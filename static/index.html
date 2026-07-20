@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SAM-3D · Object Reconstruction</title>
+<script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0f1117;
+  --surface:  #1a1d27;
+  --border:   #2e3247;
+  --accent:   #5b6ef5;
+  --accent2:  #7c3aed;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --text:     #e2e8f0;
+  --muted:    #64748b;
+  --radius:   12px;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* ── Header ── */
+header {
+  width: 100%;
+  padding: 20px 32px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+header h1 { font-size: 1.25rem; font-weight: 600; }
+header span.badge {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* ── Main layout ── */
+main {
+  width: 100%;
+  max-width: 1100px;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* ── Step card ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+.card-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+/* ── Upload drop zone ── */
+#drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 48px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+#drop-zone:hover, #drop-zone.dragover {
+  border-color: var(--accent);
+  background: rgba(91,110,245,.06);
+  color: var(--text);
+}
+#drop-zone .icon { font-size: 2.5rem; margin-bottom: 10px; }
+#drop-zone input { display: none; }
+
+/* ── Canvas / image workspace ── */
+#viewport {
+  position: relative;
+  max-width: fit-content;
+  max-height: 60vh;
+  margin: 0 auto;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0b0d13;
+  touch-action: none;
+}
+#workspace {
+  position: relative;
+  display: block;
+  cursor: crosshair;
+  line-height: 0;  /* remove gap below img */
+  transform-origin: 0 0;
+  will-change: transform;
+}
+#workspace.panning { cursor: grabbing; }
+#workspace.pannable { cursor: grab; }
+#workspace img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+#workspace canvas {
+  position: absolute;
+  top: 0; left: 0;
+  pointer-events: none;
+  width: 100%;
+  height: 100%;
+}
+#marker-canvas { pointer-events: none; }
+
+/* ── Zoom toolbar ── */
+#zoom-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  justify-content: center;
+}
+#zoom-bar button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+#zoom-bar button:hover { border-color: var(--accent); }
+#zoom-bar button.wide { width: auto; padding: 0 12px; font-size: 0.8rem; gap: 6px; }
+#zoom-level {
+  min-width: 52px;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Hint row ── */
+.hints {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.hint { display: flex; align-items: center; gap: 6px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.dot.green  { background: var(--green); }
+.dot.red    { background: var(--red);   }
+
+/* ── Buttons ── */
+.btn-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+button {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s, transform .1s;
+}
+button:active { transform: scale(0.97); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+.btn-secondary {
+  background: var(--border);
+  color: var(--text);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+/* ── Progress ── */
+#progress-card { display: none; }
+.progress-track {
+  background: var(--border);
+  border-radius: 99px;
+  height: 8px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  transition: width .4s ease;
+  width: 0%;
+}
+#progress-msg {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+/* ── Result ── */
+#result-card { display: none; }
+model-viewer {
+  width: 100%;
+  height: 500px;
+  border-radius: 8px;
+  background: #111;
+}
+.result-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+/* ── Console ── */
+#console-card {
+  display: none;
+}
+#console-output {
+  background: #0d0d0d;
+  color: #a8ffa8;
+  font-family: 'Menlo', 'Consolas', monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 12px 14px;
+  height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#console-output .err { color: #ff6b6b; }
+#console-output .warn { color: #ffd93d; }
+
+/* ── Utility ── */
+.hidden { display: none !important; }
+.section { display: none; }
+.section.active { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+    <rect width="28" height="28" rx="7" fill="url(#g1)"/>
+    <path d="M8 14 L14 8 L20 14 L14 20 Z" fill="white" opacity=".9"/>
+    <defs>
+      <linearGradient id="g1" x1="0" y1="0" x2="28" y2="28">
+        <stop offset="0%"   stop-color="#5b6ef5"/>
+        <stop offset="100%" stop-color="#7c3aed"/>
+      </linearGradient>
+    </defs>
+  </svg>
+  <h1>SAM-3D</h1>
+  <span class="badge">Apple Silicon</span>
+</header>
+
+<main>
+
+  <!-- ─── Step 1 : Upload ─────────────────────────────────────────────── -->
+  <div class="card" id="step-upload">
+    <div class="card-title">Step 1 — Upload image</div>
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()"
+         ondragover="onDragOver(event)" ondragleave="onDragLeave(event)"
+         ondrop="onDrop(event)">
+      <div class="icon">🖼</div>
+      <div>Drop an image here, or click to browse</div>
+      <div style="font-size:.75rem;margin-top:6px;opacity:.6">PNG · JPG · WebP</div>
+      <input type="file" id="file-input" accept="image/*" onchange="onFileInput(event)"/>
+    </div>
+  </div>
+
+  <!-- ─── Step 2 : Annotate ───────────────────────────────────────────── -->
+  <div class="card hidden" id="step-annotate">
+    <div class="card-title">Step 2 — Click to mark the object</div>
+
+    <div id="viewport">
+      <div id="workspace">
+        <img id="base-img" alt="Uploaded image" draggable="false"/>
+        <canvas id="mask-canvas"></canvas>
+        <canvas id="marker-canvas"></canvas>
+      </div>
+    </div>
+
+    <div id="zoom-bar">
+      <button title="Zoom out" onclick="zoomAtCenter(1/1.25)">&minus;</button>
+      <span id="zoom-level">100%</span>
+      <button title="Zoom in" onclick="zoomAtCenter(1.25)">+</button>
+      <button class="wide" title="Zoom to fit" onclick="resetZoom()">⤢ Fit</button>
+    </div>
+
+    <div class="hints">
+      <div class="hint"><div class="dot green"></div> Left-click — add object point</div>
+      <div class="hint"><div class="dot red"></div>   Right-click — mark background</div>
+      <div class="hint" style="color: var(--text)">Scroll to zoom · drag to pan</div>
+      <div class="hint" style="margin-left:auto; color: var(--text)" id="point-count">0 points</div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn-ghost" id="undo-btn" onclick="undo()" disabled title="Undo (⌘Z)">↶ Undo</button>
+      <button class="btn-ghost" id="redo-btn" onclick="redo()" disabled title="Redo (⇧⌘Z)">↷ Redo</button>
+      <button class="btn-ghost" onclick="clearMarkers()">✕ Clear all</button>
+      <button class="btn-primary" id="generate-btn" onclick="startReconstruct()" disabled>
+        Generate 3-D &rarr;
+      </button>
+    </div>
+  </div>
+
+  <!-- ─── Step 3 : Progress ───────────────────────────────────────────── -->
+  <div class="card" id="progress-card">
+    <div class="card-title">Step 3 — Reconstructing…</div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <div id="progress-msg">Initialising pipeline…</div>
+  </div>
+
+  <!-- ─── Console ────────────────────────────────────────────────────────── -->
+  <div class="card" id="console-card">
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Console</span>
+      <button class="btn-ghost" style="padding:4px 10px;font-size:0.75rem" onclick="clearConsole()">Clear</button>
+    </div>
+    <div id="console-output"></div>
+  </div>
+
+  <!-- ─── Step 4 : Result ─────────────────────────────────────────────── -->
+  <div class="card" id="result-card">
+    <div class="card-title">Result — 3-D Object</div>
+    <model-viewer id="viewer"
+      auto-rotate
+      camera-controls
+      shadow-intensity="1"
+      ar
+      ar-modes="webxr scene-viewer quick-look"
+      style="width:100%;height:500px;border-radius:8px;background:#111;">
+    </model-viewer>
+    <div class="result-actions">
+      <a id="download-link"><button class="btn-secondary">⬇ Download GLB</button></a>
+      <a id="download-link-ply"><button class="btn-secondary">⬇ Download PLY</button></a>
+      <button class="btn-ghost" onclick="restartApp()">← Try another image</button>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+let imageId   = null;
+let imgW = 0, imgH = 0;          // natural image dimensions
+let markers   = [];              // [{x,y,label}]  label: 1=pos, 0=neg
+let lastMaskB64 = null;
+
+const baseImg      = document.getElementById("base-img");
+const maskCanvas   = document.getElementById("mask-canvas");
+const markerCanvas = document.getElementById("marker-canvas");
+const maskCtx      = maskCanvas.getContext("2d");
+const markerCtx    = markerCanvas.getContext("2d");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload
+// ─────────────────────────────────────────────────────────────────────────────
+function onDragOver(e)  { e.preventDefault(); document.getElementById("drop-zone").classList.add("dragover"); }
+function onDragLeave(e) { document.getElementById("drop-zone").classList.remove("dragover"); }
+function onDrop(e) {
+  e.preventDefault();
+  onDragLeave(e);
+  const f = e.dataTransfer.files[0];
+  if (f) uploadFile(f);
+}
+function onFileInput(e) {
+  const f = e.target.files[0];
+  if (f) uploadFile(f);
+}
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res  = await fetch("/upload", { method: "POST", body: fd });
+  const data = await res.json();
+  imageId = data.image_id;
+  imgW    = data.width;
+  imgH    = data.height;
+
+  // Fresh image → reset markers, mask and undo/redo history
+  markers = [];
+  lastMaskB64 = null;
+  resetHistory();
+  updatePointCount();
+  document.getElementById("generate-btn").disabled = true;
+
+  // Show image on canvas
+  const objectUrl = URL.createObjectURL(file);
+  baseImg.src = objectUrl;
+  baseImg.onload = () => {
+    // Reveal the card FIRST so the image has a rendered size, then sync canvas
+    document.getElementById("step-upload").classList.add("hidden");
+    document.getElementById("step-annotate").classList.remove("hidden");
+    requestAnimationFrame(() => syncCanvasSize());
+  };
+}
+
+// Displayed (layout) size of the image — NOT affected by the zoom transform,
+// so the canvas coordinate system stays stable while zooming/panning.
+function displaySize() {
+  return { w: baseImg.offsetWidth, h: baseImg.offsetHeight };
+}
+
+function syncCanvasSize() {
+  const { w, h } = displaySize();
+  const dpr  = window.devicePixelRatio || 1;
+  // physical pixels
+  maskCanvas.width   = markerCanvas.width   = Math.round(w * dpr);
+  maskCanvas.height  = markerCanvas.height  = Math.round(h * dpr);
+  maskCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  markerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  resetZoom();
+  redrawMarkers();
+}
+
+window.addEventListener("resize", () => { if (imageId) syncCanvasSize(); });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Marker interaction
+// ─────────────────────────────────────────────────────────────────────────────
+const workspace = document.getElementById("workspace");
+const viewport  = document.getElementById("viewport");
+
+// ── Zoom & pan ──
+let zoom = 1, panX = 0, panY = 0;
+const MIN_ZOOM = 1, MAX_ZOOM = 8;
+
+function applyTransform() {
+  workspace.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  workspace.classList.toggle("pannable", zoom > 1);
+  document.getElementById("zoom-level").textContent = Math.round(zoom * 100) + "%";
+}
+
+function clampPan() {
+  const { w, h } = displaySize();
+  const contentW = w * zoom, contentH = h * zoom;
+  const vpW = viewport.clientWidth, vpH = viewport.clientHeight;
+  panX = contentW <= vpW ? (vpW - contentW) / 2
+                         : Math.min(0, Math.max(vpW - contentW, panX));
+  panY = contentH <= vpH ? (vpH - contentH) / 2
+                         : Math.min(0, Math.max(vpH - contentH, panY));
+}
+
+// Zoom keeping the image point under (clientX, clientY) fixed on screen.
+function zoomAt(clientX, clientY, factor) {
+  const prev = zoom;
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+  if (zoom === prev) return;
+  const vpRect = viewport.getBoundingClientRect();
+  const ux = clientX - vpRect.left, uy = clientY - vpRect.top;
+  // image-space point under cursor stays put: pan = u - imgPt * zoom
+  panX = ux - ((ux - panX) / prev) * zoom;
+  panY = uy - ((uy - panY) / prev) * zoom;
+  clampPan();
+  applyTransform();
+}
+
+function zoomAtCenter(factor) {
+  const vpRect = viewport.getBoundingClientRect();
+  zoomAt(vpRect.left + viewport.clientWidth / 2,
+         vpRect.top  + viewport.clientHeight / 2, factor);
+}
+
+function resetZoom() {
+  zoom = 1; panX = 0; panY = 0;
+  clampPan();
+  applyTransform();
+}
+
+viewport.addEventListener("wheel", e => {
+  if (!imageId) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+// Drag to pan (when zoomed in). A tiny drag threshold distinguishes a pan from
+// a click so point placement still works.
+let panning = false, movedDist = 0, panStart = null, suppressClick = false;
+
+workspace.addEventListener("pointerdown", e => {
+  if (!imageId) return;
+  if (e.button !== 0 && e.button !== 1) return;   // left or middle only
+  panStart = { x: e.clientX, y: e.clientY, panX, panY };
+  movedDist = 0;
+  panning = (e.button === 1);   // middle button always pans
+});
+
+window.addEventListener("pointermove", e => {
+  if (!panStart) return;
+  const dx = e.clientX - panStart.x, dy = e.clientY - panStart.y;
+  movedDist = Math.hypot(dx, dy);
+  if (!panning && movedDist > 4 && zoom > 1) {
+    panning = true;
+    workspace.classList.add("panning");
+  }
+  if (panning) {
+    panX = panStart.panX + dx;
+    panY = panStart.panY + dy;
+    clampPan();
+    applyTransform();
+  }
+});
+
+window.addEventListener("pointerup", () => {
+  if (panning && movedDist > 4) suppressClick = true;   // don't drop a marker
+  panning = false;
+  panStart = null;
+  workspace.classList.remove("panning");
+});
+
+workspace.addEventListener("click",       e => addMarker(e, 1));
+workspace.addEventListener("contextmenu", e => { e.preventDefault(); addMarker(e, 0); });
+
+function canvasCoords(e) {
+  // getBoundingClientRect reflects the current zoom transform, so normalising
+  // by rect.width/height maps the click to natural image coordinates directly.
+  const rect = baseImg.getBoundingClientRect();
+  return {
+    nx: (e.clientX - rect.left) / rect.width  * imgW,
+    ny: (e.clientY - rect.top)  / rect.height * imgH,
+  };
+}
+
+async function addMarker(e, label) {
+  if (suppressClick) { suppressClick = false; return; }
+  const { nx, ny } = canvasCoords(e);
+  if (nx < 0 || ny < 0 || nx > imgW || ny > imgH) return;
+  pushHistory();
+  markers.push({ nx, ny, label });
+  await afterMarkersChange();
+}
+
+function clearMarkers() {
+  if (markers.length === 0) return;
+  pushHistory();
+  markers = [];
+  afterMarkersChange();
+}
+
+// ── Undo / redo ──
+let undoStack = [], redoStack = [];
+
+function pushHistory() {
+  undoStack.push(markers.slice());
+  redoStack = [];
+  updateHistoryButtons();
+}
+
+function resetHistory() {
+  undoStack = [];
+  redoStack = [];
+  updateHistoryButtons();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(markers.slice());
+  markers = undoStack.pop();
+  afterMarkersChange();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(markers.slice());
+  markers = redoStack.pop();
+  afterMarkersChange();
+}
+
+function updateHistoryButtons() {
+  document.getElementById("undo-btn").disabled = undoStack.length === 0;
+  document.getElementById("redo-btn").disabled = redoStack.length === 0;
+}
+
+// Redraw + refresh the mask whenever the marker set changes.
+async function afterMarkersChange() {
+  redrawMarkers();
+  updatePointCount();
+  updateHistoryButtons();
+  const hasPos = markers.some(m => m.label === 1);
+  document.getElementById("generate-btn").disabled = !hasPos;
+  if (hasPos) {
+    await runSegment();
+  } else {
+    lastMaskB64 = null;
+    clearMask();
+  }
+}
+
+// Keyboard shortcuts: ⌘Z / Ctrl+Z = undo, ⇧⌘Z / Ctrl+Y = redo.
+window.addEventListener("keydown", e => {
+  if (!imageId || document.getElementById("step-annotate").classList.contains("hidden")) return;
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) return;
+  const key = e.key.toLowerCase();
+  if (key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if ((key === "z" && e.shiftKey) || key === "y") { e.preventDefault(); redo(); }
+});
+
+function updatePointCount() {
+  const pos = markers.filter(m => m.label === 1).length;
+  const neg = markers.filter(m => m.label === 0).length;
+  document.getElementById("point-count").textContent =
+    `${pos} positive · ${neg} negative`;
+}
+
+function redrawMarkers() {
+  const { w, h } = displaySize();
+  markerCtx.clearRect(0, 0, w, h);
+  for (const m of markers) {
+    const cx = m.nx / imgW * w;
+    const cy = m.ny / imgH * h;
+    markerCtx.beginPath();
+    markerCtx.arc(cx, cy, 7, 0, Math.PI * 2);
+    markerCtx.fillStyle   = m.label === 1 ? "#22c55e" : "#ef4444";
+    markerCtx.strokeStyle = "#fff";
+    markerCtx.lineWidth   = 2;
+    markerCtx.fill();
+    markerCtx.stroke();
+
+    // Plus / minus symbol
+    markerCtx.fillStyle = "#fff";
+    markerCtx.font = "bold 11px sans-serif";
+    markerCtx.textAlign = "center";
+    markerCtx.textBaseline = "middle";
+    markerCtx.fillText(m.label === 1 ? "+" : "−", cx, cy);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SAM segmentation
+// ─────────────────────────────────────────────────────────────────────────────
+let segmentController = null;
+
+async function runSegment() {
+  if (!imageId || markers.filter(m => m.label === 1).length === 0) {
+    clearMask(); return;
+  }
+
+  // Abort previous in-flight request
+  if (segmentController) segmentController.abort();
+  segmentController = new AbortController();
+
+  const body = {
+    image_id:        imageId,
+    positive_points: markers.filter(m => m.label === 1).map(m => ({ x: m.nx, y: m.ny })),
+    negative_points: markers.filter(m => m.label === 0).map(m => ({ x: m.nx, y: m.ny })),
+  };
+
+  try {
+    const res  = await fetch("/segment", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+      signal:  segmentController.signal,
+    });
+    const data = await res.json();
+    lastMaskB64 = data.mask_b64;
+    drawMask(lastMaskB64);
+  } catch (err) {
+    if (err.name !== "AbortError") console.error("Segment error:", err);
+  }
+}
+
+function clearMask() {
+  const { w, h } = displaySize();
+  maskCtx.clearRect(0, 0, w, h);
+}
+
+function drawMask(b64) {
+  const maskImg = new Image();
+  maskImg.src   = "data:image/png;base64," + b64;
+  maskImg.onload = () => {
+    const { w, h } = displaySize();
+    const dw   = Math.round(w);
+    const dh   = Math.round(h);
+
+    // Step 1: scale SAM mask (natural size) → display size on a temp canvas
+    const tmp  = document.createElement("canvas");
+    tmp.width  = dw;  tmp.height = dh;
+    const tc   = tmp.getContext("2d");
+    tc.drawImage(maskImg, 0, 0, dw, dh);
+    const src  = tc.getImageData(0, 0, dw, dh).data;
+
+    // Step 2: build tinted overlay in the same temp canvas
+    const out  = tc.createImageData(dw, dh);
+    const od   = out.data;
+    for (let i = 0; i < src.length; i += 4) {
+      if (src[i] > 127) {   // R > 127 → foreground
+        od[i]     = 91;
+        od[i + 1] = 110;
+        od[i + 2] = 245;
+        od[i + 3] = 115;    // α ≈ 0.45
+      }
+    }
+    tc.putImageData(out, 0, 0);
+
+    // Step 3: blit tmp onto the DPR-scaled mask canvas via drawImage
+    // putImageData ignores the canvas transform; drawImage respects it.
+    maskCtx.clearRect(0, 0, dw, dh);
+    maskCtx.drawImage(tmp, 0, 0, dw, dh);
+    redrawMarkers();
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reconstruct
+// ─────────────────────────────────────────────────────────────────────────────
+async function startReconstruct() {
+  if (!imageId || !lastMaskB64) {
+    alert("Please click at least one positive point first.");
+    return;
+  }
+
+  // Switch to progress view
+  document.getElementById("step-annotate").classList.add("hidden");
+  document.getElementById("progress-card").style.display = "block";
+  setProgress(5, "Sending request…");
+
+  const body = { image_id: imageId, mask_b64: lastMaskB64 };
+  const res  = await fetch("/reconstruct", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(body),
+  });
+  const { job_id } = await res.json();
+
+  listenProgress(job_id);
+  openConsole();
+}
+
+function setProgress(pct, msg) {
+  document.getElementById("progress-fill").style.width = Math.max(0, pct) + "%";
+  document.getElementById("progress-msg").textContent  = msg;
+}
+
+function listenProgress(jobId) {
+  const es = new EventSource(`/status/${jobId}`);
+  es.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.ping) return;
+    setProgress(data.progress, data.message);
+    if (data.done) {
+      es.close();
+      if (data.message === "complete") {
+        showResult(jobId);
+      } else {
+        // Error
+        setProgress(0, "Error: " + data.message.replace("error: ", ""));
+      }
+    }
+  };
+  es.onerror = () => {
+    setProgress(0, "Connection lost. Please try again.");
+    es.close();
+  };
+}
+
+function showResult(jobId) {
+  const url = `/result/${jobId}`;
+  document.getElementById("progress-card").style.display = "none";
+  document.getElementById("result-card").style.display   = "block";
+  document.getElementById("viewer").setAttribute("src", url);
+
+  const link = document.getElementById("download-link");
+  link.href     = url;
+  link.download = "reconstruction.glb";
+
+  const linkPly = document.getElementById("download-link-ply");
+  if (linkPly) {
+    linkPly.href     = `${url}?format=ply`;
+    linkPly.download = "reconstruction.ply";
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Console
+// ────────────────────────────────────────────────────────────────────────────────
+let _logEs  = null;
+
+function openConsole() {
+  const card = document.getElementById("console-card");
+  card.style.display = "block";
+
+  if (_logEs) { _logEs.close(); }
+  _logEs = new EventSource("/logs");
+  _logEs.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    appendConsole(data.line);
+  };
+}
+
+function appendConsole(line) {
+  const el   = document.getElementById("console-output");
+  const span = document.createElement("span");
+  const low  = line.toLowerCase();
+  if (low.includes("error") || low.includes("traceback")) span.className = "err";
+  else if (low.includes("warning") || low.includes("warn"))  span.className = "warn";
+  span.textContent = line + "\n";
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;  // auto-scroll
+}
+
+function clearConsole() {
+  document.getElementById("console-output").innerHTML = "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reset
+// ─────────────────────────────────────────────────────────────────────────────
+function restartApp() {
+  imageId     = null;
+  markers     = [];
+  lastMaskB64 = null;
+  resetHistory();
+  updatePointCount();
+  document.getElementById("result-card").style.display    = "none";
+  document.getElementById("progress-card").style.display  = "none";
+  document.getElementById("step-annotate").classList.add("hidden");
+  document.getElementById("step-upload").classList.remove("hidden");
+  document.getElementById("file-input").value = "";
+  markerCtx.clearRect(0, 0, 9999, 9999);
+  maskCtx.clearRect(0, 0, 9999, 9999);
+}
+</script>
+</body>
+</html>

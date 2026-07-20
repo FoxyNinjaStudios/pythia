@@ -1,0 +1,465 @@
+"""
+server.py  –  FastAPI web server for the SAM-3D interactive demo.
+
+Endpoints
+---------
+GET  /                          → serve static/index.html
+POST /upload                    → save image, return image_id
+POST /segment                   → SAM point segmentation → mask (base64 PNG)
+POST /reconstruct               → launch async 3-D reconstruction, return job_id
+GET  /status/{job_id}           → SSE stream of progress events
+GET  /result/{job_id}           → download the final GLB
+
+Run
+---
+    conda activate sam-3d-mlx
+    python server.py
+  or
+    uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ── environment must be set before any ML imports ─────────────────────────────
+os.environ.setdefault("SPARSE_BACKEND",      "mps")
+os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
+os.environ.setdefault("OMP_NUM_THREADS",     "14")
+os.environ.setdefault("MKL_NUM_THREADS",     "14")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+
+import numpy as np
+import torch
+from PIL import Image as PILImage
+
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ── directory setup ────────────────────────────────────────────────────────────
+UPLOAD_DIR = Path("tmp/uploads")
+RESULT_DIR = Path("tmp/results")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("sam3d.server")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread-safe log buffer  (used by /logs SSE endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_log_lines: List[str] = []
+_log_lock  = threading.Lock()
+_LOG_MAX   = 2000
+_ANSI_RE   = re.compile(r'\x1b\[[0-9;]*[mK]')
+
+
+class _LogBufferHandler(logging.Handler):
+    """Appends every log record to _log_lines (thread-safe, bounded)."""
+    def emit(self, record: logging.LogRecord):
+        line = self.format(record)
+        with _log_lock:
+            _log_lines.append(line)
+            if len(_log_lines) > _LOG_MAX:
+                del _log_lines[0]
+
+
+class _StdoutTee:
+    """
+    Tees sys.stdout into _log_lines so print() calls from the pipeline
+    appear in the /logs SSE stream alongside log records.
+    """
+    def __init__(self, original):
+        self._orig = original
+        self._buf  = ""
+
+    def write(self, text: str):
+        self._orig.write(text)
+        self._buf += _ANSI_RE.sub("", text)   # strip ANSI colour codes
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                with _log_lock:
+                    _log_lines.append(line)
+                    if len(_log_lines) > _LOG_MAX:
+                        del _log_lines[0]
+
+    def flush(self):            self._orig.flush()
+    def fileno(self):           return self._orig.fileno()
+    def isatty(self):           return False
+
+
+sys.stdout = _StdoutTee(sys.stdout)
+
+_buf_handler = _LogBufferHandler()
+_buf_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s"))
+logging.getLogger().addHandler(_buf_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job state
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JobState:
+    def __init__(self, job_id: str):
+        self.job_id      = job_id
+        self.progress    = 0
+        self.message     = "Queued"
+        self.done        = False
+        self.error: Optional[str] = None
+        self.result_path: Optional[str] = None
+        self._queues: List[asyncio.Queue] = []
+
+    def update(self, message: str, progress: int):
+        self.message  = message
+        self.progress = progress
+        self._broadcast({"progress": progress, "message": message})
+
+    def complete(self, result_path: str):
+        self.done        = True
+        self.result_path = result_path
+        self.progress    = 100
+        self.message     = "complete"
+        self._broadcast({"progress": 100, "message": "complete", "done": True})
+
+    def fail(self, error: str):
+        self.done  = True
+        self.error = error
+        self._broadcast({"progress": -1, "message": f"error: {error}", "done": True})
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._queues.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        try:
+            self._queues.remove(q)
+        except ValueError:
+            pass
+
+    def _broadcast(self, payload: dict):
+        for q in list(self._queues):
+            q.put_nowait(payload)
+
+
+jobs: Dict[str, JobState] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SegmentRequest(BaseModel):
+    image_id:        str
+    positive_points: List[Dict[str, float]]
+    negative_points: Optional[List[Dict[str, float]]] = []
+
+
+class ReconstructRequest(BaseModel):
+    image_id:  str
+    mask_b64:  str   # base64-encoded PNG mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────────────────
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    logger.info("SAM-3D server starting…")
+    asyncio.get_event_loop().run_in_executor(None, _preload_sam)
+    yield
+
+app = FastAPI(title="SAM-3D Interactive Demo", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+# ── Upload ─────────────────────────────────────────────────────────────────────
+
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    data = await file.read()
+    img  = PILImage.open(io.BytesIO(data)).convert("RGB")
+    image_id = str(uuid.uuid4())
+    img.save(UPLOAD_DIR / f"{image_id}.png")
+    return {"image_id": image_id, "width": img.width, "height": img.height}
+
+
+# ── Segment ────────────────────────────────────────────────────────────────────
+
+@app.post("/segment")
+async def segment(req: SegmentRequest):
+    img_path = UPLOAD_DIR / f"{req.image_id}.png"
+    if not img_path.exists():
+        raise HTTPException(404, "Image not found")
+
+    image = np.array(PILImage.open(img_path).convert("RGB"))
+
+    loop = asyncio.get_event_loop()
+    mask = await loop.run_in_executor(
+        None,
+        lambda: _sam_predict(image, req.positive_points, req.negative_points),
+    )
+
+    from sam_wrapper import mask_to_base64_png
+    return {"mask_b64": mask_to_base64_png(mask)}
+
+
+# ── Reconstruct ────────────────────────────────────────────────────────────────
+
+@app.post("/reconstruct")
+async def reconstruct(req: ReconstructRequest):
+    img_path = UPLOAD_DIR / f"{req.image_id}.png"
+    if not img_path.exists():
+        raise HTTPException(404, "Image not found")
+
+    # Save mask
+    mask_bytes = base64.b64decode(req.mask_b64)
+    mask_img   = PILImage.open(io.BytesIO(mask_bytes)).convert("L")
+    mask_path  = UPLOAD_DIR / f"{req.image_id}_mask.png"
+    mask_img.save(mask_path)
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = JobState(job_id)
+
+    # Run pipeline in a background thread (non-blocking)
+    asyncio.get_event_loop().run_in_executor(
+        None,
+        _run_reconstruction_sync,
+        job_id,
+        str(img_path),
+        str(mask_path),
+    )
+
+    return {"job_id": job_id}
+
+
+# ── Status SSE ─────────────────────────────────────────────────────────────────
+
+@app.get("/status/{job_id}")
+async def status_stream(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+
+    job = jobs[job_id]
+
+    async def event_gen():
+        # Immediately send current state
+        yield _sse({"progress": job.progress, "message": job.message, "done": job.done})
+        if job.done:
+            return
+
+        q = job.subscribe()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=25.0)
+                    yield _sse(event)
+                    if event.get("done"):
+                        break
+                except asyncio.TimeoutError:
+                    yield _sse({"ping": True})  # keep-alive
+        finally:
+            job.unsubscribe(q)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache",
+                                       "X-Accel-Buffering": "no"})
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+# ── Log streaming SSE ─────────────────────────────────────────────────────────
+
+@app.get("/logs")
+async def log_stream():
+    """SSE stream of all Python log messages. Front-end console subscribes here."""
+    with _log_lock:
+        cursor = len(_log_lines)   # start from current tail, skip old history
+
+    async def gen():
+        nonlocal cursor
+        # Send last 50 lines as backlog
+        with _log_lock:
+            backlog = _log_lines[max(0, cursor - 50):cursor]
+        for line in backlog:
+            yield _sse({"line": line})
+
+        while True:
+            await asyncio.sleep(0.25)
+            with _log_lock:
+                new  = _log_lines[cursor:]
+                cursor = len(_log_lines)
+            for line in new:
+                yield _sse({"line": line})
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Result download ────────────────────────────────────────────────────────────
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str, format: str = "glb"):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    job = jobs[job_id]
+    if not job.done:
+        raise HTTPException(202, "Not ready yet")
+    if job.error:
+        raise HTTPException(500, job.error)
+    fmt = "ply" if str(format).lower() == "ply" else "glb"
+    path = Path(job.result_path).with_suffix(f".{fmt}")
+    if not path.exists():
+        raise HTTPException(404, f"{fmt.upper()} not available")
+    media_type = "text/plain" if fmt == "ply" else "model/gltf-binary"
+    return FileResponse(
+        str(path),
+        media_type=media_type,
+        filename=f"reconstruction.{fmt}",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker functions (run in ThreadPoolExecutor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sam_predict(image, positive_points, negative_points):
+    from sam_wrapper import predict_mask
+    return predict_mask(image, positive_points, negative_points)
+
+
+class _PipelineLogHandler(logging.Handler):
+    """Redirect pipeline log messages to SSE progress updates."""
+
+    def __init__(self, job: JobState):
+        super().__init__()
+        self.job = job
+
+    def emit(self, record: logging.LogRecord):
+        msg = record.getMessage()
+        if "STAGE 0" in msg or "depth" in msg.lower():
+            self.job.update("Estimating depth…", 15)
+        elif "STAGE 1" in msg:
+            self.job.update("Generating sparse voxels…", 30)
+        elif "STAGE 2" in msg:
+            self.job.update("Refining latent structure…", 55)
+        elif "STAGE 3" in msg or "decod" in msg.lower():
+            self.job.update("Decoding 3-D mesh…", 70)
+        elif "postprocess" in msg.lower():
+            self.job.update("Post-processing mesh…", 80)
+
+
+def _run_reconstruction_sync(job_id: str, img_path: str, mask_path: str):
+    """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
+    job = jobs[job_id]
+    # Attach log handler so pipeline stages drive the progress bar
+    root_logger = logging.getLogger()
+    handler = _PipelineLogHandler(job)
+    root_logger.addHandler(handler)
+
+    try:
+        image = np.array(PILImage.open(img_path).convert("RGB"))
+        mask  = np.array(PILImage.open(mask_path).convert("L"))
+
+        job.update("Loading pipeline…", 5)
+
+        from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
+        pipeline = InferencePipelineLowMemory(
+            config_path="checkpoints/hf/pipeline.yaml",
+            device="cpu",
+            dtype="float16",
+            cache_dir=".cache",
+        )
+
+        job.update("Running 3-D reconstruction…", 12)
+
+        output = pipeline.run(
+            image,
+            mask,
+            seed=42,
+            stage1_only=False,
+            stage1_inference_steps=8,
+            stage2_inference_steps=8,
+            decode_formats=["mesh"],
+            simplify_ratio=0.0,
+            vertex_color_source="gaussian",
+        )
+
+        # The pipeline already returns a per-vertex-colored GLB (to_glb colors each
+        # vertex from the Gaussian appearance field). Vertex color is more accurate
+        # than the UV bake here, so just export it directly.
+        result_mesh = output["glb"]
+
+        result_path = str(RESULT_DIR / f"{job_id}.glb")
+        result_ply = str(RESULT_DIR / f"{job_id}.ply")
+        job.update("Exporting GLB + PLY…", 95)
+        result_mesh.export(result_path, file_type="glb")
+        try:
+            result_mesh.export(result_ply, file_type="ply")
+        except Exception as exc:
+            logger.warning(f"[JOB {job_id}] PLY export failed: {exc}")
+
+        job.complete(result_path)
+        logger.info(f"[JOB {job_id}] Done → {result_path}")
+
+    except Exception as exc:
+        job.fail(str(exc))
+        logger.error(f"[JOB {job_id}] Failed:\n{traceback.format_exc()}")
+    finally:
+        root_logger.removeHandler(handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup  – pre-download SAM weights in background
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _preload_sam():
+    try:
+        from sam_wrapper import ensure_sam_weights
+        ensure_sam_weights()
+    except Exception as exc:
+        logger.warning(f"SAM weight preload failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8005,
+        workers=1,       # must be 1 – ML models are not fork-safe
+        reload=False,
+    )

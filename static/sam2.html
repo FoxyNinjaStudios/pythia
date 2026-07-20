@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SAM2 — Client-Side Segmentation</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, sans-serif;
+    background: #0f1115; color: #e6e6e6; display: flex; flex-direction: column;
+    align-items: center; padding: 24px; gap: 16px;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  .hint { font-size: 13px; color: #9aa4b2; max-width: 640px; text-align: center; line-height: 1.5; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  button, label.filebtn {
+    background: #1f6feb; color: #fff; border: none; padding: 8px 14px;
+    border-radius: 8px; font-size: 14px; cursor: pointer;
+  }
+  button.secondary, label.filebtn.secondary { background: #262b34; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-size: 13px; color: #9aa4b2; min-height: 18px; }
+  #stage { position: relative; max-width: 90vw; }
+  #view { max-width: 90vw; max-height: 70vh; border-radius: 10px; cursor: crosshair;
+          background: #14171d; display: block; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+  <h1>Segment Anything 2 (client-side)</h1>
+  <p class="hint">
+    Load an image, then <b>left-click</b> on the object to add foreground points.
+    <b>Right-click</b> (or Shift+click) adds background points. Everything runs in your browser via SAM2.
+  </p>
+
+  <div class="toolbar">
+    <label class="filebtn">Load image<input id="file" type="file" accept="image/*" disabled /></label>
+    <button id="sample" class="secondary" disabled>Use sample</button>
+    <button id="clear" class="secondary" disabled>Clear points</button>
+    <button id="download" class="secondary" disabled>Download mask</button>
+  </div>
+
+  <div id="status">Loading model…</div>
+
+  <div id="stage">
+    <canvas id="view"></canvas>
+  </div>
+
+<script type="module">
+import {
+  Sam2Model, AutoProcessor, RawImage, Tensor
+} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+
+// SAM2.1 tiny. Other browser-ready exports: onnx-community/sam2.1-hiera-{small,base-plus,large}-ONNX
+const MODEL_ID = 'onnx-community/sam2.1-hiera-tiny-ONNX';
+const SAMPLE_URL =
+  'https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/corgi.jpg';
+
+const view   = document.getElementById('view');
+const ctx    = view.getContext('2d');
+const statusEl = document.getElementById('status');
+const fileEl = document.getElementById('file');
+const clearBtn = document.getElementById('clear');
+const dlBtn  = document.getElementById('download');
+
+let model, processor;
+let modelReady = null;      // promise that resolves once the model is loaded
+let imgEl = null;
+let imageProcessed = null;   // processor output (has reshaped/original sizes)
+let imageEmbeddings = null;  // cached encoder output (multi-scale: image_embeddings.0/1/2)
+let points = [];             // { position:[nx,ny], label:0|1 }
+let maskCanvas = null;       // colored overlay
+let lastMask = null;         // { data, off, W, H } for download
+
+const setStatus = (t) => statusEl.textContent = t;
+
+// ── Load model (WebGPU, fallback to WASM) ────────────────────────────────────
+async function loadModel() {
+  processor = await AutoProcessor.from_pretrained(MODEL_ID);
+  // This export ships float32 weights (external data); no fp16/q8 variants.
+  try {
+    model = await Sam2Model.from_pretrained(MODEL_ID, { device: 'webgpu' });
+    setStatus('Model ready (WebGPU). Load an image.');
+  } catch (e) {
+    console.warn('WebGPU unavailable, falling back to WASM:', e);
+    model = await Sam2Model.from_pretrained(MODEL_ID);
+    setStatus('Model ready (WASM). Load an image.');
+  }
+  // Enable image controls now that the model + processor are ready.
+  fileEl.disabled = false;
+  document.getElementById('sample').disabled = false;
+}
+
+// ── Set the working image + compute embeddings once ──────────────────────────
+async function setImage(url) {
+  points = []; maskCanvas = null; lastMask = null;
+  clearBtn.disabled = true; dlBtn.disabled = true;
+
+  // Safety net: don't touch the model/processor until they're loaded.
+  if (modelReady) { setStatus('Waiting for model…'); await modelReady; }
+
+  setStatus('Loading image…');
+  imgEl = new Image();
+  imgEl.crossOrigin = 'anonymous';
+  imgEl.src = url;
+  await imgEl.decode();
+
+  view.width = imgEl.naturalWidth;
+  view.height = imgEl.naturalHeight;
+  render();
+
+  setStatus('Computing image embeddings…');
+  const rawImage = await RawImage.read(url);
+  imageProcessed  = await processor(rawImage);
+  imageEmbeddings = await model.get_image_embeddings(imageProcessed);
+  setStatus('Ready — click the object.');
+}
+
+// ── Decode mask from current points ──────────────────────────────────────────
+async function decode() {
+  if (!imageEmbeddings || points.length === 0) {
+    maskCanvas = null; lastMask = null; dlBtn.disabled = true; render(); return;
+  }
+  setStatus('Segmenting…');
+  const [rh, rw] = imageProcessed.reshaped_input_sizes[0]; // [height, width]
+
+  const coords = points.flatMap(p => [p.position[0] * rw, p.position[1] * rh]);
+  const labels = BigInt64Array.from(points.map(p => BigInt(p.label)));
+
+  const input_points = new Tensor('float32', coords, [1, 1, points.length, 2]);
+  const input_labels = new Tensor('int64', labels, [1, 1, points.length]);
+
+  // Reuse cached multi-scale embeddings → only the tiny decoder runs per click.
+  const { pred_masks, iou_scores } = await model({
+    ...imageEmbeddings, input_points, input_labels,
+  });
+
+  const masks = await processor.post_process_masks(
+    pred_masks, imageProcessed.original_sizes, imageProcessed.reshaped_input_sizes,
+  );
+
+  buildMask(masks[0], iou_scores);
+  dlBtn.disabled = false;
+  render();
+  setStatus('Ready — click to refine.');
+}
+
+// ── Turn the best-scoring mask into a colored overlay canvas ─────────────────
+function buildMask(maskTensor, scores) {
+  const d = maskTensor.dims;
+  let numMasks, H, W;
+  if (d.length === 4) { numMasks = d[1]; H = d[2]; W = d[3]; }
+  else                { numMasks = d[0]; H = d[1]; W = d[2]; }
+
+  const s = scores.data;
+  let best = 0;
+  for (let i = 1; i < numMasks; ++i) if (s[i] > s[best]) best = i;
+
+  const data = maskTensor.data;
+  const off  = best * H * W;
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const cx = c.getContext('2d');
+  const id = cx.createImageData(W, H);
+  for (let i = 0; i < H * W; ++i) {
+    if (data[off + i]) {
+      id.data[i*4+0] = 34; id.data[i*4+1] = 139; id.data[i*4+2] = 230; id.data[i*4+3] = 150;
+    }
+  }
+  cx.putImageData(id, 0, 0);
+  maskCanvas = c;
+  lastMask = { data, off, W, H };
+}
+
+// ── Render image + mask overlay + point markers ──────────────────────────────
+function render() {
+  if (!imgEl) return;
+  ctx.clearRect(0, 0, view.width, view.height);
+  ctx.drawImage(imgEl, 0, 0, view.width, view.height);
+  if (maskCanvas) ctx.drawImage(maskCanvas, 0, 0, view.width, view.height);
+
+  for (const p of points) {
+    const x = p.position[0] * view.width;
+    const y = p.position[1] * view.height;
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(4, view.width / 120), 0, 2 * Math.PI);
+    ctx.fillStyle = p.label === 1 ? '#22c55e' : '#ef4444';
+    ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+}
+
+// ── Click handling ───────────────────────────────────────────────────────────
+function addPoint(ev, label) {
+  if (!imageEmbeddings) return;
+  const rect = view.getBoundingClientRect();
+  const nx = (ev.clientX - rect.left) / rect.width;
+  const ny = (ev.clientY - rect.top)  / rect.height;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+  points.push({ position: [nx, ny], label });
+  clearBtn.disabled = false;
+  render();
+  decode();
+}
+
+view.addEventListener('click', (e) => addPoint(e, e.shiftKey ? 0 : 1));
+view.addEventListener('contextmenu', (e) => { e.preventDefault(); addPoint(e, 0); });
+
+clearBtn.addEventListener('click', () => {
+  points = []; maskCanvas = null; lastMask = null;
+  clearBtn.disabled = true; dlBtn.disabled = true;
+  render(); setStatus('Ready — click the object.');
+});
+
+dlBtn.addEventListener('click', () => {
+  if (!lastMask) return;
+  const { data, off, W, H } = lastMask;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const cx = c.getContext('2d');
+  const id = cx.createImageData(W, H);
+  for (let i = 0; i < W * H; ++i) {
+    const v = data[off + i] ? 255 : 0;
+    id.data[i*4+0] = v; id.data[i*4+1] = v; id.data[i*4+2] = v; id.data[i*4+3] = 255;
+  }
+  cx.putImageData(id, 0, 0);
+  const a = document.createElement('a');
+  a.download = 'mask.png'; a.href = c.toDataURL('image/png'); a.click();
+});
+
+fileEl.addEventListener('change', (e) => {
+  const f = e.target.files?.[0];
+  if (f) setImage(URL.createObjectURL(f));
+});
+document.getElementById('sample').addEventListener('click', () => setImage(SAMPLE_URL));
+
+// ── Go ───────────────────────────────────────────────────────────────────────
+modelReady = loadModel();
+modelReady.catch((e) => {
+  console.error('Model failed to load:', e);
+  setStatus('Model failed to load — see console.');
+});
+</script>
+</body>
+</html>

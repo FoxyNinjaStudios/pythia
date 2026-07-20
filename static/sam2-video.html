@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SAM2 Video — Client-Side Object Tracking</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, sans-serif;
+    background: #0f1115; color: #e6e6e6; display: flex; flex-direction: column;
+    align-items: center; padding: 24px; gap: 16px;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  .hint { font-size: 13px; color: #9aa4b2; max-width: 680px; text-align: center; line-height: 1.5; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; align-items: center; }
+  button, label.filebtn {
+    background: #1f6feb; color: #fff; border: none; padding: 8px 14px;
+    border-radius: 8px; font-size: 14px; cursor: pointer;
+  }
+  button.secondary, label.filebtn.secondary { background: #262b34; }
+  button:disabled, label.filebtn.disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-size: 13px; color: #9aa4b2; min-height: 18px; }
+  #stage { position: relative; max-width: 90vw; }
+  #view { max-width: 90vw; max-height: 68vh; border-radius: 10px; cursor: crosshair;
+          background: #14171d; display: block; }
+  input[type=file] { display: none; }
+  .scrub { display: flex; gap: 8px; align-items: center; width: min(90vw, 640px); }
+  .scrub input[type=range] { flex: 1; }
+  .scrub label { font-size: 12px; color: #9aa4b2; min-width: 84px; }
+</style>
+</head>
+<body>
+  <h1>SAM2 Video — client-side object tracking</h1>
+  <p class="hint">
+    Load a video, scrub to a starting frame, then <b>left-click</b> the object to segment it
+    (<b>right-click</b>/Shift+click adds background points). Press <b>Track</b> to follow the object
+    through the clip and record an annotated video. Everything runs in your browser via SAM2.
+    <br /><i>Note: this uses per-frame SAM2 segmentation with centroid propagation — the browser ONNX
+    export has no temporal-memory module, so fast motion or occlusion may lose the object.</i>
+  </p>
+
+  <div class="toolbar">
+    <label class="filebtn" id="filebtn">Load video<input id="file" type="file" accept="video/*" disabled /></label>
+    <button id="sample" class="secondary" disabled>Use sample</button>
+    <button id="clear" class="secondary" disabled>Clear points</button>
+    <button id="track" disabled>Track ▶</button>
+    <button id="stop" class="secondary" disabled>Stop</button>
+    <button id="download" class="secondary" disabled>Download video</button>
+  </div>
+
+  <div class="scrub">
+    <label id="timeLabel">0.0s / 0.0s</label>
+    <input id="scrub" type="range" min="0" max="0" step="0.01" value="0" disabled />
+  </div>
+
+  <div id="status">Loading model…</div>
+
+  <div id="stage">
+    <canvas id="view"></canvas>
+  </div>
+
+<script type="module">
+import {
+  Sam2Model, AutoProcessor, RawImage, Tensor
+} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+
+// SAM2.1 tiny. Other browser-ready exports: onnx-community/sam2.1-hiera-{small,base-plus,large}-ONNX
+const MODEL_ID = 'onnx-community/sam2.1-hiera-tiny-ONNX';
+const SAMPLE_URL =
+  'https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/hopper.mp4';
+
+const TRACK_FPS = 8;         // frames per second sampled while tracking
+
+const view      = document.getElementById('view');
+const ctx       = view.getContext('2d');
+const statusEl  = document.getElementById('status');
+const fileEl    = document.getElementById('file');
+const filebtn   = document.getElementById('filebtn');
+const sampleBtn = document.getElementById('sample');
+const clearBtn  = document.getElementById('clear');
+const trackBtn  = document.getElementById('track');
+const stopBtn   = document.getElementById('stop');
+const dlBtn     = document.getElementById('download');
+const scrubEl   = document.getElementById('scrub');
+const timeLabel = document.getElementById('timeLabel');
+
+let model, processor;
+let modelReady = null;
+
+const videoEl = document.createElement('video');
+videoEl.crossOrigin = 'anonymous';
+videoEl.muted = true;
+videoEl.playsInline = true;
+videoEl.preload = 'auto';
+
+const frameCanvas = document.createElement('canvas'); // offscreen full-res frame
+const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+
+let videoReady = false;
+let points = [];             // { position:[nx,ny], label:0|1 } for the current start frame
+let maskCanvas = null;       // colored overlay for current frame
+let tracking = false;
+let recordUrl = null;        // object URL of the recorded webm
+
+const setStatus = (t) => statusEl.textContent = t;
+
+// ── Load model (WebGPU, fallback to WASM) ────────────────────────────────────
+async function loadModel() {
+  processor = await AutoProcessor.from_pretrained(MODEL_ID);
+  try {
+    model = await Sam2Model.from_pretrained(MODEL_ID, { device: 'webgpu' });
+    setStatus('Model ready (WebGPU). Load a video.');
+  } catch (e) {
+    console.warn('WebGPU unavailable, falling back to WASM:', e);
+    model = await Sam2Model.from_pretrained(MODEL_ID);
+    setStatus('Model ready (WASM). Load a video.');
+  }
+  fileEl.disabled = false;
+  filebtn.classList.remove('disabled');
+  sampleBtn.disabled = false;
+}
+
+// ── Seek helper: set currentTime and wait for the frame to be ready ──────────
+function seek(t) {
+  return new Promise((resolve) => {
+    const onSeeked = () => { videoEl.removeEventListener('seeked', onSeeked); resolve(); };
+    videoEl.addEventListener('seeked', onSeeked);
+    videoEl.currentTime = Math.min(Math.max(t, 0), videoEl.duration || 0);
+  });
+}
+
+// ── Load a video source ──────────────────────────────────────────────────────
+async function setVideo(url) {
+  if (modelReady) { setStatus('Waiting for model…'); await modelReady; }
+  resetState();
+  setStatus('Loading video…');
+
+  videoReady = false;
+  videoEl.src = url;
+  await new Promise((resolve, reject) => {
+    videoEl.onloadeddata = resolve;
+    videoEl.onerror = () => reject(new Error('Could not load video (format or CORS).'));
+  });
+
+  view.width = frameCanvas.width = videoEl.videoWidth;
+  view.height = frameCanvas.height = videoEl.videoHeight;
+
+  scrubEl.min = 0;
+  scrubEl.max = videoEl.duration.toFixed(2);
+  scrubEl.step = (1 / TRACK_FPS).toFixed(3);
+  scrubEl.value = 0;
+  scrubEl.disabled = false;
+
+  await seek(0);
+  drawFrame();
+  videoReady = true;
+  updateTimeLabel();
+  setStatus('Scrub to a start frame, then click the object.');
+}
+
+function resetState() {
+  points = []; maskCanvas = null;
+  clearBtn.disabled = true; trackBtn.disabled = true; dlBtn.disabled = true;
+  if (recordUrl) { URL.revokeObjectURL(recordUrl); recordUrl = null; }
+}
+
+function updateTimeLabel() {
+  const d = videoEl.duration || 0;
+  timeLabel.textContent = `${videoEl.currentTime.toFixed(1)}s / ${d.toFixed(1)}s`;
+}
+
+// ── Draw current video frame to the offscreen + visible canvas ───────────────
+function drawFrame() {
+  frameCtx.drawImage(videoEl, 0, 0, frameCanvas.width, frameCanvas.height);
+  render();
+}
+
+// ── Segment one frame from seed points → returns overlay + mask centroid ─────
+async function segmentFrame(seedPoints) {
+  const rawImage = RawImage.fromCanvas(frameCanvas);
+  const processed = await processor(rawImage);
+  const embeddings = await model.get_image_embeddings(processed);
+
+  const [rh, rw] = processed.reshaped_input_sizes[0];
+  const coords = seedPoints.flatMap(p => [p.position[0] * rw, p.position[1] * rh]);
+  const labels = BigInt64Array.from(seedPoints.map(p => BigInt(p.label)));
+  const input_points = new Tensor('float32', coords, [1, 1, seedPoints.length, 2]);
+  const input_labels = new Tensor('int64', labels, [1, 1, seedPoints.length]);
+
+  const { pred_masks, iou_scores } = await model({
+    ...embeddings, input_points, input_labels,
+  });
+  const masks = await processor.post_process_masks(
+    pred_masks, processed.original_sizes, processed.reshaped_input_sizes,
+  );
+  return buildOverlay(masks[0], iou_scores);
+}
+
+// ── Build a colored overlay canvas + normalized centroid of the best mask ────
+function buildOverlay(maskTensor, scores) {
+  const d = maskTensor.dims;
+  let numMasks, H, W;
+  if (d.length === 4) { numMasks = d[1]; H = d[2]; W = d[3]; }
+  else                { numMasks = d[0]; H = d[1]; W = d[2]; }
+
+  const s = scores.data;
+  let best = 0;
+  for (let i = 1; i < numMasks; ++i) if (s[i] > s[best]) best = i;
+
+  const data = maskTensor.data;
+  const off  = best * H * W;
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const cx = c.getContext('2d');
+  const id = cx.createImageData(W, H);
+  let sumX = 0, sumY = 0, count = 0;
+  for (let y = 0; y < H; ++y) {
+    for (let x = 0; x < W; ++x) {
+      const i = y * W + x;
+      if (data[off + i]) {
+        id.data[i*4+0] = 34; id.data[i*4+1] = 139; id.data[i*4+2] = 230; id.data[i*4+3] = 150;
+        sumX += x; sumY += y; count++;
+      }
+    }
+  }
+  cx.putImageData(id, 0, 0);
+  const centroid = count > 0 ? [sumX / count / W, sumY / count / H] : null;
+  return { overlay: c, centroid, count };
+}
+
+// ── Render frame + overlay + point markers ───────────────────────────────────
+function render(markers = points) {
+  ctx.clearRect(0, 0, view.width, view.height);
+  ctx.drawImage(frameCanvas, 0, 0, view.width, view.height);
+  if (maskCanvas) ctx.drawImage(maskCanvas, 0, 0, view.width, view.height);
+  for (const p of markers) {
+    const x = p.position[0] * view.width;
+    const y = p.position[1] * view.height;
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(4, view.width / 120), 0, 2 * Math.PI);
+    ctx.fillStyle = p.label === 1 ? '#22c55e' : '#ef4444';
+    ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+  }
+}
+
+// ── Segment the current (start) frame from user clicks ───────────────────────
+async function segmentCurrent() {
+  if (points.length === 0) { maskCanvas = null; render(); return; }
+  setStatus('Segmenting…');
+  const { overlay } = await segmentFrame(points);
+  maskCanvas = overlay;
+  render();
+  trackBtn.disabled = false;
+  setStatus('Ready — click to refine, or press Track ▶.');
+}
+
+// ── Click handling (only on the start frame, not while tracking) ─────────────
+function addPoint(ev, label) {
+  if (!videoReady || tracking) return;
+  const rect = view.getBoundingClientRect();
+  const nx = (ev.clientX - rect.left) / rect.width;
+  const ny = (ev.clientY - rect.top)  / rect.height;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+  points.push({ position: [nx, ny], label });
+  clearBtn.disabled = false;
+  render();
+  segmentCurrent();
+}
+
+view.addEventListener('click', (e) => addPoint(e, e.shiftKey ? 0 : 1));
+view.addEventListener('contextmenu', (e) => { e.preventDefault(); addPoint(e, 0); });
+
+clearBtn.addEventListener('click', () => {
+  points = []; maskCanvas = null;
+  clearBtn.disabled = true; trackBtn.disabled = true;
+  render(); setStatus('Click the object to segment it.');
+});
+
+scrubEl.addEventListener('input', async () => {
+  if (!videoReady || tracking) return;
+  points = []; maskCanvas = null;
+  clearBtn.disabled = true; trackBtn.disabled = true;
+  await seek(parseFloat(scrubEl.value));
+  drawFrame();
+  updateTimeLabel();
+});
+
+// ── Track: propagate through the clip and record ─────────────────────────────
+async function track() {
+  if (tracking || points.length === 0) return;
+  tracking = true;
+  trackBtn.disabled = true; stopBtn.disabled = false;
+  clearBtn.disabled = true; scrubEl.disabled = true;
+  fileEl.disabled = true; sampleBtn.disabled = true; dlBtn.disabled = true;
+
+  // Manual-frame stream so each processed frame is recorded exactly once.
+  const stream = view.captureStream(0);
+  const [track0] = stream.getVideoTracks();
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  const recorder = new MediaRecorder(stream, { mimeType: mime });
+  const chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  const recorded = new Promise((res) => { recorder.onstop = res; });
+  recorder.start();
+
+  const dt = 1 / TRACK_FPS;
+  const start = parseFloat(scrubEl.value);
+  const duration = videoEl.duration;
+  let seed = points.slice();           // start from user clicks
+  let frameIdx = 0;
+  const totalFrames = Math.max(1, Math.ceil((duration - start) / dt));
+
+  try {
+    for (let t = start; t <= duration + 1e-3 && tracking; t += dt) {
+      await seek(t);
+      frameCtx.drawImage(videoEl, 0, 0, frameCanvas.width, frameCanvas.height);
+
+      const { overlay, centroid, count } = await segmentFrame(seed);
+      maskCanvas = overlay;
+      // Show the seed markers on the first frame, none afterwards.
+      render(frameIdx === 0 ? points : []);
+      track0.requestFrame();
+
+      updateTimeLabel();
+      setStatus(`Tracking… frame ${frameIdx + 1}/${totalFrames}`);
+
+      // Propagate: next frame is seeded from this mask's centroid.
+      if (centroid && count > 20) {
+        seed = [{ position: centroid, label: 1 }];
+      } else {
+        setStatus(`Lost the object at frame ${frameIdx + 1}. Stopping.`);
+        break;
+      }
+      frameIdx++;
+    }
+  } finally {
+    recorder.stop();
+    await recorded;
+    stream.getTracks().forEach(tr => tr.stop());
+
+    if (recordUrl) URL.revokeObjectURL(recordUrl);
+    recordUrl = URL.createObjectURL(new Blob(chunks, { type: mime }));
+    dlBtn.disabled = false;
+
+    tracking = false;
+    stopBtn.disabled = true;
+    scrubEl.disabled = false;
+    fileEl.disabled = false; sampleBtn.disabled = false;
+    trackBtn.disabled = points.length === 0;
+    clearBtn.disabled = points.length === 0;
+    setStatus('Tracking complete — Download video to save the result.');
+  }
+}
+
+trackBtn.addEventListener('click', track);
+stopBtn.addEventListener('click', () => { tracking = false; });
+
+dlBtn.addEventListener('click', () => {
+  if (!recordUrl) return;
+  const a = document.createElement('a');
+  a.download = 'sam2-tracking.webm';
+  a.href = recordUrl;
+  a.click();
+});
+
+fileEl.addEventListener('change', (e) => {
+  const f = e.target.files?.[0];
+  if (f) setVideo(URL.createObjectURL(f));
+});
+sampleBtn.addEventListener('click', () => setVideo(SAMPLE_URL));
+
+// ── Go ───────────────────────────────────────────────────────────────────────
+modelReady = loadModel();
+modelReady.catch((e) => {
+  console.error('Model failed to load:', e);
+  setStatus('Model failed to load — see console.');
+});
+</script>
+</body>
+</html>
