@@ -179,6 +179,16 @@ class ReconstructRequest(BaseModel):
     # Client sends these from the Fast/Medium/Slow presets; default is Fast (8/8).
     stage1_steps: int = 8
     stage2_steps: int = 8
+    # Layout placement: also produce a scene-placed GLB positioning the object in
+    # camera space via the predicted pose. layout_refine adds ICP + render-compare
+    # pose refinement (slower, CPU-only).
+    layout: bool = False
+    layout_refine: bool = False
+
+
+class DepthRequest(BaseModel):
+    image_id: str
+    mask_b64: str   # base64-encoded PNG mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,9 +238,28 @@ async def segment(req: SegmentRequest):
         None,
         lambda: _sam_predict(image, req.positive_points, req.negative_points),
     )
+    mask = smooth_mask(mask)
 
     from sam_wrapper import mask_to_base64_png
     return {"mask_b64": mask_to_base64_png(mask)}
+
+
+# ── Depth preview ──────────────────────────────────────────────────────────────
+
+@app.post("/depth")
+async def depth(req: DepthRequest):
+    """Greyscale depth map of the masked object (best-effort, for the preview)."""
+    img_path = UPLOAD_DIR / f"{req.image_id}.png"
+    if not img_path.exists():
+        raise HTTPException(404, "Image not found")
+
+    image = np.array(PILImage.open(img_path).convert("RGB"))
+    from sam_wrapper import base64_png_to_mask
+    mask = base64_png_to_mask(req.mask_b64)
+
+    loop = asyncio.get_event_loop()
+    depth_b64 = await loop.run_in_executor(None, lambda: _depth_to_png(image, mask))
+    return {"depth_b64": depth_b64}
 
 
 # ── Reconstruct ────────────────────────────────────────────────────────────────
@@ -263,6 +292,8 @@ async def reconstruct(req: ReconstructRequest):
         str(mask_path),
         stage1_steps,
         stage2_steps,
+        bool(req.layout),
+        bool(req.layout_refine),
     )
 
     return {"job_id": job_id}
@@ -346,7 +377,18 @@ async def get_result(job_id: str, format: str = "glb"):
         raise HTTPException(202, "Not ready yet")
     if job.error:
         raise HTTPException(500, job.error)
-    fmt = "ply" if str(format).lower() == "ply" else "glb"
+    fmt_raw = str(format).lower()
+    if fmt_raw == "placed":
+        # Scene-placed GLB (object positioned in camera space).
+        path = Path(job.result_path).with_name(Path(job.result_path).stem + "_placed.glb")
+        if not path.exists():
+            raise HTTPException(404, "Placed GLB not available")
+        return FileResponse(
+            str(path),
+            media_type="model/gltf-binary",
+            filename="reconstruction_placed.glb",
+        )
+    fmt = "ply" if fmt_raw == "ply" else "glb"
     path = Path(job.result_path).with_suffix(f".{fmt}")
     if not path.exists():
         raise HTTPException(404, f"{fmt.upper()} not available")
@@ -365,6 +407,155 @@ async def get_result(job_id: str, format: str = "glb"):
 def _sam_predict(image, positive_points, negative_points):
     from sam_wrapper import predict_mask
     return predict_mask(image, positive_points, negative_points)
+
+
+def smooth_mask(
+    mask: np.ndarray,
+    close_frac: float = 0.006,
+    open_frac: float = 0.004,
+    blur_frac: float = 0.004,
+    keep_largest: bool = True,
+) -> np.ndarray:
+    """Clean a SAM mask before reconstruction.
+
+    Fills pinholes, removes speckles, optionally keeps only the largest blob,
+    and smooths the jagged boundary (blur -> re-threshold). Kernel sizes are a
+    fraction of the image's shorter side so the amount of smoothing is
+    resolution-independent. Returns a uint8 0/255 mask (same as the input).
+    """
+    import cv2
+
+    m = (np.asarray(mask) > 127).astype(np.uint8) * 255
+    if m.ndim == 3:
+        m = m[..., -1]
+
+    short = max(1, min(m.shape[:2]))
+
+    def _odd(frac: float, lo: int = 3) -> int:
+        k = int(round(short * frac))
+        k = max(lo, k)
+        return k | 1  # force odd
+
+    # 1) close then open: fill pinholes, then drop speckles
+    if close_frac > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(close_frac), _odd(close_frac)))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    if open_frac > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(open_frac), _odd(open_frac)))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+
+    # 2) keep only the largest connected component (drops stray islands)
+    if keep_largest:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+        if n > 2:  # background + >1 blob
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            m = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    # 3) blur -> threshold: round the jaggies
+    if blur_frac > 0:
+        ksize = _odd(blur_frac)
+        m = cv2.GaussianBlur(m, (ksize, ksize), 0)
+        m = (m > 127).astype(np.uint8) * 255
+
+    if not m.any():
+        # Never hand back an empty mask if the original had something.
+        return (np.asarray(mask) > 127).astype(np.uint8) * 255
+    return m
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Depth preview  – run MoGe once to show a greyscale depth map of the object
+# while the (much slower) 3-D reconstruction runs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_depth_pipeline = None
+_depth_lock = threading.Lock()
+
+
+def _get_depth_pipeline():
+    """Lazily build (and cache) a lightweight pipeline used only for MoGe depth.
+
+    Construction only loads the small preprocessors; the MoGe weights are loaded
+    on first ``compute_pointmap`` call and unloaded again right after so they do
+    not compete for memory with the reconstruction pipeline.
+    """
+    global _depth_pipeline
+    with _depth_lock:
+        if _depth_pipeline is None:
+            from sam3d_objects.pipeline.inference_pipeline_low_memory import (
+                InferencePipelineLowMemory,
+            )
+            _depth_pipeline = InferencePipelineLowMemory(
+                config_path="checkpoints/hf/pipeline.yaml",
+                device="cpu",
+                dtype="float16",
+                cache_dir=".cache",
+            )
+        return _depth_pipeline
+
+
+def _depth_to_png(image_rgb: np.ndarray, mask: np.ndarray) -> Optional[str]:
+    """Return a base64 RGBA PNG: greyscale depth inside the mask, transparent out.
+
+    Near = bright, far = dark. Never raises — returns ``None`` on any failure so
+    the client simply keeps showing the plain mask.
+    """
+    try:
+        import cv2
+
+        pipe = _get_depth_pipeline()
+
+        m = (np.asarray(mask) > 127)
+        if m.ndim == 3:
+            m = m[..., -1]
+        if not m.any():
+            return None
+
+        # MoGe expects an RGBA image (mask carried in the alpha channel).
+        rgba = pipe.merge_image_and_mask(image_rgb, m.astype(np.uint8) * 255)
+
+        # Serialise MoGe access: it is not safe to run the same model from two
+        # threads, and the reconstruction pipeline uses its own instance.
+        with _depth_lock:
+            point_map = pipe.compute_pointmap(rgba)
+            try:
+                z = point_map["pointmap"][2].detach().cpu().numpy().astype(np.float32)
+            finally:
+                # Free the MoGe weights before the heavy reconstruction stages.
+                pipe._unload_depth_model()
+
+        # Resize the mask to the pointmap grid if MoGe changed resolution.
+        if z.shape != m.shape:
+            m = cv2.resize(m.astype(np.uint8), (z.shape[1], z.shape[0]),
+                           interpolation=cv2.INTER_NEAREST) > 0
+
+        vals = z[m]
+        if vals.size == 0 or not np.isfinite(vals).any():
+            return None
+        vals = vals[np.isfinite(vals)]
+
+        # Robust normalise within the object (ignore outlier tails).
+        lo, hi = np.percentile(vals, 2), np.percentile(vals, 98)
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
+        norm = np.clip((z - lo) / (hi - lo), 0.0, 1.0)
+        # Map depth through a full-colour scale (turbo): near = warm, far = cool.
+        depth_u8 = ((1.0 - norm) * 255.0).astype(np.uint8)  # near = high end
+        colored = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)  # BGR
+        colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+
+        # Compose RGBA: coloured depth where masked, fully transparent elsewhere.
+        h, w = norm.shape
+        out = np.zeros((h, w, 4), dtype=np.uint8)
+        out[..., :3] = colored
+        out[..., 3] = np.where(m, 255, 0).astype(np.uint8)
+
+        buf = io.BytesIO()
+        PILImage.fromarray(out, mode="RGBA").save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as exc:  # never break the preview
+        logger.warning("Depth preview failed: %s", exc)
+        return None
 
 
 class _PipelineLogHandler(logging.Handler):
@@ -394,6 +585,8 @@ def _run_reconstruction_sync(
     mask_path: str,
     stage1_steps: int = 8,
     stage2_steps: int = 8,
+    layout: bool = False,
+    layout_refine: bool = False,
 ):
     """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
@@ -438,6 +631,8 @@ def _run_reconstruction_sync(
             decode_formats=_decode_formats,
             simplify_ratio=0.0,
             vertex_color_source="gaussian",
+            with_layout_postprocess=layout,
+            layout_refine=layout_refine,
         )
 
         # The pipeline already returns a per-vertex-colored GLB (to_glb colors each
@@ -449,6 +644,20 @@ def _run_reconstruction_sync(
         result_ply = str(RESULT_DIR / f"{job_id}.ply")
         job.update("Exporting GLB + PLY…", 95)
         result_mesh.export(result_path, file_type="glb")
+
+        # Scene-placed GLB (object positioned in camera space via predicted pose).
+        placed_mesh = output.get("glb_placed")
+        if placed_mesh is not None:
+            try:
+                placed_path = str(RESULT_DIR / f"{job_id}_placed.glb")
+                placed_mesh.export(placed_path, file_type="glb")
+                iou = output.get("layout_iou")
+                logger.info(
+                    f"[JOB {job_id}] Placed GLB exported"
+                    + (f" (layout IoU {iou})" if iou is not None else "")
+                )
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] Placed GLB export failed: {exc}")
 
         # PLY: prefer a real Gaussian splat (optional module); otherwise fall back
         # to exporting the mesh as a .ply so the download link always works.

@@ -49,6 +49,10 @@ Using **SAM 3D** by Meta AI:
   - `GLB` mesh with **per-vertex color** (default).
   - `GLB` mesh with a **baked UV texture atlas** (portable, no CUDA / nvdiffrast).
   - Real **3D Gaussian-Splatting `.ply`** for depth-ambiguous / soft previews.
+- **Scene placement (pose + layout)** — optionally position the reconstructed
+  object in real-world camera space using the model's predicted pose, with an
+  optional pointmap/mask-guided refinement pass. Emits a `*_placed.glb`
+  alongside the canonical mesh.
 - **Apple-Silicon native** — MPS backend plus hand-written Metal kernels for
   sparse convolution and flash attention.
 - **Low-memory pipeline** — sequential stage loading and SLAT caching to fit in
@@ -71,6 +75,11 @@ python server.py
 
 Workflow: upload an image → click points to segment the object → pick a quality
 preset → reconstruct → orbit the result and download **GLB** or **PLY**.
+
+To place the object in real-world camera space, tick **Place in scene** before
+reconstructing (and optionally **Refine** for a slower, pointmap-guided pose
+pass). The result view then offers a **View placed / View object** toggle and a
+placed-GLB download.
 
 Optional Gaussian-splat export is on by default; disable it with
 `SAM3D_SPLAT=0`.
@@ -99,8 +108,43 @@ python main.py \
 | `--bake` | Bake a UV texture atlas instead of per-vertex color |
 | `--bake-source` | `gaussian` (higher fidelity) or `vertex` |
 | `--texture-size` | Baked atlas edge length in px (default: 2048) |
+| `--layout` | Also emit a scene-placed `<output>_placed.glb` (object posed in camera space) |
+| `--layout-refine` | With `--layout`, refine the pose against the pointmap + mask (ICP + render-compare; slower, CPU) |
 | `--cache-dir` / `--load-slat` | Cache / reuse intermediate SLAT to skip stages 0–2 |
 | `--output` `-o` | Output file (`.glb`, `.stl`) |
+
+#### Scene placement (pose + layout)
+
+By default the mesh is exported in canonical object space (centered, unit-ish
+scale). Pass `--layout` to also write a `<output>_placed.glb` that positions the
+object in real-world **camera space** using the pose the model predicts:
+
+```bash
+python main.py \
+    --image images/shutterstock_stylish_kidsroom_1640806567/image.png \
+    --mask-dir images/shutterstock_stylish_kidsroom_1640806567 \
+    --mask-index 0 \
+    --mesh --layout --layout-refine \
+    --output outputs/reconstruction.glb
+# writes outputs/reconstruction.glb (canonical) + outputs/reconstruction_placed.glb (posed)
+```
+
+What each step does:
+
+1. **Pose prediction** — the sparse-structure stage already predicts an object
+   rotation, translation, and scale (relative to the camera); these are decoded
+   into a placement transform.
+2. **Placement (`--layout`)** — the transform (z-up → y-up basis change, then
+   scale / rotate / translate) is applied to the exported mesh, so the object
+   sits where it was observed in the photo. The canonical mesh is always kept.
+3. **Refinement (`--layout-refine`, optional)** — refines the pose against the
+   MoGe pointmap and the object mask: manual point-cloud alignment → shape ICP →
+   a render-and-compare silhouette optimization (reported as a layout IoU). Runs
+   on CPU and is slower; without it, placement just uses the raw predicted pose.
+
+Placement never blocks the main path: if pose or refinement fails, the canonical
+mesh is still produced. Both `--layout` flags have equivalents in the web UI
+(**Place in scene** / **Refine**).
 
 ## Installation
 

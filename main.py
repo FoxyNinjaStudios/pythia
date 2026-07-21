@@ -121,6 +121,8 @@ def run_pipeline(
     texture_bake_source: str = "gaussian",
     texture_size: int = 2048,
     vertex_color_source: str = "gaussian",
+    layout: bool = False,
+    layout_refine: bool = False,
 ):
     """
     Run SAM-3D pipeline: image + mask -> 3D mesh.
@@ -145,6 +147,10 @@ def run_pipeline(
         vertex_color_source: For the default (non-bake) path, where per-vertex color comes
             from: "gaussian" (saturated SH-DC appearance, recommended) or "mesh" (the
             decoder's washed-out vertex head).
+        layout: If True, also emit a scene-placed GLB positioning the object in
+            camera space using the predicted pose (written as <output>_placed.glb).
+        layout_refine: If True, refine the pose against the pointmap + mask (ICP +
+            render-compare) before placement. Slower (runs on CPU).
     """
     from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
 
@@ -231,6 +237,8 @@ def run_pipeline(
         texture_bake_source=texture_bake_source,
         texture_size=texture_size,
         vertex_color_source=vertex_color_source,
+        with_layout_postprocess=layout,
+        layout_refine=layout_refine,
     )
     
     t_total = time.perf_counter() - t_start
@@ -264,6 +272,18 @@ def run_pipeline(
             print(f"[OUTPUT] Mesh saved to: {ply_path}")
         except Exception as e:
             print(f"[OUTPUT] PLY export skipped: {e}")
+
+        # Scene-placed GLB (object positioned in camera space via the predicted pose).
+        placed = output.get("glb_placed")
+        if placed is not None:
+            placed_path = os.path.splitext(output_path)[0] + "_placed.glb"
+            try:
+                placed.export(placed_path, file_type='glb')
+                iou = output.get("layout_iou")
+                iou_str = f" (layout IoU {iou})" if iou is not None else ""
+                print(f"[OUTPUT] Placed mesh saved to: {placed_path}{iou_str}")
+            except Exception as e:
+                print(f"[OUTPUT] Placed GLB export skipped: {e}")
     elif not output_mesh:
         print("[OUTPUT] Voxel export complete (mesh generation skipped).")
     else:
@@ -378,6 +398,18 @@ def main():
              "(saturated SH-DC appearance, recommended) or 'mesh' (the decoder's washed-out "
              "vertex head). Default: gaussian."
     )
+    parser.add_argument(
+        "--layout",
+        action="store_true",
+        help="Also emit a scene-placed GLB (<output>_placed.glb) positioning the object in "
+             "camera space using the model's predicted pose."
+    )
+    parser.add_argument(
+        "--layout-refine",
+        action="store_true",
+        help="With --layout, refine the pose against the pointmap + mask (ICP + "
+             "render-compare) before placement. Slower; runs on CPU."
+    )
 
     args = parser.parse_args()
     
@@ -410,6 +442,8 @@ def main():
         texture_bake_source=args.bake_source,
         texture_size=args.texture_size,
         vertex_color_source=args.vertex_color_source,
+        layout=args.layout,
+        layout_refine=args.layout_refine,
     )
 
 

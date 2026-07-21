@@ -37,6 +37,7 @@ from sam3d_objects.pipeline.inference_utils import (
     SLAT_STD,
     downsample_sparse_structure,
     prune_sparse_structure,
+    layout_post_optimization,
 )
 from sam3d_objects.model.io import (
     load_model_from_checkpoint,
@@ -172,7 +173,12 @@ class InferencePipelineLowMemory:
         self.config = OmegaConf.load(config_path)
         self.device = torch.device(device)
         self.dtype = self._get_dtype(dtype)
-        self.layout_post_optimization_method = layout_post_optimization_method
+        # Layout post-optimization method (pose refinement against the pointmap +
+        # mask). Defaults to the CPU/MPS-portable implementation so callers can
+        # opt in via run(with_layout_postprocess=True) without extra wiring.
+        self.layout_post_optimization_method = (
+            layout_post_optimization_method or layout_post_optimization
+        )
         self.clip_pointmap_beyond_scale = clip_pointmap_beyond_scale
         self.cache_dir = cache_dir
         
@@ -449,6 +455,140 @@ class InferencePipelineLowMemory:
         )
         return x.squeeze(0)
     
+    def _pose_to_placement_transform(self, pose, device):
+        """Build the local->camera placement transform from a decoded pose.
+
+        Mirrors the convention used by the layout optimizer (get_mesh): the mesh
+        is first rotated from z-up (mesh decoder frame) to y-up (pytorch3d camera
+        frame), then the predicted scale/rotation/translation are applied.
+
+        Returns a pytorch3d Transform3d (batch of 1).
+        """
+        from pytorch3d.transforms import quaternion_to_matrix
+        from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
+
+        quat = pose["rotation"].to(device).float()
+        trans = pose["translation"].to(device).float()
+        scale = pose["scale"].to(device).float()
+        # Normalise shapes to a batch of 1.
+        if quat.dim() == 1:
+            quat = quat[None]
+        quat = quat.reshape(-1, 4)[:1]
+        trans = trans.reshape(-1, 3)[:1]
+        scale = scale.reshape(-1, 3)[:1]
+
+        rotation = quaternion_to_matrix(quat)  # (1, 3, 3)
+
+        # z-up -> y-up basis change, applied as verts @ R_convert.T (row vectors).
+        r_convert = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+        convert_tfm = Transform3d(device=device).rotate(r_convert.T[None])
+        pose_tfm = compose_transform(
+            scale=scale, rotation=rotation, translation=trans
+        )
+        return convert_tfm.compose(pose_tfm)
+
+    def _apply_transform_to_glb(self, glb, transform, device):
+        """Apply a pytorch3d Transform3d to every geometry in a trimesh GLB.
+
+        trimesh uses column-vector homogeneous matrices (v' = M @ v), whereas
+        pytorch3d's get_matrix() is row-vector (v' = v @ M); the two differ by a
+        transpose. Returns a transformed copy (input is left untouched).
+        """
+        m_row = transform.get_matrix()[0].detach().cpu().numpy()  # (4, 4) row-vector
+        m_col = m_row.T  # column-vector convention for trimesh
+        placed = deepcopy(glb)
+        placed.apply_transform(m_col)
+        return placed
+
+    def _run_layout_placement(
+        self,
+        glb,
+        pose,
+        intrinsics,
+        layout_mask,
+        layout_pointmap,
+        refine,
+        device,
+    ):
+        """Refine the object pose against the pointmap/mask and place the mesh.
+
+        Args:
+            glb: canonical-space trimesh produced by ``to_glb``.
+            pose: dict with ``rotation`` (quat), ``translation``, ``scale``.
+            intrinsics: normalised 3x3 camera intrinsics tensor (or None).
+            layout_mask: HxW object mask at model-input resolution (or None).
+            layout_pointmap: HxWx3 pointmap at model-input resolution (or None).
+            refine: if True and inputs are available, run the ICP + render-compare
+                layout optimizer to refine the pose before placing.
+            device: torch device string for the (CPU/MPS) optimizer.
+
+        Returns:
+            (placed_glb, refined_pose, iou). ``placed_glb`` is a copy of ``glb``
+            transformed into camera space; ``refined_pose`` is the (possibly
+            refined) pose dict; ``iou`` is the layout IoU (or None).
+        """
+        refined_pose = dict(pose)
+        iou = None
+
+        can_refine = (
+            refine
+            and self.layout_post_optimization_method is not None
+            and intrinsics is not None
+            and layout_mask is not None
+            and layout_pointmap is not None
+        )
+        if can_refine:
+            try:
+                logger.info("[LOW-MEM] Running layout post-optimization (pose refine)...")
+                intr = intrinsics.clone().float().to(device)
+                fx, fy = intr[0, 0], intr[1, 1]
+                re_focal = torch.minimum(fx, fy)
+                intr[0, 0], intr[1, 1] = re_focal, re_focal
+                (
+                    revised_quat,
+                    revised_t,
+                    revised_scale,
+                    final_iou,
+                    _flag_icp,
+                    _flag_optim,
+                ) = self.layout_post_optimization_method(
+                    deepcopy(glb),
+                    pose["rotation"].to(device),
+                    pose["translation"].to(device),
+                    pose["scale"].to(device),
+                    layout_mask.to(device),
+                    layout_pointmap.to(device),
+                    intr,
+                    min_size=518,
+                    device=torch.device(device),
+                )
+                refined_pose = {
+                    "rotation": revised_quat,
+                    "translation": revised_t,
+                    "scale": revised_scale,
+                }
+                iou = final_iou
+                logger.info(f"[LOW-MEM] Layout refinement IoU: {final_iou}")
+            except Exception as e:  # never break the main path on a refine failure
+                logger.warning(
+                    f"[LOW-MEM] Layout refinement failed ({e}); placing with decoded pose",
+                    exc_info=True,
+                )
+                refined_pose = dict(pose)
+
+        try:
+            transform = self._pose_to_placement_transform(refined_pose, device)
+            placed_glb = self._apply_transform_to_glb(glb, transform, device)
+        except Exception as e:
+            logger.warning(f"[LOW-MEM] Object placement failed ({e}); returning canonical mesh")
+            placed_glb = None
+
+        return placed_glb, refined_pose, iou
+
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],
@@ -458,6 +598,7 @@ class InferencePipelineLowMemory:
         with_mesh_postprocess=True,
         with_texture_baking=True,
         with_layout_postprocess=False,
+        layout_refine=False,
         use_vertex_color=True,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
@@ -479,6 +620,11 @@ class InferencePipelineLowMemory:
             use_cache: If True and cache_dir is set, load cached stages and save new results.
             simplify_ratio: Ratio of triangles to remove during mesh simplification (0.0=none, 0.95=heavy).
             load_slat: Path to a cached SLAT .pt file to load directly (skips stages 0-2).
+            with_layout_postprocess: If True, place the decoded object into camera
+                space using the predicted pose. Emits ``glb_placed`` in the output.
+            layout_refine: If True (and layout inputs are available), refine the pose
+                with the ICP + render-compare layout optimizer before placement.
+                Requires a fresh run (not a cached SLAT). Slower; runs on CPU.
         """
         logger.info("[LOW-MEM] Starting sequential inference pipeline")
         log_memory("Start of run()")
@@ -492,6 +638,12 @@ class InferencePipelineLowMemory:
         ss_return_dict = {}
         pts = None
         pts_colors = None
+        # Layout-placement state (persisted across stages). intrinsics comes from
+        # STAGE 0; the mask/pointmap for optional pose refinement come from the SS
+        # preprocessor and are only available on a fresh (non-cached) run.
+        intrinsics = None
+        layout_mask = None
+        layout_pointmap = None
         
         # Check if we should load SLAT from a specific file
         if load_slat:
@@ -504,6 +656,8 @@ class InferencePipelineLowMemory:
             ss_return_dict["translation"] = slat_cache.get("ss_return_dict_translation")
             ss_return_dict["scale"] = slat_cache.get("ss_return_dict_scale")
             ss_return_dict["coords"] = slat_cache.get("coords")
+            ss_return_dict["rotation"] = slat_cache.get("ss_return_dict_rotation")
+            intrinsics = slat_cache.get("intrinsics")
             pts = slat_cache.get("pts")
             pts_colors = slat_cache.get("pts_colors")
             slat_from_cache = True
@@ -526,6 +680,8 @@ class InferencePipelineLowMemory:
                 ss_return_dict["translation"] = slat_cache.get("ss_return_dict_translation")
                 ss_return_dict["scale"] = slat_cache.get("ss_return_dict_scale")
                 ss_return_dict["coords"] = slat_cache.get("coords")
+                ss_return_dict["rotation"] = slat_cache.get("ss_return_dict_rotation")
+                intrinsics = slat_cache.get("intrinsics")
                 pts = slat_cache.get("pts")
                 pts_colors = slat_cache.get("pts_colors")
                 slat_from_cache = True
@@ -541,6 +697,8 @@ class InferencePipelineLowMemory:
             pointmap = pointmap_dict["pointmap"]
             pts = self._down_sample_img(pointmap)
             pts_colors = self._down_sample_img(pointmap_dict["pts_color"])
+            # Camera intrinsics for optional layout placement / pose refinement.
+            intrinsics = pointmap_dict.get("intrinsics")
             
             # Unload depth model immediately
             self._unload_depth_model()
@@ -549,6 +707,15 @@ class InferencePipelineLowMemory:
             # Preprocess images
             ss_input_dict = self.preprocess_image(image, self.ss_preprocessor, pointmap=pointmap)
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            
+            # Stash the model-resolution mask + pointmap for optional pose
+            # refinement (only available on a fresh run, not from SLAT cache).
+            if with_layout_postprocess and layout_refine:
+                _rgb_mask = ss_input_dict.get("rgb_image_mask")
+                _rgb_pm = ss_input_dict.get("rgb_pointmap")
+                if _rgb_mask is not None and _rgb_pm is not None:
+                    layout_mask = _rgb_mask[0, 0].detach().cpu()
+                    layout_pointmap = _rgb_pm[0].permute(1, 2, 0).detach().cpu()
             
             if seed is not None:
                 torch.manual_seed(seed)
@@ -732,6 +899,8 @@ class InferencePipelineLowMemory:
                 "feats": slat.feats.cpu(),
                 "ss_return_dict_translation": ss_return_dict.get("translation"),
                 "ss_return_dict_scale": ss_return_dict.get("scale"),
+                "ss_return_dict_rotation": ss_return_dict.get("rotation"),
+                "intrinsics": intrinsics.cpu() if isinstance(intrinsics, torch.Tensor) else intrinsics,
                 "pts": pts.cpu() if pts is not None else None,
                 "pts_colors": pts_colors.cpu() if pts_colors is not None else None,
             }, slat_save_path)
@@ -745,6 +914,8 @@ class InferencePipelineLowMemory:
                     "feats": slat.feats.cpu(),
                     "ss_return_dict_translation": ss_return_dict.get("translation"),
                     "ss_return_dict_scale": ss_return_dict.get("scale"),
+                    "ss_return_dict_rotation": ss_return_dict.get("rotation"),
+                    "intrinsics": intrinsics.cpu() if isinstance(intrinsics, torch.Tensor) else intrinsics,
                     "pts": pts.cpu() if pts is not None else None,
                     "pts_colors": pts_colors.cpu() if pts_colors is not None else None,
                 }, slat_cache_path)
@@ -889,6 +1060,45 @@ class InferencePipelineLowMemory:
         if "gaussian" in outputs:
             outputs["gs"] = outputs["gaussian"][0]
         
+        # ========================
+        # Layout placement (opt-in)
+        # ========================
+        # Position the reconstructed object into camera space using the pose the
+        # SS generator predicted (optionally refined against the pointmap/mask).
+        # Emits ``glb_placed`` alongside the canonical ``glb``; the canonical mesh
+        # is always kept so the default viewer/export path is unchanged.
+        if with_layout_postprocess and outputs.get("glb") is not None:
+            has_pose = all(
+                ss_return_dict.get(k) is not None
+                for k in ("rotation", "translation", "scale")
+            )
+            if not has_pose:
+                logger.warning(
+                    "[LOW-MEM] Layout placement requested but no decoded pose available; "
+                    "skipping (the model config may not predict pose)."
+                )
+            else:
+                pose = {
+                    "rotation": ss_return_dict["rotation"],
+                    "translation": ss_return_dict["translation"],
+                    "scale": ss_return_dict["scale"],
+                }
+                placed_glb, refined_pose, layout_iou = self._run_layout_placement(
+                    outputs["glb"],
+                    pose,
+                    intrinsics,
+                    layout_mask,
+                    layout_pointmap,
+                    refine=layout_refine,
+                    device="cpu",
+                )
+                if placed_glb is not None:
+                    outputs["glb_placed"] = placed_glb
+                    ss_return_dict.update(refined_pose)
+                    if layout_iou is not None:
+                        outputs["layout_iou"] = layout_iou
+                    logger.info("[LOW-MEM] Object placed into camera space (glb_placed).")
+        
         log_memory("End of run()")
         logger.info("[LOW-MEM] Pipeline complete!")
         
@@ -896,6 +1106,8 @@ class InferencePipelineLowMemory:
             **ss_return_dict,
             **outputs,
         }
+        if intrinsics is not None:
+            result["intrinsics"] = intrinsics
         
         # Only include pointmap if it was computed (not when loading from cache)
         if pts is not None:

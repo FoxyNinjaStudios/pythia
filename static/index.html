@@ -435,6 +435,17 @@ model-viewer {
       </div>
     </div>
 
+    <div class="control-row" style="display:flex;align-items:center;gap:10px;margin:10px 0 2px;">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;">
+        <input type="checkbox" id="layout-toggle" />
+        <span>Place in scene <span style="opacity:.6">(estimate real-world pose)</span></span>
+      </label>
+      <label id="layout-refine-wrap" style="display:none;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;opacity:.85;">
+        <input type="checkbox" id="layout-refine-toggle" />
+        <span>Refine <span style="opacity:.6">(slower, CPU)</span></span>
+      </label>
+    </div>
+
     <div class="btn-row">
       <button class="btn-ghost" id="undo-btn" onclick="undo()" disabled title="Undo (⌘Z)">↶ Undo</button>
       <button class="btn-ghost" id="redo-btn" onclick="redo()" disabled title="Redo (⇧⌘Z)">↷ Redo</button>
@@ -486,6 +497,8 @@ model-viewer {
     <div class="result-actions">
       <a id="download-link"><button class="btn-secondary">⬇ Download GLB</button></a>
       <a id="download-link-ply"><button class="btn-secondary">⬇ Download PLY</button></a>
+      <button class="btn-secondary" id="toggle-placed-btn" style="display:none" onclick="togglePlaced()">🎯 View placed</button>
+      <a id="download-link-placed" style="display:none"><button class="btn-secondary">⬇ Download placed GLB</button></a>
     </div>
   </div>
 
@@ -506,6 +519,18 @@ function setQuality(btn) {
   document.querySelectorAll("#quality-seg button")
     .forEach(b => b.classList.toggle("active", b === btn));
 }
+
+// Reveal the "Refine" sub-option only when scene placement is enabled.
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.id === "layout-toggle") {
+    const wrap = document.getElementById("layout-refine-wrap");
+    if (wrap) wrap.style.display = e.target.checked ? "flex" : "none";
+    if (!e.target.checked) {
+      const rf = document.getElementById("layout-refine-toggle");
+      if (rf) rf.checked = false;
+    }
+  }
+});
 
 function qualityLabel() {
   const { s1, s2 } = qualitySteps;
@@ -983,11 +1008,24 @@ async function startReconstruct() {
   // Show the segmentation mask in the preview slot while we reconstruct.
   const rmi = document.getElementById("recon-mask-img");
   if (rmi) rmi.src = lastMaskB64 ? "data:image/png;base64," + lastMaskB64 : "";
+  // Best-effort: upgrade the mask into a greyscale depth map (MoGe) once ready.
+  if (rmi && lastMaskB64) {
+    fetch("/depth", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ image_id: imageId, mask_b64: lastMaskB64 }),
+    })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d && d.depth_b64) rmi.src = "data:image/png;base64," + d.depth_b64; })
+      .catch(() => {});
+  }
   setProgress(5, "Sending request…");
   startTimer();
 
   const body = { image_id: imageId, mask_b64: lastMaskB64,
-                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2 };
+                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2,
+                 layout: !!(document.getElementById("layout-toggle") || {}).checked,
+                 layout_refine: !!(document.getElementById("layout-refine-toggle") || {}).checked };
   const res  = await fetch("/reconstruct", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -1070,6 +1108,38 @@ function showResult(jobId, elapsed) {
     linkPly.href     = `${url}?format=ply`;
     linkPly.download = "reconstruction.ply";
   }
+
+  // Scene-placed GLB: probe for availability, then reveal the view/download controls.
+  _placedJobId  = jobId;
+  _showingPlaced = false;
+  const placedUrl  = `${url}?format=placed`;
+  const toggleBtn  = document.getElementById("toggle-placed-btn");
+  const linkPlaced = document.getElementById("download-link-placed");
+  if (toggleBtn) toggleBtn.style.display = "none";
+  if (linkPlaced) linkPlaced.style.display = "none";
+  fetch(placedUrl, { method: "HEAD" })
+    .then(r => {
+      if (!r.ok) return;
+      if (toggleBtn) { toggleBtn.style.display = ""; toggleBtn.textContent = "🎯 View placed"; }
+      if (linkPlaced) {
+        linkPlaced.style.display = "";
+        linkPlaced.href = placedUrl;
+        linkPlaced.download = "reconstruction_placed.glb";
+      }
+    })
+    .catch(() => {});
+}
+
+let _placedJobId = null;
+let _showingPlaced = false;
+function togglePlaced() {
+  if (!_placedJobId) return;
+  const viewer = document.getElementById("viewer");
+  const btn    = document.getElementById("toggle-placed-btn");
+  _showingPlaced = !_showingPlaced;
+  const base = `/result/${_placedJobId}`;
+  viewer.setAttribute("src", _showingPlaced ? `${base}?format=placed` : base);
+  if (btn) btn.textContent = _showingPlaced ? "↩ View object" : "🎯 View placed";
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
