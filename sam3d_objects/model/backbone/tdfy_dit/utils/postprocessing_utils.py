@@ -1095,13 +1095,14 @@ def to_glb(
     else:
         mesh = trimesh.Trimesh(vertices, faces)
 
-    # Silhouette de-staircase: the mesh is extracted from a 64^3 sparse voxel
-    # grid, so its surface (and thus the rendered silhouette) inherits a
-    # ~1/64 step-size staircase that no amount of 2D-mask cleanup can remove.
-    # A few passes of volume-preserving Taubin smoothing (lambda/mu) suppress
-    # that high-frequency staircase while avoiding the shrinkage of plain
-    # Laplacian smoothing. It only moves vertex positions, so UVs and per-vertex
-    # colors (both indexed by vertex id) stay valid.
+    # Silhouette de-fur: the mesh is extracted from a 64^3 sparse voxel grid
+    # via flexicubes, which leaves isolated "spike" vertices shooting out of the
+    # silhouette (the "fur" along backrest/leg edges). Whole-mesh smoothers make
+    # this WORSE — Taubin's volume-preserving inverse step amplifies the spikes
+    # (measured ~4x more outliers), and Laplacian NaNs on non-watertight meshes.
+    # Instead we despike: pull only the outlier vertices onto their neighbor
+    # centroid. It only moves vertex positions, so UVs and per-vertex colors
+    # (both indexed by vertex id) stay valid.
     if mesh_smooth_iterations > 0 and mesh.vertices.shape[0] > 0 and mesh.faces.shape[0] > 0:
         mesh = _smooth_mesh_surface(mesh, iterations=mesh_smooth_iterations, verbose=verbose)
 
@@ -1109,21 +1110,54 @@ def to_glb(
 
 
 def _smooth_mesh_surface(mesh: trimesh.Trimesh, iterations: int = 5, verbose: bool = False) -> trimesh.Trimesh:
-    """Volume-preserving Taubin (lambda/mu) smoothing of the mesh surface.
+    """Remove silhouette "fur" spikes by clamping outlier vertices.
 
-    Suppresses the high-frequency voxel-grid staircase on the silhouette while
-    preserving overall shape/volume (unlike plain Laplacian smoothing, which
-    shrinks). Connectivity is untouched, so UV coordinates and per-vertex colors
-    remain valid. Failures are non-fatal - the original mesh is returned.
+    The flexicubes extraction on the 64^3 SLAT grid leaves isolated vertices
+    that shoot out of the surface (spikes / "fur" along the silhouette). Rather
+    than a global low-pass filter (Taubin/Laplacian actually *amplify* these on
+    the noisy, non-watertight decoder mesh), we detect vertices whose distance to
+    the centroid of their 1-ring neighbors exceeds a small fraction of the mesh
+    bounding box and snap just those onto the neighbor centroid, iterating a few
+    times. Interior/true-detail vertices are untouched, and connectivity is
+    preserved so UV coordinates and per-vertex colors remain valid. Failures are
+    non-fatal - the original mesh is returned.
     """
     try:
-        from trimesh import smoothing
+        import scipy.sparse as sp
 
-        smoothing.filter_taubin(mesh, lamb=0.5, nu=0.53, iterations=int(iterations))
+        V = np.asarray(mesh.vertices, dtype=np.float64)
+        edges = np.asarray(mesh.edges_unique)
+        if V.shape[0] == 0 or edges.shape[0] == 0:
+            return mesh
+
+        n = V.shape[0]
+        rows = np.concatenate([edges[:, 0], edges[:, 1]])
+        cols = np.concatenate([edges[:, 1], edges[:, 0]])
+        W = sp.csr_matrix((np.ones(rows.shape[0], np.float64), (rows, cols)), shape=(n, n))
+        deg = np.asarray(W.sum(axis=1)).ravel()
+        deg[deg == 0] = 1.0
+
+        scale = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) or 1.0
+        thr = 0.01 * scale  # a single vertex >1% of the bbox from its neighbors is a spike
+
+        moved = 0
+        # A couple of extra passes beyond `iterations` lets clusters of adjacent
+        # spikes settle (their neighbors may themselves be spikes on pass 1).
+        for _ in range(max(1, int(iterations)) + 3):
+            nbr = (W @ V) / deg[:, None]
+            d = np.linalg.norm(V - nbr, axis=1)
+            out = d > thr
+            k = int(out.sum())
+            if k == 0:
+                break
+            V[out] = nbr[out]
+            moved += k
+
+        mesh.vertices = V
         if verbose:
-            logger.info(f"Taubin-smoothed mesh silhouette ({iterations} iterations)")
-    except Exception as exc:  # pragma: no cover - smoothing is best-effort
-        logger.warning(f"Mesh silhouette smoothing skipped: {exc}")
+            logger.info(f"Despiked mesh silhouette ({moved} outlier vertex moves)")
+    except Exception as exc:  # pragma: no cover - despiking is best-effort
+        logger.warning(f"Mesh silhouette despike skipped: {exc}")
     return mesh
 
 

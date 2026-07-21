@@ -175,6 +175,10 @@ class SegmentRequest(BaseModel):
 class ReconstructRequest(BaseModel):
     image_id:  str
     mask_b64:  str   # base64-encoded PNG mask
+    # Quality preset step counts (stage-1 = coarse shape, stage-2 = latent refine).
+    # Client sends these from the Fast/Medium/Slow presets; default is Fast (8/8).
+    stage1_steps: int = 8
+    stage2_steps: int = 8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,12 +251,18 @@ async def reconstruct(req: ReconstructRequest):
     jobs[job_id] = JobState(job_id)
 
     # Run pipeline in a background thread (non-blocking)
+    # Clamp to a sane range so a bad client value can't hang the machine.
+    stage1_steps = max(1, min(int(req.stage1_steps), 100))
+    stage2_steps = max(1, min(int(req.stage2_steps), 100))
+
     asyncio.get_event_loop().run_in_executor(
         None,
         _run_reconstruction_sync,
         job_id,
         str(img_path),
         str(mask_path),
+        stage1_steps,
+        stage2_steps,
     )
 
     return {"job_id": job_id}
@@ -378,7 +388,13 @@ class _PipelineLogHandler(logging.Handler):
             self.job.update("Post-processing mesh…", 80)
 
 
-def _run_reconstruction_sync(job_id: str, img_path: str, mask_path: str):
+def _run_reconstruction_sync(
+    job_id: str,
+    img_path: str,
+    mask_path: str,
+    stage1_steps: int = 8,
+    stage2_steps: int = 8,
+):
     """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
     # Attach log handler so pipeline stages drive the progress bar
@@ -402,14 +418,24 @@ def _run_reconstruction_sync(job_id: str, img_path: str, mask_path: str):
 
         job.update("Running 3-D reconstruction…", 12)
 
+        # When the optional splat module is on, ask the decoder for the Gaussian
+        # appearance rep too so we can export a real 3DGS .ply (see splat_export).
+        import splat_export
+        _decode_formats = ["mesh", "gaussian"] if splat_export.enabled() else ["mesh"]
+
         output = pipeline.run(
             image,
             mask,
             seed=42,
             stage1_only=False,
-            stage1_inference_steps=8,
-            stage2_inference_steps=8,
-            decode_formats=["mesh"],
+            # Step counts come from the client quality preset (Fast/Medium/Slow).
+            # Stage 1 generates the coarse sparse-voxel shape; more steps give it
+            # more confident geometry and noticeably less hallucinated wrinkling
+            # on depth-ambiguous (grazing) surfaces like sofa arms. Slower, but
+            # the main quality lever for single-view side geometry.
+            stage1_inference_steps=stage1_steps,
+            stage2_inference_steps=stage2_steps,
+            decode_formats=_decode_formats,
             simplify_ratio=0.0,
             vertex_color_source="gaussian",
         )
@@ -423,10 +449,14 @@ def _run_reconstruction_sync(job_id: str, img_path: str, mask_path: str):
         result_ply = str(RESULT_DIR / f"{job_id}.ply")
         job.update("Exporting GLB + PLY…", 95)
         result_mesh.export(result_path, file_type="glb")
-        try:
-            result_mesh.export(result_ply, file_type="ply")
-        except Exception as exc:
-            logger.warning(f"[JOB {job_id}] PLY export failed: {exc}")
+
+        # PLY: prefer a real Gaussian splat (optional module); otherwise fall back
+        # to exporting the mesh as a .ply so the download link always works.
+        if not splat_export.export_splat(output, result_ply):
+            try:
+                result_mesh.export(result_ply, file_type="ply")
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] PLY export failed: {exc}")
 
         job.complete(result_path)
         logger.info(f"[JOB {job_id}] Done → {result_path}")

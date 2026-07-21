@@ -1,6 +1,19 @@
 # SAM 3D Objects for Apple Silicon
 
-Efficient 3D object reconstruction from images on macOS using Metal Performance Shaders (MPS). Gaussian splatting and color baking are not supported.
+Turn a single photo into a 3D object on a Mac. This is a native Apple-Silicon
+port of Meta AI's **SAM 3D Objects** — it runs the full single-image
+reconstruction pipeline on the GPU via Metal Performance Shaders (MPS) plus
+custom Metal compute kernels, with no CUDA required.
+
+It ships two ways:
+
+- **A packaged macOS app** — an interactive desktop application: drop in an
+  image, click points to segment the object with SAM, and reconstruct a
+  textured 3D model that you can orbit, inspect, and export.
+- **A command-line tool** (`main.py`) for scripted / batch reconstruction.
+
+Outputs include watertight **GLB meshes** (per-vertex color or baked UV
+texture atlas) and real **3D Gaussian-Splatting `.ply`** files.
 
 **Original Image**
 <p align="left">
@@ -27,32 +40,42 @@ Using **SAM 3D** by Meta AI:
 - [Official GitHub](https://github.com/facebookresearch/sam-3d-objects)
 - [Model Weights (Hugging Face)](https://huggingface.co/facebook/sam-3d-objects)
 
-## Installation
+## Features
 
-1. **Clone and install dependencies**:
-   ```bash
-   git clone <this-repo>
-   cd Sam3D-MLX
-   uv sync
-   ```
+- **Interactive segmentation** — SAM point-prompt masking in the browser UI
+  (positive / negative clicks), no manual mask files needed.
+- **Single-image 3D reconstruction** — geometry + appearance from one photo.
+- **Multiple output formats:**
+  - `GLB` mesh with **per-vertex color** (default).
+  - `GLB` mesh with a **baked UV texture atlas** (portable, no CUDA / nvdiffrast).
+  - Real **3D Gaussian-Splatting `.ply`** for depth-ambiguous / soft previews.
+- **Apple-Silicon native** — MPS backend plus hand-written Metal kernels for
+  sparse convolution and flash attention.
+- **Low-memory pipeline** — sequential stage loading and SLAT caching to fit in
+  ~48 GB unified memory.
+- **Live progress** — streamed pipeline logs and an in-place mask → model
+  preview in the web app.
 
-2. **Download checkpoints** from [Hugging Face](https://huggingface.co/facebook/sam-3d-objects) and place them in `checkpoints/hf/`:
-   ```bash
-   mkdir -p checkpoints/hf
-   # Download pipeline.yaml and all .pt/.safetensors files into checkpoints/hf/
-   ```
+## Two ways to run
 
-3. **Configure environment**
-   ```fish
-   set -x PYTORCH_MPS_HIGH_WATERMARK_RATIO 0.0
-   set -x SPARSE_BACKEND mps
-   set -x SPARSE_ATTN_BACKEND sdpa
-   set -x PYTHONPATH .
-   ```
+### 1. Desktop app (interactive web UI)
 
-## Usage
+The app is a FastAPI server that serves an interactive single-page UI
+(`static/index.html`). Start it and open the browser UI:
 
-**Recommended: Use conda environment directly** (PyTorch3D compatibility)
+```bash
+conda activate sam-3d-mlx
+python server.py
+# then open http://localhost:8000
+```
+
+Workflow: upload an image → click points to segment the object → pick a quality
+preset → reconstruct → orbit the result and download **GLB** or **PLY**.
+
+Optional Gaussian-splat export is on by default; disable it with
+`SAM3D_SPLAT=0`.
+
+### 2. Command line
 
 ```bash
 conda activate sam-3d-mlx
@@ -64,76 +87,131 @@ python main.py \
     --output outputs/reconstruction.glb
 ```
 
-**Alternative: Use uv (if uv.lock is available)**
-```bash
-uv run python main.py \
-    --image images/shutterstock_stylish_kidsroom_1640806567/image.png \
-    --mask-dir images/shutterstock_stylish_kidsroom_1640806567 \
-    --mesh \
-    --output outputs/reconstruction.glb
-```
-
-### Key Arguments
+#### Key Arguments
 | Argument | Description |
 |----------|-------------|
 | `--image` | Input image path |
-| `--mask-dir` / `--mask-index` | SAM-style mask directory and index |
-| `--steps` | Diffusion steps (default: 12) |
-| `--mesh` | Output a full smooth GLB mesh |
-| `--output` | File path for results (.glb, .stl) |
+| `--mask` / `--mask-dir` + `--mask-index` | Object mask (single file or SAM-style directory) |
+| `--mesh` | Output a smooth GLB mesh (otherwise voxel STL) |
+| `--steps` | Diffusion steps (default: 12; higher = better, slower) |
+| `--simplify` | Mesh decimation ratio (`0.0` = none … `0.95` = heavy) |
+| `--vertex-color-source` | `gaussian` (saturated, recommended) or `mesh` |
+| `--bake` | Bake a UV texture atlas instead of per-vertex color |
+| `--bake-source` | `gaussian` (higher fidelity) or `vertex` |
+| `--texture-size` | Baked atlas edge length in px (default: 2048) |
+| `--cache-dir` / `--load-slat` | Cache / reuse intermediate SLAT to skip stages 0–2 |
+| `--output` `-o` | Output file (`.glb`, `.stl`) |
+
+## Installation
+
+1. **Clone and create the environment** (a conda env is recommended for
+   PyTorch3D C++/ABI compatibility):
+   ```bash
+   git clone <this-repo>
+   cd Sam3D-Objects-MLX
+   conda create -n sam-3d-mlx python=3.11
+   conda activate sam-3d-mlx
+   uv pip install -e .        # or: uv sync
+   ```
+
+2. **Download checkpoints** from
+   [Hugging Face](https://huggingface.co/facebook/sam-3d-objects) into
+   `checkpoints/hf/` (the `pipeline.yaml` plus all `.pt` / `.safetensors`
+   weights). These weights are governed by Meta's SAM License — see
+   [Licensing](#licensing).
+
+3. **Environment variables** (set automatically by `main.py` / `server.py`, but
+   useful when running manually):
+   ```bash
+   export SPARSE_BACKEND=mps
+   export SPARSE_ATTN_BACKEND=sdpa
+   export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+   ```
 
 ## Structure
 ```
-checkpoints/hf/     # Model weights (download from HuggingFace)
-images/             # Example dataset
-outputs/            # 3D model results
-.cache/             # Intermediate latent files
-sam3d_objects/      # Core model logic
+main.py             # CLI entry point
+server.py           # FastAPI interactive web app
+static/index.html   # Single-page UI (segmentation + viewer)
+splat_export.py     # Optional Gaussian-splat (.ply) export module
+texture_baking.py   # UV texture-atlas baking (portable, no CUDA)
+sam3d_objects/       # Core model + pipeline (Apple-Silicon port)
+checkpoints/hf/     # Model weights (download from Hugging Face)
+images/             # Example images + masks
+outputs/            # Reconstruction results
+.cache/             # Cached intermediate latents (SLAT)
 ```
 
-## What Was Done
+## How the port works
 
-This port adapts the original CUDA-based [SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects) pipeline to run on Apple Silicon:
+This project adapts the original CUDA-based
+[SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects) pipeline to
+Apple Silicon:
 
-1. **Removed CUDA dependencies**: Replaced `spconv-cu121`, `xformers`, and other CUDA-specific packages.
-2. **[MPS Backend](https://developer.apple.com/metal/pytorch/)**: Rewired model loading and inference to use PyTorch's Metal Performance Shaders backend.
-3. **Metal Sparse Convolution**: Custom Metal compute shaders for voxel processing:
-   - [`sparse_conv.metal`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/conv/sparse_conv.metal) — GPU kernels
-   - [`conv_metal.py`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/conv/conv_metal.py) — PyObjC wrapper
-4. **Metal Flash Attention**: GPU-accelerated attention for sparse transformers:
-   - [`flash_attn.metal`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/attention/flash_attn.metal) — GPU kernels
-   - [`metal_flash_attn.py`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/attention/metal_flash_attn.py) — Python wrapper
-5. **[Low-Memory Pipeline](sam3d_objects/pipeline/inference_pipeline_low_memory.py)**: Sequential model loading to fit within 48GB RAM.
+1. **Removed CUDA dependencies** — replaced `spconv-cu121`, `xformers`, and other
+   CUDA-only packages.
+2. **[MPS backend](https://developer.apple.com/metal/pytorch/)** — model loading
+   and inference rewired onto PyTorch's Metal Performance Shaders.
+3. **Metal sparse convolution** — custom Metal compute kernels for voxel
+   processing:
+   - [`sparse_conv.metal`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/conv/sparse_conv.metal)
+   - [`conv_metal.py`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/conv/conv_metal.py)
+4. **Metal flash attention** — GPU-accelerated attention for the sparse
+   transformers:
+   - [`flash_attn.metal`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/attention/flash_attn.metal)
+   - [`metal_flash_attn.py`](sam3d_objects/model/backbone/tdfy_dit/modules/sparse/attention/metal_flash_attn.py)
+5. **[Low-memory pipeline](sam3d_objects/pipeline/inference_pipeline_low_memory.py)**
+   — sequential stage loading and chunked decoding to run within 48 GB of
+   unified memory.
+6. **Portable appearance** — Gaussian-splat export and a PyTorch3D-based UV
+   texture baker replace the original CUDA/nvdiffrast texturing path.
 
 ## Troubleshooting
 
-### `ImportError: Symbol not found` when using `uv run`
-
-**Problem**: `uv run` creates a fresh `.venv` and installs dependencies, but PyTorch3D's C++ extensions don't link correctly with PyTorch's libraries.
-
-**Solution**: Use the conda environment directly instead:
+### `ImportError: Symbol not found`
+PyTorch3D's compiled C++ extensions must match PyTorch's ABI. Use the conda
+environment (with PyTorch3D built to match) rather than an ad-hoc `.venv`:
 ```bash
-# Remove conflicting .venv
 rm -rf .venv
-
-# Use conda (recommended)
 conda activate sam-3d-mlx
-python main.py --image ... --mask-dir ... --output ...
+python main.py ...
 ```
-
-**Why**: PyTorch3D has compiled C++ extensions that need to match PyTorch's ABI. The conda environment has PyTorch3D built from source with matching versions.
 
 ### Metal GPU segmentation faults
-
-**Problem**: Custom Metal GPU kernels may cause crashes during mesh generation.
-
-**Solution**: The default backend is now MPS (PyTorch's native Metal support), which is stable and recommended. No action needed.
-
-**For advanced users**: If you need different sparse backends:
+The default sparse backend is MPS (PyTorch-native Metal), which is stable. If
+you experiment with other backends:
 ```bash
-# MPS (default, recommended)
-SPARSE_BACKEND=mps SPARSE_ATTN_BACKEND=sdpa python main.py ...
-
-# Pure CPU
-SPARSE_BACKEND=spconv SPARSE_ATTN_BACKEND=sdpa python main.py ...
+SPARSE_BACKEND=mps    SPARSE_ATTN_BACKEND=sdpa python main.py ...   # default
+SPARSE_BACKEND=spconv SPARSE_ATTN_BACKEND=sdpa python main.py ...   # pure CPU
 ```
+
+## Licensing
+
+This project uses an **open-core** model, similar to MongoDB: the source is
+released under a strong copyleft license, while certain components are protected
+IP available under a separate commercial license.
+
+- **Open source (AGPL-3.0).** The application source in this repository is
+  licensed under the **GNU Affero General Public License v3.0** (see
+  [`LICENSE`](LICENSE)). Because the AGPL's network clause applies, if you run a
+  modified version of this software to provide a service over a network, you
+  must make your complete corresponding source available to the users of that
+  service under the same license.
+
+- **Protected IP / commercial license.** Some modules are proprietary and are
+  **not** granted under the AGPL for closed-source or SaaS use. A **commercial
+  license** is available that (a) lifts the AGPL's copyleft and network
+  source-disclosure obligations and (b) grants rights to the protected
+  components for embedding in proprietary products or the packaged macOS app.
+  Contact the maintainers to obtain a commercial license.
+
+- **Model weights (Meta SAM License).** The SAM 3D model weights and the code
+  under [`sam3d_objects/`](sam3d_objects/LICENSE) are provided by Meta under the
+  **SAM License** and remain subject to Meta's terms and acceptable-use policy.
+  They are **not** covered by this project's AGPL or commercial grant — you must
+  obtain and use them directly under Meta's license.
+
+If you are unsure which license applies to your use case (e.g. shipping the
+packaged app, offering a hosted service, or embedding the pipeline in a
+proprietary product), please reach out before distribution.
+

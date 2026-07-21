@@ -212,6 +212,47 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   border: 1px solid var(--border);
 }
 
+/* ── Quality preset ── */
+.quality-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+.quality-row .label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg button {
+  border: none;
+  border-radius: 0;
+  padding: 8px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: transparent;
+  color: var(--muted);
+  border-right: 1px solid var(--border);
+}
+.seg button:last-child { border-right: none; }
+.seg button.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+.seg button .sub {
+  display: block;
+  font-size: 0.65rem;
+  font-weight: 500;
+  opacity: .8;
+}
+
 /* ── Progress ── */
 #progress-card { display: none; }
 .progress-track {
@@ -231,6 +272,59 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 #progress-msg {
   font-size: 0.85rem;
   color: var(--muted);
+}
+#progress-time {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+#eta-time { color: var(--text); opacity: .75; }
+#result-time {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+#result-time b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* Reconstruction preview: shows the segmentation mask (with a shimmer sweep to
+   read as an indeterminate progress bar) in the same 500px slot the finished
+   3-D model appears in. */
+.recon-preview {
+  position: relative;
+  width: 100%;
+  height: 500px;
+  border-radius: 8px;
+  background: #111;
+  overflow: hidden;
+  margin: 14px 0 4px;
+}
+.recon-preview img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: .9;
+}
+.recon-preview .shimmer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(100deg,
+    transparent 20%,
+    rgba(124,58,237,.20) 40%,
+    rgba(91,110,245,.42) 50%,
+    rgba(124,58,237,.20) 60%,
+    transparent 80%);
+  background-size: 220% 100%;
+  animation: shimmer-sweep 1.4s linear infinite;
+}
+@keyframes shimmer-sweep {
+  0%   { background-position: 120% 0; }
+  100% { background-position: -120% 0; }
 }
 
 /* ── Result ── */
@@ -288,6 +382,7 @@ model-viewer {
   </svg>
   <h1>SAM-3D</h1>
   <span class="badge">Apple Silicon</span>
+        <button class="btn-ghost" onclick="restartApp()">← Try another image</button>
 </header>
 
 <main>
@@ -331,6 +426,15 @@ model-viewer {
       <div class="hint" style="margin-left:auto; color: var(--text)" id="point-count">0 points</div>
     </div>
 
+    <div class="quality-row">
+      <span class="label">Quality</span>
+      <div class="seg" id="quality-seg">
+        <button type="button" data-s1="8"  data-s2="8"  data-steps="8 / 8"   onclick="setQuality(this)" class="active" title="Fastest — 8 / 8 steps">Fast<span class="sub"></span></button>
+        <button type="button" data-s1="25" data-s2="12" data-steps="25 / 12" onclick="setQuality(this)" title="Balanced — 25 / 12 steps">Medium<span class="sub"></span></button>
+        <button type="button" data-s1="40" data-s2="20" data-steps="40 / 20" onclick="setQuality(this)" title="Best geometry, slowest — 40 / 20 steps">Slow<span class="sub"></span></button>
+      </div>
+    </div>
+
     <div class="btn-row">
       <button class="btn-ghost" id="undo-btn" onclick="undo()" disabled title="Undo (⌘Z)">↶ Undo</button>
       <button class="btn-ghost" id="redo-btn" onclick="redo()" disabled title="Redo (⇧⌘Z)">↷ Redo</button>
@@ -348,6 +452,14 @@ model-viewer {
       <div class="progress-fill" id="progress-fill"></div>
     </div>
     <div id="progress-msg">Initialising pipeline…</div>
+    <div id="progress-time">
+      <span id="elapsed-time">Elapsed 0:00</span>
+      <span id="eta-time"></span>
+    </div>
+    <div class="recon-preview" id="recon-preview">
+      <img id="recon-mask-img" alt="segmentation mask" />
+      <div class="shimmer"></div>
+    </div>
   </div>
 
   <!-- ─── Console ────────────────────────────────────────────────────────── -->
@@ -362,6 +474,7 @@ model-viewer {
   <!-- ─── Step 4 : Result ─────────────────────────────────────────────── -->
   <div class="card" id="result-card">
     <div class="card-title">Result — 3-D Object</div>
+    <div id="result-time"></div>
     <model-viewer id="viewer"
       auto-rotate
       camera-controls
@@ -373,7 +486,6 @@ model-viewer {
     <div class="result-actions">
       <a id="download-link"><button class="btn-secondary">⬇ Download GLB</button></a>
       <a id="download-link-ply"><button class="btn-secondary">⬇ Download PLY</button></a>
-      <button class="btn-ghost" onclick="restartApp()">← Try another image</button>
     </div>
   </div>
 
@@ -387,6 +499,118 @@ let imageId   = null;
 let imgW = 0, imgH = 0;          // natural image dimensions
 let markers   = [];              // [{x,y,label}]  label: 1=pos, 0=neg
 let lastMaskB64 = null;
+let qualitySteps = { s1: 8, s2: 8 };   // Fast preset (stage1 / stage2 inference steps)
+
+function setQuality(btn) {
+  qualitySteps = { s1: +btn.dataset.s1, s2: +btn.dataset.s2 };
+  document.querySelectorAll("#quality-seg button")
+    .forEach(b => b.classList.toggle("active", b === btn));
+}
+
+function qualityLabel() {
+  const { s1, s2 } = qualitySteps;
+  if (s1 <= 8)  return "Fast";
+  if (s1 <= 25) return "Medium";
+  return "Slow";
+}
+
+// ── Timing / ETA ──────────────────────────────────────────────────────────────
+let _timerStart = 0;      // ms epoch when reconstruction started
+let _timerId    = null;   // setInterval handle for the live elapsed clock
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Seed estimates (seconds) shown before any real run has been measured on this
+// machine. Derived from a fixed-overhead + per-step model:
+//   ~60s overhead + ~5s per inference step across both stages.
+//   Fast 8/8 = 16 steps, Medium 25/12 = 37, Slow 40/20 = 60.
+const SEED_ESTIMATES = {
+  "8_8":   140,   // ~2:20
+  "25_12": 245,   // ~4:05
+  "40_20": 360,   // ~6:00
+};
+
+// Persisted per-preset timings. Each entry is { sec, measured }.
+//   measured=false → still a seed estimate; measured=true → from a real run.
+function loadEstTimes() {
+  try { return JSON.parse(localStorage.getItem("estTimes") || "{}"); }
+  catch { return {}; }
+}
+
+// On first load, seed localStorage with the estimates so the UI shows concrete
+// numbers immediately. Seeds never overwrite already-measured values.
+function seedEstTimes() {
+  const t = loadEstTimes();
+  let changed = false;
+  for (const [k, sec] of Object.entries(SEED_ESTIMATES)) {
+    if (t[k] === undefined) { t[k] = { sec, measured: false }; changed = true; }
+  }
+  if (changed) localStorage.setItem("estTimes", JSON.stringify(t));
+}
+
+function saveEstTime(key, seconds) {
+  const t = loadEstTimes();
+  const prev = t[key];
+  if (prev && prev.measured) {
+    // Blend real runs with an exponential moving average so the estimate
+    // adapts to this machine while staying stable across runs.
+    t[key] = { sec: Math.round(prev.sec * 0.6 + seconds * 0.4), measured: true };
+  } else {
+    // First real run replaces the seed estimate outright.
+    t[key] = { sec: Math.round(seconds), measured: true };
+  }
+  localStorage.setItem("estTimes", JSON.stringify(t));
+}
+
+// Fit a linear model  sec = a + b*totalSteps  from the presets that have real
+// measurements, so any un-measured preset is extrapolated from actual data on
+// this machine. Falls back to the seed model (60s + 5s/step) when nothing has
+// been measured yet.
+function fitModel() {
+  const t = loadEstTimes();
+  const pts = [];
+  for (const [k, e] of Object.entries(t)) {
+    if (!e || !e.measured || typeof e.sec !== "number") continue;
+    const [s1, s2] = k.split("_").map(Number);
+    pts.push([s1 + s2, e.sec]);
+  }
+  if (pts.length === 0) return { a: 60, b: 5 };          // seed model
+  if (pts.length === 1) {                                 // anchor the seed slope
+    const [x, y] = pts[0];
+    return { a: y - 5 * x, b: 5 };
+  }
+  let n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;   // least-squares fit
+  for (const [x, y] of pts) { sx += x; sy += y; sxx += x * x; sxy += x * y; }
+  const denom = n * sxx - sx * sx;
+  if (denom === 0) return { a: sy / n, b: 0 };
+  const b = (n * sxy - sx * sy) / denom;
+  const a = (sy - b * sx) / n;
+  return { a, b };
+}
+
+// Estimate total runtime for a preset. A measured preset uses its own recorded
+// time; anything else is extrapolated from the fitted model.
+function estimateSeconds(s1, s2) {
+  const entry = loadEstTimes()[`${s1}_${s2}`];
+  if (entry && entry.measured && typeof entry.sec === "number") return entry.sec;
+  const { a, b } = fitModel();
+  return Math.max(1, a + b * (s1 + s2));
+}
+
+// Fill each preset button's sub-label with its steps + current time estimate.
+function refreshPresetEstimates() {
+  document.querySelectorAll("#quality-seg button").forEach(b => {
+    const sec = estimateSeconds(+b.dataset.s1, +b.dataset.s2);
+    b.querySelector(".sub").textContent = `${b.dataset.steps} · ~${fmtDuration(sec)}`;
+  });
+}
+
+seedEstTimes();
+refreshPresetEstimates();
 
 const baseImg      = document.getElementById("base-img");
 const maskCanvas   = document.getElementById("mask-canvas");
@@ -756,9 +980,14 @@ async function startReconstruct() {
   // Switch to progress view
   document.getElementById("step-annotate").classList.add("hidden");
   document.getElementById("progress-card").style.display = "block";
+  // Show the segmentation mask in the preview slot while we reconstruct.
+  const rmi = document.getElementById("recon-mask-img");
+  if (rmi) rmi.src = lastMaskB64 ? "data:image/png;base64," + lastMaskB64 : "";
   setProgress(5, "Sending request…");
+  startTimer();
 
-  const body = { image_id: imageId, mask_b64: lastMaskB64 };
+  const body = { image_id: imageId, mask_b64: lastMaskB64,
+                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2 };
   const res  = await fetch("/reconstruct", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -775,6 +1004,24 @@ function setProgress(pct, msg) {
   document.getElementById("progress-msg").textContent  = msg;
 }
 
+function startTimer() {
+  _timerStart = Date.now();
+  const eta = estimateSeconds(qualitySteps.s1, qualitySteps.s2);
+  document.getElementById("eta-time").textContent = `· Est. ~${fmtDuration(eta)}`;
+  const tick = () => {
+    const elapsed = (Date.now() - _timerStart) / 1000;
+    document.getElementById("elapsed-time").textContent = `Elapsed ${fmtDuration(elapsed)}`;
+  };
+  tick();
+  if (_timerId) clearInterval(_timerId);
+  _timerId = setInterval(tick, 1000);
+}
+
+function stopTimer() {
+  if (_timerId) { clearInterval(_timerId); _timerId = null; }
+  return (Date.now() - _timerStart) / 1000;
+}
+
 function listenProgress(jobId) {
   const es = new EventSource(`/status/${jobId}`);
   es.onmessage = (e) => {
@@ -784,23 +1031,34 @@ function listenProgress(jobId) {
     if (data.done) {
       es.close();
       if (data.message === "complete") {
-        showResult(jobId);
+        const elapsed = stopTimer();
+        saveEstTime(`${qualitySteps.s1}_${qualitySteps.s2}`, elapsed);
+        refreshPresetEstimates();
+        showResult(jobId, elapsed);
       } else {
         // Error
+        stopTimer();
         setProgress(0, "Error: " + data.message.replace("error: ", ""));
       }
     }
   };
   es.onerror = () => {
+    stopTimer();
     setProgress(0, "Connection lost. Please try again.");
     es.close();
   };
 }
 
-function showResult(jobId) {
+function showResult(jobId, elapsed) {
   const url = `/result/${jobId}`;
   document.getElementById("progress-card").style.display = "none";
   document.getElementById("result-card").style.display   = "block";
+  const rt = document.getElementById("result-time");
+  if (rt) {
+    rt.innerHTML = (elapsed != null)
+      ? `Generated in <b>${fmtDuration(elapsed)}</b> · ${qualityLabel()} quality (${qualitySteps.s1} / ${qualitySteps.s2} steps)`
+      : "";
+  }
   document.getElementById("viewer").setAttribute("src", url);
 
   const link = document.getElementById("download-link");
@@ -850,18 +1108,15 @@ function clearConsole() {
 // Reset
 // ─────────────────────────────────────────────────────────────────────────────
 function restartApp() {
-  imageId     = null;
-  markers     = [];
-  lastMaskB64 = null;
-  resetHistory();
-  updatePointCount();
-  document.getElementById("result-card").style.display    = "none";
-  document.getElementById("progress-card").style.display  = "none";
-  document.getElementById("step-annotate").classList.add("hidden");
-  document.getElementById("step-upload").classList.remove("hidden");
-  document.getElementById("file-input").value = "";
-  markerCtx.clearRect(0, 0, 9999, 9999);
-  maskCtx.clearRect(0, 0, 9999, 9999);
+   // is reconstructing? if so, abort the job
+    if (_timerId) {
+       if (!confirm("A reconstruction is in progress. Are you sure you want to restart?")) {
+         stopTimer();
+         return;
+       }
+    }
+    // Restart the app
+    location.reload();
 }
 </script>
 </body>
