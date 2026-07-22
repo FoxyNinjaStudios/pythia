@@ -308,6 +308,9 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   height: 100%;
   object-fit: contain;
   opacity: .9;
+  filter: brightness(.55);
+  /* Make black pixels read as transparent against the dark backdrop. */
+  mix-blend-mode: screen;
 }
 .recon-preview .shimmer {
   position: absolute;
@@ -437,10 +440,10 @@ model-viewer {
 
     <div class="control-row" style="display:flex;align-items:center;gap:10px;margin:10px 0 2px;">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;">
-        <input type="checkbox" id="layout-toggle" />
+        <input type="checkbox" id="layout-toggle" checked />
         <span>Place in scene <span style="opacity:.6">(estimate real-world pose)</span></span>
       </label>
-      <label id="layout-refine-wrap" style="display:none;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;opacity:.85;">
+      <label id="layout-refine-wrap" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;opacity:.85;">
         <input type="checkbox" id="layout-refine-toggle" />
         <span>Refine <span style="opacity:.6">(slower, CPU)</span></span>
       </label>
@@ -977,10 +980,10 @@ function drawMask(b64) {
     const od   = out.data;
     for (let i = 0; i < src.length; i += 4) {
       if (src[i] > 127) {   // R > 127 → foreground
-        od[i]     = 91;
-        od[i + 1] = 110;
-        od[i + 2] = 245;
-        od[i + 3] = 115;    // α ≈ 0.45
+        od[i]     = 46;
+        od[i + 1] = 55;
+        od[i + 2] = 123;
+        od[i + 3] = 185;    // α ≈ 0.65 (darker overlay)
       }
     }
     tc.putImageData(out, 0, 0);

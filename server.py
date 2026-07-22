@@ -184,6 +184,9 @@ class ReconstructRequest(BaseModel):
     # pose refinement (slower, CPU-only).
     layout: bool = False
     layout_refine: bool = False
+    # Shortcut-model distillation: sample both flow stages CFG-free with step-size
+    # conditioning (~1 eval/step). Much faster with few steps; needs distilled weights.
+    distill: bool = False
 
 
 class DepthRequest(BaseModel):
@@ -294,6 +297,7 @@ async def reconstruct(req: ReconstructRequest):
         stage2_steps,
         bool(req.layout),
         bool(req.layout_refine),
+        bool(req.distill),
     )
 
     return {"job_id": job_id}
@@ -587,6 +591,7 @@ def _run_reconstruction_sync(
     stage2_steps: int = 8,
     layout: bool = False,
     layout_refine: bool = False,
+    distill: bool = False,
 ):
     """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
@@ -633,6 +638,8 @@ def _run_reconstruction_sync(
             vertex_color_source="gaussian",
             with_layout_postprocess=layout,
             layout_refine=layout_refine,
+            use_stage1_distillation=distill,
+            use_stage2_distillation=distill,
         )
 
         # The pipeline already returns a per-vertex-colored GLB (to_glb colors each

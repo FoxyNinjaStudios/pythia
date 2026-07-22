@@ -123,6 +123,7 @@ def run_pipeline(
     vertex_color_source: str = "gaussian",
     layout: bool = False,
     layout_refine: bool = False,
+    distill: bool = False,
 ):
     """
     Run SAM-3D pipeline: image + mask -> 3D mesh.
@@ -239,6 +240,8 @@ def run_pipeline(
         vertex_color_source=vertex_color_source,
         with_layout_postprocess=layout,
         layout_refine=layout_refine,
+        use_stage1_distillation=distill,
+        use_stage2_distillation=distill,
     )
     
     t_total = time.perf_counter() - t_start
@@ -410,6 +413,13 @@ def main():
         help="With --layout, refine the pose against the pointmap + mask (ICP + "
              "render-compare) before placement. Slower; runs on CPU."
     )
+    parser.add_argument(
+        "--distill",
+        action="store_true",
+        help="Sample both flow stages with the shortcut model (step-size conditioning, "
+             "CFG off, ~1 eval/step) instead of CFG-guided flow matching. Much faster "
+             "with few steps, but requires shortcut-distilled weights. Try --steps 4."
+    )
 
     args = parser.parse_args()
     
@@ -444,6 +454,7 @@ def main():
         vertex_color_source=args.vertex_color_source,
         layout=args.layout,
         layout_refine=args.layout_refine,
+        distill=args.distill,
     )
 
 

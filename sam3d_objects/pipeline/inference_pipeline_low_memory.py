@@ -602,6 +602,8 @@ class InferencePipelineLowMemory:
         use_vertex_color=True,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
+        use_stage1_distillation=False,
+        use_stage2_distillation=False,
         decode_formats=None,
         use_cache: bool = True,
         simplify_ratio: float = 0.0,
@@ -625,6 +627,12 @@ class InferencePipelineLowMemory:
             layout_refine: If True (and layout inputs are available), refine the pose
                 with the ICP + render-compare layout optimizer before placement.
                 Requires a fresh run (not a cached SLAT). Slower; runs on CPU.
+            use_stage1_distillation / use_stage2_distillation: If True, sample the
+                corresponding flow stage with the shortcut model (step-size
+                conditioning, CFG off, ~1 network eval per step) instead of
+                CFG-guided flow matching. Faster with far fewer steps, but requires
+                shortcut-distilled weights (is_shortcut_model=True in the generator
+                config). See arXiv:2410.12557.
         """
         logger.info("[LOW-MEM] Starting sequential inference pipeline")
         log_memory("Start of run()")
@@ -736,13 +744,22 @@ class InferencePipelineLowMemory:
             # Configure generator
             inference_steps = stage1_inference_steps or self.ss_inference_steps
             ss_generator.inference_steps = inference_steps
-            ss_generator.reverse_fn.strength = self.ss_cfg_strength
             ss_generator.reverse_fn.interval = self.ss_cfg_interval
             ss_generator.rescale_t = self.ss_rescale_t
             ss_generator.reverse_fn.backbone.condition_embedder.normalize_images = True
             ss_generator.reverse_fn.unconditional_handling = "add_flag"
-            ss_generator.reverse_fn.strength_pm = self.ss_cfg_strength_pm
-            ss_generator.no_shortcut = True
+            # Shortcut-model distillation (arXiv:2410.12557): the shortcut sampler
+            # conditions on step size d = 1/steps and runs CFG-free (1 NFE/step), so
+            # it needs far fewer steps. Default is CFG-guided flow matching, which is
+            # higher fidelity but 2 NFEs/step. Mirrors upstream's use_distillation.
+            if use_stage1_distillation:
+                ss_generator.no_shortcut = False
+                ss_generator.reverse_fn.strength = 0
+                ss_generator.reverse_fn.strength_pm = 0
+            else:
+                ss_generator.no_shortcut = True
+                ss_generator.reverse_fn.strength = self.ss_cfg_strength
+                ss_generator.reverse_fn.strength_pm = self.ss_cfg_strength_pm
             
             # Run stage 1
             with torch.no_grad():
@@ -839,10 +856,15 @@ class InferencePipelineLowMemory:
             # Configure generator
             inference_steps = stage2_inference_steps or self.slat_inference_steps
             slat_generator.inference_steps = inference_steps
-            slat_generator.reverse_fn.strength = self.slat_cfg_strength
             slat_generator.reverse_fn.interval = self.slat_cfg_interval
             slat_generator.rescale_t = self.slat_rescale_t
-            slat_generator.no_shortcut = True
+            # See stage 1: shortcut distillation vs CFG-guided flow matching.
+            if use_stage2_distillation:
+                slat_generator.no_shortcut = False
+                slat_generator.reverse_fn.strength = 0
+            else:
+                slat_generator.no_shortcut = True
+                slat_generator.reverse_fn.strength = self.slat_cfg_strength
             
             # Run stage 2
             with torch.no_grad():
