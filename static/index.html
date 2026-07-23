@@ -4,6 +4,15 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>SAM-3D · Object Reconstruction</title>
+<!-- Import map must precede every module script so bare "three" specifiers resolve. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
 <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -310,6 +319,33 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   background: #111;
 }
 
+/* Client-side mesh tuning (Three.js) */
+#tune-card { margin-top: 14px; }
+.tune-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.tune-row #holefill-val {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+#holefill-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.tune-status {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-height: 1em;
+}
+
 /* Reconstruction preview: shows the segmentation mask (with a shimmer sweep to
    read as an indeterminate progress bar) in the same 500px slot the finished
    3-D model appears in. */
@@ -533,6 +569,21 @@ model-viewer {
       <a id="download-link-ply"><button class="btn-secondary">⬇ Download PLY</button></a>
       <button class="btn-secondary" id="toggle-placed-btn" style="display:none" onclick="togglePlaced()">🎯 View placed</button>
       <a id="download-link-placed" style="display:none"><button class="btn-secondary">⬇ Download placed GLB</button></a>
+    </div>
+
+    <!-- Client-side mesh tuning: fills mesh boundary loops in-browser via Three.js
+         and lets you export the tuned GLB without a round-trip to the server. -->
+    <div id="tune-card">
+      <div class="tune-row">
+        <label for="holefill-slider">Fill holes (client-side)</label>
+        <span id="holefill-val">off</span>
+      </div>
+      <input type="range" id="holefill-slider" min="0" max="1000" step="10" value="0"
+             oninput="onHoleFill(this.value)" disabled />
+      <div id="holefill-status" class="tune-status"></div>
+      <div class="result-actions">
+        <a id="download-link-tuned" style="display:none"><button class="btn-secondary">⬇ Download tuned GLB</button></a>
+      </div>
     </div>
   </div>
 
@@ -1273,6 +1324,9 @@ function showResult(jobId, elapsed) {
   }
   document.getElementById("viewer").setAttribute("src", url);
 
+  // Prepare the client-side hole-filling tool with the freshly generated mesh.
+  if (window.HoleTune) window.HoleTune.load(url);
+
   const link = document.getElementById("download-link");
   link.href     = url;
   link.download = "reconstruction.glb";
@@ -1314,6 +1368,10 @@ function togglePlaced() {
   const base = `/result/${_placedJobId}`;
   viewer.setAttribute("src", _showingPlaced ? `${base}?format=placed` : base);
   if (btn) btn.textContent = _showingPlaced ? "↩ View object" : "🎯 View placed";
+  // Hole-fill tuning only applies to the object view; hide/restore accordingly.
+  const tuneCard = document.getElementById("tune-card");
+  if (tuneCard) tuneCard.style.display = _showingPlaced ? "none" : "";
+  if (!_showingPlaced && window.HoleTune) window.HoleTune.reapply();
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -1362,6 +1420,268 @@ function restartApp() {
     // Restart the app
     location.reload();
 }
+</script>
+
+<!-- ────────────────────────────────────────────────────────────────────────────
+     Client-side mesh tuning (Three.js): load the generated GLB, fill open mesh
+     boundary loops up to a slider-controlled size, preview the result live in the
+     existing <model-viewer>, and export the tuned GLB entirely in the browser.
+──────────────────────────────────────────────────────────────────────────── -->
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader }   from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+
+const WELD_EPS = 1e-5;                 // position quantisation for vertex welding
+const loader   = new GLTFLoader();
+
+let srcMesh    = null;                 // first mesh found in the loaded GLB
+let srcMaterial= null;                 // its material (reused for export)
+let allLoops   = [];                   // cached boundary loops (welded topology)
+let welded     = null;                 // cached welded working set
+let curThreshold = 0;
+let curBlobURL = null;                 // object URL currently shown / exportable
+let debounceId = null;
+
+const $ = (id) => document.getElementById(id);
+
+// ── Welded working set: unique vertices + faces in welded index space ──────────
+function buildWorking(geometry) {
+  const pos   = geometry.getAttribute("position");
+  const col   = geometry.getAttribute("color");
+  const uv    = geometry.getAttribute("uv");
+  const index = geometry.getIndex();
+  const triCount = index ? index.count / 3 : pos.count / 3;
+  const getIdx   = (i) => (index ? index.getX(i) : i);
+
+  const map    = new Map();            // quantised-key -> uid
+  const remap  = new Int32Array(pos.count).fill(-1);
+  const uPos = [], uCol = col ? [] : null, uUv = uv ? [] : null;
+  const key  = (x, y, z) =>
+    Math.round(x / WELD_EPS) + "_" + Math.round(y / WELD_EPS) + "_" + Math.round(z / WELD_EPS);
+
+  function weld(vi) {
+    if (remap[vi] >= 0) return remap[vi];
+    const x = pos.getX(vi), y = pos.getY(vi), z = pos.getZ(vi);
+    const k = key(x, y, z);
+    let uid = map.get(k);
+    if (uid === undefined) {
+      uid = uPos.length / 3;
+      map.set(k, uid);
+      uPos.push(x, y, z);
+      if (uCol) uCol.push(col.getX(vi), col.getY(vi), col.getZ(vi));
+      if (uUv)  uUv.push(uv.getX(vi), uv.getY(vi));
+    }
+    remap[vi] = uid;
+    return uid;
+  }
+
+  const faces = [];
+  for (let f = 0; f < triCount; f++) {
+    const a = weld(getIdx(3 * f)), b = weld(getIdx(3 * f + 1)), c = weld(getIdx(3 * f + 2));
+    if (a === b || b === c || a === c) continue;      // drop degenerates
+    faces.push([a, b, c]);
+  }
+  return { uPos, uCol, uUv, faces };
+}
+
+// ── Boundary loops from welded faces (edges used by exactly one face) ──────────
+function findBoundaryLoops(faces) {
+  const ek = (a, b) => (a < b ? a + "_" + b : b + "_" + a);
+  const count = new Map();
+  for (const [a, b, c] of faces) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const k = ek(u, v);
+      count.set(k, (count.get(k) || 0) + 1);
+    }
+  }
+  // Reversed boundary half-edges form the hole loops (v->u for a face edge u->v).
+  const adj = new Map();               // start -> [ends]
+  for (const [a, b, c] of faces) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      if (count.get(ek(u, v)) === 1) {
+        if (!adj.has(v)) adj.set(v, []);
+        adj.get(v).push(u);
+      }
+    }
+  }
+  const loops = [];
+  for (const start of Array.from(adj.keys())) {
+    while (adj.get(start) && adj.get(start).length > 0) {
+      const loop = [];
+      let cur = start, guard = 0;
+      while (cur !== undefined && guard++ < 1e6) {
+        loop.push(cur);
+        const arr = adj.get(cur);
+        const nxt = arr && arr.length ? arr.pop() : undefined;
+        if (nxt === undefined || nxt === start) break;
+        cur = nxt;
+      }
+      if (loop.length >= 3) loops.push(loop);
+    }
+  }
+  return loops;
+}
+
+// ── Rebuild geometry, fan-filling every loop whose length ≤ threshold ──────────
+function buildFilledGeometry(threshold) {
+  const { uPos, uCol, uUv, faces } = welded;
+  const outPos   = uPos.slice();
+  const outCol   = uCol ? uCol.slice() : null;
+  const outUv    = uUv ? uUv.slice() : null;
+  const outFaces = faces.slice();
+
+  let filled = 0;
+  for (const loop of allLoops) {
+    if (threshold <= 0 || loop.length > threshold) continue;
+    const n = loop.length;
+    let cx = 0, cy = 0, cz = 0, cr = 0, cg = 0, cb = 0, cu = 0, cv = 0;
+    for (const vi of loop) {
+      cx += outPos[3 * vi]; cy += outPos[3 * vi + 1]; cz += outPos[3 * vi + 2];
+      if (outCol) { cr += outCol[3 * vi]; cg += outCol[3 * vi + 1]; cb += outCol[3 * vi + 2]; }
+      if (outUv)  { cu += outUv[2 * vi]; cv += outUv[2 * vi + 1]; }
+    }
+    const ci = outPos.length / 3;
+    outPos.push(cx / n, cy / n, cz / n);
+    if (outCol) outCol.push(cr / n, cg / n, cb / n);
+    if (outUv)  outUv.push(cu / n, cv / n);
+    for (let i = 0; i < n; i++) outFaces.push([ci, loop[i], loop[(i + 1) % n]]);
+    filled++;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(outPos), 3));
+  if (outCol) g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(outCol), 3));
+  if (outUv)  g.setAttribute("uv",    new THREE.BufferAttribute(new Float32Array(outUv), 2));
+  const idx = new Uint32Array(outFaces.length * 3);
+  for (let i = 0; i < outFaces.length; i++) {
+    idx[3 * i] = outFaces[i][0]; idx[3 * i + 1] = outFaces[i][1]; idx[3 * i + 2] = outFaces[i][2];
+  }
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.computeVertexNormals();
+  return { geometry: g, filled, total: allLoops.length };
+}
+
+// ── Export a mesh to a binary GLB Blob via GLTFExporter ────────────────────────
+function meshToGLB(mesh) {
+  return new Promise((resolve, reject) => {
+    new GLTFExporter().parse(
+      mesh,
+      (buf) => resolve(new Blob([buf], { type: "model/gltf-binary" })),
+      (err) => reject(err),
+      { binary: true }
+    );
+  });
+}
+
+// ── Apply the current threshold: rebuild, preview, and arm the tuned download ──
+async function apply() {
+  const status = $("holefill-status");
+  if (!welded) return;
+
+  if (curThreshold <= 0) {
+    // Threshold off → show the pristine server GLB, no re-encode needed.
+    if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
+    $("viewer").setAttribute("src", window.HoleTune._srcURL);
+    const link = $("download-link-tuned");
+    if (link) link.style.display = "none";
+    status.textContent = `${allLoops.length} open bound`
+      + (allLoops.length === 1 ? "y" : "ies") + " detected · move the slider to fill";
+    return;
+  }
+
+  status.textContent = "Filling…";
+  // Yield so the "Filling…" text paints before the (sync) rebuild.
+  await new Promise((r) => setTimeout(r, 0));
+
+  const { geometry, filled, total } = buildFilledGeometry(curThreshold);
+  const mat = srcMaterial ? srcMaterial.clone() : new THREE.MeshStandardMaterial({ metalness: 0, roughness: 1 });
+  if (geometry.getAttribute("color")) mat.vertexColors = true;
+  mat.side = THREE.DoubleSide;          // keep fresh patches visible regardless of winding
+  mat.needsUpdate = true;
+  const mesh = new THREE.Mesh(geometry, mat);
+
+  let blob;
+  try {
+    blob = await meshToGLB(mesh);
+  } catch (e) {
+    status.textContent = "Export failed: " + e;
+    return;
+  }
+  if (curBlobURL) URL.revokeObjectURL(curBlobURL);
+  curBlobURL = URL.createObjectURL(blob);
+  $("viewer").setAttribute("src", curBlobURL);
+
+  const link = $("download-link-tuned");
+  if (link) {
+    link.href = curBlobURL;
+    link.download = "reconstruction_tuned.glb";
+    link.style.display = "";
+  }
+  const added = geometry.index.count / 3 - welded.faces.length;
+  status.textContent = `Filled ${filled}/${total} boundaries · +${added} triangles`;
+}
+
+function scheduleApply() {
+  if (debounceId) clearTimeout(debounceId);
+  debounceId = setTimeout(apply, 180);
+}
+
+// ── Public bridge for the non-module UI code ───────────────────────────────────
+window.HoleTune = {
+  _srcURL: null,
+
+  async load(url) {
+    this.reset();
+    this._srcURL = url;
+    const slider = $("holefill-slider");
+    const status = $("holefill-status");
+    status.textContent = "Analysing mesh…";
+    let gltf;
+    try {
+      gltf = await loader.loadAsync(url);
+    } catch (e) {
+      status.textContent = "Could not load mesh for tuning: " + e;
+      return;
+    }
+    srcMesh = null;
+    gltf.scene.traverse((o) => { if (!srcMesh && o.isMesh) { srcMesh = o; } });
+    if (!srcMesh) { status.textContent = "No mesh found for tuning."; return; }
+
+    srcMaterial = srcMesh.material;
+    welded   = buildWorking(srcMesh.geometry);
+    allLoops = findBoundaryLoops(welded.faces);
+
+    if (slider) { slider.disabled = false; slider.value = 0; }
+    curThreshold = 0;
+    $("holefill-val").textContent = "off";
+    apply();                            // sets status + keeps pristine model shown
+  },
+
+  setThreshold(v) {
+    curThreshold = +v;
+    $("holefill-val").textContent = curThreshold <= 0 ? "off" : `≤ ${curThreshold} edges`;
+    scheduleApply();
+  },
+
+  // Re-show the tuned mesh after returning from the placed view.
+  reapply() { if (welded) apply(); },
+
+  reset() {
+    if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
+    srcMesh = null; srcMaterial = null; welded = null; allLoops = [];
+    curThreshold = 0;
+    const slider = $("holefill-slider");
+    if (slider) { slider.value = 0; slider.disabled = true; }
+    const val = $("holefill-val");    if (val) val.textContent = "off";
+    const st  = $("holefill-status"); if (st)  st.textContent = "";
+    const link = $("download-link-tuned"); if (link) link.style.display = "none";
+    const card = $("tune-card"); if (card) card.style.display = "";
+  },
+};
+
+// Global handler referenced by the slider's oninput attribute.
+window.onHoleFill = (v) => window.HoleTune.setThreshold(v);
 </script>
 </body>
 </html>
