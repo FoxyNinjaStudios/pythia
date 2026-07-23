@@ -289,6 +289,27 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 }
 #result-time b { color: var(--text); font-variant-numeric: tabular-nums; }
 
+/* ── Live RAM graph ── */
+#ram-card { display: none; }
+.ram-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ram-head b { color: var(--text); }
+.ram-head .ram-peak { color: var(--accent2); }
+#ram-canvas {
+  width: 100%;
+  height: 160px;
+  display: block;
+  border-radius: 8px;
+  background: #111;
+}
+
 /* Reconstruction preview: shows the segmentation mask (with a shimmer sweep to
    read as an indeterminate progress bar) in the same 500px slot the finished
    3-D model appears in. */
@@ -474,6 +495,16 @@ model-viewer {
       <img id="recon-mask-img" alt="segmentation mask" />
       <div class="shimmer"></div>
     </div>
+  </div>
+
+  <!-- ─── Live RAM graph ─────────────────────────────────────────────────── -->
+  <div class="card" id="ram-card">
+    <div class="card-title">Memory usage</div>
+    <div class="ram-head">
+      <span>Process RSS <b id="ram-current">0.0 GB</b> · peak <span class="ram-peak" id="ram-peak">0.0 GB</span></span>
+      <span id="ram-total"></span>
+    </div>
+    <canvas id="ram-canvas"></canvas>
   </div>
 
   <!-- ─── Console ────────────────────────────────────────────────────────── -->
@@ -1024,6 +1055,7 @@ async function startReconstruct() {
   }
   setProgress(5, "Sending request…");
   startTimer();
+  ramReset();
 
   const body = { image_id: imageId, mask_b64: lastMaskB64,
                  stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2,
@@ -1068,6 +1100,12 @@ function listenProgress(jobId) {
   es.onmessage = (e) => {
     const data = JSON.parse(e.data);
     if (data.ping) return;
+    // Live memory graph updates (streamed alongside progress events).
+    if (data.sys_total != null) ramSetTotal(data.sys_total);
+    if (Array.isArray(data.mem_series) && data.mem_series.length) ramSeed(data.mem_series);
+    if (data.mem) ramPush(data.mem);
+    if (data.peak != null) ramSetPeak(data.peak);
+    if (data.progress == null && data.done == null) return;   // pure mem tick
     setProgress(data.progress, data.message);
     if (data.done) {
       es.close();
@@ -1090,10 +1128,143 @@ function listenProgress(jobId) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Live RAM graph
+// ─────────────────────────────────────────────────────────────────────────────
+let ramSeries   = [];     // [{t, rss, sys}]
+let ramSysTotal = 0;      // total physical RAM (GB), for the y-axis ceiling hint
+let ramPeak     = 0;      // peak process RSS (GB)
+
+function ramReset() {
+  ramSeries = [];
+  ramPeak   = 0;
+  const card = document.getElementById("ram-card");
+  if (card) card.style.display = "block";
+  ramSetPeak(0);
+  document.getElementById("ram-current").textContent = "0.0 GB";
+  ramDraw();
+}
+
+function ramSetTotal(gb) {
+  ramSysTotal = +gb || 0;
+  const el = document.getElementById("ram-total");
+  if (el) el.textContent = ramSysTotal ? `${ramSysTotal.toFixed(1)} GB total` : "";
+}
+
+function ramSetPeak(gb) {
+  ramPeak = Math.max(ramPeak, +gb || 0);
+  const el = document.getElementById("ram-peak");
+  if (el) el.textContent = `${ramPeak.toFixed(1)} GB`;
+}
+
+function ramSeed(series) {
+  // Replace history wholesale (used when (re)connecting to an in-flight job).
+  if (series.length <= ramSeries.length) return;
+  ramSeries = series.slice();
+  for (const p of ramSeries) ramSetPeak(p.rss);
+  ramUpdateReadout();
+  ramDraw();
+}
+
+function ramPush(point) {
+  ramSeries.push(point);
+  if (ramSeries.length > 5000) ramSeries.shift();
+  ramSetPeak(point.rss);
+  ramUpdateReadout();
+  ramDraw();
+}
+
+function ramUpdateReadout() {
+  const last = ramSeries[ramSeries.length - 1];
+  if (last) document.getElementById("ram-current").textContent = `${last.rss.toFixed(1)} GB`;
+}
+
+function ramDraw() {
+  const canvas = document.getElementById("ram-canvas");
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth  || 600;
+  const cssH = canvas.clientHeight || 160;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width  = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 40, padR = 10, padT = 10, padB = 18;
+  const plotW = Math.max(1, cssW - padL - padR);
+  const plotH = Math.max(1, cssH - padT - padB);
+
+  // Axis ranges.
+  const n = ramSeries.length;
+  const tMax = n ? Math.max(1, ramSeries[n - 1].t) : 1;
+  const yMax = Math.max(1, ramPeak * 1.15);
+
+  const xAt = (t) => padL + (t / tMax) * plotW;
+  const yAt = (v) => padT + plotH - (v / yMax) * plotH;
+
+  // Gridlines + y labels (GB).
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.strokeStyle = "#2e3247";
+  ctx.fillStyle   = "#64748b";
+  ctx.lineWidth   = 1;
+  const gridLines = 4;
+  for (let i = 0; i <= gridLines; i++) {
+    const v = (yMax / gridLines) * i;
+    const y = yAt(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.textAlign = "right";
+    ctx.fillText(v.toFixed(0), padL - 6, y);
+  }
+
+  if (n >= 1) {
+    // Filled area under the RSS curve.
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    grad.addColorStop(0, "rgba(91,110,245,0.35)");
+    grad.addColorStop(1, "rgba(91,110,245,0.02)");
+    ctx.beginPath();
+    ctx.moveTo(xAt(ramSeries[0].t), yAt(0));
+    for (const p of ramSeries) ctx.lineTo(xAt(p.t), yAt(p.rss));
+    ctx.lineTo(xAt(ramSeries[n - 1].t), yAt(0));
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // RSS line.
+    ctx.beginPath();
+    ctx.moveTo(xAt(ramSeries[0].t), yAt(ramSeries[0].rss));
+    for (const p of ramSeries) ctx.lineTo(xAt(p.t), yAt(p.rss));
+    ctx.strokeStyle = "#7c3aed";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // x-axis time label (seconds).
+  ctx.fillStyle = "#64748b";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(`${tMax.toFixed(0)}s`, padL + plotW, cssH - 5);
+  ctx.textAlign = "left";
+  ctx.fillText("0s", padL, cssH - 5);
+}
+
+window.addEventListener("resize", ramDraw);
+
 function showResult(jobId, elapsed) {
   const url = `/result/${jobId}`;
   document.getElementById("progress-card").style.display = "none";
   document.getElementById("result-card").style.display   = "block";
+  // Keep the memory graph visible alongside the finished model; redraw so the
+  // canvas picks up its now-laid-out width.
+  const ramCard = document.getElementById("ram-card");
+  if (ramCard) ramCard.style.display = "block";
+  ramDraw();
   const rt = document.getElementById("result-time");
   if (rt) {
     rt.innerHTML = (elapsed != null)

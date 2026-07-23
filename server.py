@@ -61,6 +61,35 @@ logger = logging.getLogger("sam3d.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Memory sampling  (drives the live RAM graph shown during reconstruction)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import psutil
+    _PROC = psutil.Process()
+
+    def _mem_rss_gb() -> float:
+        """Current process resident set size, in GB (live, goes up and down)."""
+        return _PROC.memory_info().rss / 1e9
+
+    def _sys_used_gb() -> float:
+        return psutil.virtual_memory().used / 1e9
+
+    def _sys_total_gb() -> float:
+        return psutil.virtual_memory().total / 1e9
+except Exception:  # psutil unavailable → fall back to peak RSS from resource
+    import resource
+
+    def _mem_rss_gb() -> float:
+        # ru_maxrss is bytes on macOS, KB on Linux; treat as macOS bytes here.
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e9
+
+    def _sys_used_gb() -> float:
+        return 0.0
+
+    def _sys_total_gb() -> float:
+        return 0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Thread-safe log buffer  (used by /logs SSE endpoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -125,6 +154,32 @@ class JobState:
         self.error: Optional[str] = None
         self.result_path: Optional[str] = None
         self._queues: List[asyncio.Queue] = []
+        # Live memory tracking (for the RAM graph). mem_series is the full
+        # history so a late subscriber can still redraw the whole curve.
+        self.mem_series: List[dict] = []
+        self.peak_gb: float   = 0.0
+        self.sys_total_gb: float = _sys_total_gb()
+        self._mem_t0: float   = time.time()
+
+    def start_mem(self):
+        """Reset the memory clock to the moment reconstruction actually begins."""
+        self._mem_t0 = time.time()
+        self.mem_series.clear()
+        self.peak_gb = 0.0
+
+    def sample_mem(self):
+        """Capture one memory reading and broadcast it to subscribers."""
+        rss = _mem_rss_gb()
+        self.peak_gb = max(self.peak_gb, rss)
+        point = {
+            "t":   round(time.time() - self._mem_t0, 2),
+            "rss": round(rss, 3),
+            "sys": round(_sys_used_gb(), 3),
+        }
+        self.mem_series.append(point)
+        if len(self.mem_series) > 5000:      # keep bounded for very long runs
+            del self.mem_series[0]
+        self._broadcast({"mem": point, "peak": round(self.peak_gb, 3)})
 
     def update(self, message: str, progress: int):
         self.message  = message
@@ -136,7 +191,8 @@ class JobState:
         self.result_path = result_path
         self.progress    = 100
         self.message     = "complete"
-        self._broadcast({"progress": 100, "message": "complete", "done": True})
+        self._broadcast({"progress": 100, "message": "complete", "done": True,
+                         "peak": round(self.peak_gb, 3)})
 
     def fail(self, error: str):
         self.done  = True
@@ -313,8 +369,16 @@ async def status_stream(job_id: str):
     job = jobs[job_id]
 
     async def event_gen():
-        # Immediately send current state
-        yield _sse({"progress": job.progress, "message": job.message, "done": job.done})
+        # Immediately send current state (including any memory history so a late
+        # subscriber can redraw the full RAM curve alongside the result).
+        yield _sse({
+            "progress":  job.progress,
+            "message":   job.message,
+            "done":      job.done,
+            "mem_series": job.mem_series,
+            "sys_total": round(job.sys_total_gb, 2),
+            "peak":      round(job.peak_gb, 3),
+        })
         if job.done:
             return
 
@@ -600,6 +664,22 @@ def _run_reconstruction_sync(
     handler = _PipelineLogHandler(job)
     root_logger.addHandler(handler)
 
+    # Live RAM sampler: poll process memory ~2×/s and stream it to the client
+    # so the UI can draw a memory graph during (and after) reconstruction.
+    job.start_mem()
+    _mem_stop = threading.Event()
+
+    def _mem_sampler():
+        while not _mem_stop.is_set():
+            try:
+                job.sample_mem()
+            except Exception:
+                pass
+            _mem_stop.wait(0.5)
+
+    _mem_thread = threading.Thread(target=_mem_sampler, name=f"mem-{job_id}", daemon=True)
+    _mem_thread.start()
+
     try:
         image = np.array(PILImage.open(img_path).convert("RGB"))
         mask  = np.array(PILImage.open(mask_path).convert("L"))
@@ -681,6 +761,8 @@ def _run_reconstruction_sync(
         job.fail(str(exc))
         logger.error(f"[JOB {job_id}] Failed:\n{traceback.format_exc()}")
     finally:
+        _mem_stop.set()
+        job.sample_mem()          # one final reading so the graph ends at the peak
         root_logger.removeHandler(handler)
 
 

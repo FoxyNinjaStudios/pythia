@@ -390,7 +390,30 @@ def postprocess_mesh(
                 # Best-effort: keep the filled result even if repair fails.
                 pass
             vertices, faces = mesh.vertices, mesh.faces
-            
+
+            # 3. Robust final pass with pymeshfix to close the larger holes that
+            #    PyVista's small-hole fill and trimesh's boundary-fan repair leave
+            #    open (e.g. the big loops that show up on the top surface). This is
+            #    the CPU equivalent of the CUDA-only ``_fill_holes`` mincut path, so
+            #    it honours the same ``fill_holes_max_hole_nbe`` budget. Best-effort:
+            #    never let hole filling break the export.
+            if fill_holes_max_hole_nbe > 0 and faces.shape[0] > 0:
+                try:
+                    _tm = _meshfix.PyTMesh()
+                    _tm.load_array(
+                        np.asarray(vertices, dtype=np.float64),
+                        np.asarray(faces, dtype=np.int32),
+                    )
+                    _tm.fill_small_boundaries(
+                        nbe=int(fill_holes_max_hole_nbe), refine=True
+                    )
+                    _v, _f = _tm.return_arrays()
+                    if _f.shape[0] > 0:
+                        vertices, faces = _v, _f
+                except Exception as _exc:
+                    if verbose:
+                        tqdm.write(f"[MPS] pymeshfix hole fill skipped: {_exc}")
+
             if verbose:
                 tqdm.write(f"[MPS] Completed hole filling: {vertices.shape[0]} verts, {faces.shape[0]} faces")
         else:
