@@ -329,15 +329,18 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   color: var(--text);
   margin-bottom: 6px;
 }
-.tune-row #holefill-val {
+.tune-row #holefill-val,
+.tune-row #edgetrim-val {
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
-#holefill-slider {
+#holefill-slider,
+#edgetrim-slider {
   width: 100%;
   accent-color: var(--accent);
   cursor: pointer;
 }
+#edgetrim-slider { margin-bottom: 4px; }
 .tune-status {
   margin-top: 6px;
   font-size: 0.75rem;
@@ -580,6 +583,12 @@ model-viewer {
       </div>
       <input type="range" id="holefill-slider" min="0" max="1000" step="10" value="0"
              oninput="onHoleFill(this.value)" disabled />
+      <div class="tune-row">
+        <label for="edgetrim-slider">Trim stretched edges (client-side)</label>
+        <span id="edgetrim-val">off</span>
+      </div>
+      <input type="range" id="edgetrim-slider" min="0" max="100" step="1" value="0"
+             oninput="onEdgeTrim(this.value)" disabled />
       <div id="holefill-status" class="tune-status"></div>
       <div class="result-actions">
         <a id="download-link-tuned" style="display:none"><button class="btn-secondary">⬇ Download tuned GLB</button></a>
@@ -1439,7 +1448,9 @@ let srcMesh    = null;                 // first mesh found in the loaded GLB
 let srcMaterial= null;                 // its material (reused for export)
 let allLoops   = [];                   // cached boundary loops (welded topology)
 let welded     = null;                 // cached welded working set
-let curThreshold = 0;
+let curThreshold = 0;                  // hole-fill: fill loops with ≤ this many edges
+let curTrim    = 0;                    // edge-trim slider value (0 = off … 100 = max)
+let bboxDiag   = 1;                    // model bounding-box diagonal (edge-trim scale)
 let curBlobURL = null;                 // object URL currently shown / exportable
 let debounceId = null;
 
@@ -1523,16 +1534,47 @@ function findBoundaryLoops(faces) {
   return loops;
 }
 
-// ── Rebuild geometry, fan-filling every loop whose length ≤ threshold ──────────
-function buildFilledGeometry(threshold) {
+// ── Edge-trim threshold (world units) for a slider value in (0,100] ────────────
+//    Higher slider ⇒ shorter threshold ⇒ more aggressive trimming.  Faces whose
+//    longest edge exceeds this are dropped (removes the stretched "rubber-sheet"
+//    triangles single-view reconstructions produce at depth discontinuities).
+function trimEdgeThreshold(trim) {
+  return bboxDiag * (0.003 + 0.30 * (1 - trim / 100));
+}
+
+// ── Rebuild geometry: trim over-stretched faces, then fan-fill boundary loops ──
+function buildTunedGeometry(threshold, trim) {
   const { uPos, uCol, uUv, faces } = welded;
+
+  // 1. Trim faces whose longest edge is over the threshold.
+  let workFaces = faces, trimmed = 0;
+  if (trim > 0) {
+    const thr2 = trimEdgeThreshold(trim) ** 2;
+    const e2 = (a, b) => {
+      const dx = uPos[3 * a] - uPos[3 * b];
+      const dy = uPos[3 * a + 1] - uPos[3 * b + 1];
+      const dz = uPos[3 * a + 2] - uPos[3 * b + 2];
+      return dx * dx + dy * dy + dz * dz;
+    };
+    workFaces = [];
+    for (const f of faces) {
+      const [a, b, c] = f;
+      if (Math.max(e2(a, b), e2(b, c), e2(c, a)) <= thr2) workFaces.push(f);
+      else trimmed++;
+    }
+  }
+
+  // 2. Boundary loops (recompute only when trimming changed the face set).
+  const loops = trim > 0 ? findBoundaryLoops(workFaces) : allLoops;
+
+  // 3. Copy attributes, then fan-fill every loop with ≤ threshold edges.
   const outPos   = uPos.slice();
   const outCol   = uCol ? uCol.slice() : null;
   const outUv    = uUv ? uUv.slice() : null;
-  const outFaces = faces.slice();
+  const outFaces = workFaces.slice();
 
   let filled = 0;
-  for (const loop of allLoops) {
+  for (const loop of loops) {
     if (threshold <= 0 || loop.length > threshold) continue;
     const n = loop.length;
     let cx = 0, cy = 0, cz = 0, cr = 0, cg = 0, cb = 0, cu = 0, cv = 0;
@@ -1559,7 +1601,7 @@ function buildFilledGeometry(threshold) {
   }
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   g.computeVertexNormals();
-  return { geometry: g, filled, total: allLoops.length };
+  return { geometry: g, filled, total: loops.length, trimmed };
 }
 
 // ── Export a mesh to a binary GLB Blob via GLTFExporter ────────────────────────
@@ -1574,27 +1616,27 @@ function meshToGLB(mesh) {
   });
 }
 
-// ── Apply the current threshold: rebuild, preview, and arm the tuned download ──
+// ── Apply the current settings: rebuild, preview, and arm the tuned download ──
 async function apply() {
   const status = $("holefill-status");
   if (!welded) return;
 
-  if (curThreshold <= 0) {
-    // Threshold off → show the pristine server GLB, no re-encode needed.
+  if (curThreshold <= 0 && curTrim <= 0) {
+    // Both off → show the pristine server GLB, no re-encode needed.
     if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
     $("viewer").setAttribute("src", window.HoleTune._srcURL);
     const link = $("download-link-tuned");
     if (link) link.style.display = "none";
     status.textContent = `${allLoops.length} open bound`
-      + (allLoops.length === 1 ? "y" : "ies") + " detected · move the slider to fill";
+      + (allLoops.length === 1 ? "y" : "ies") + " detected · move a slider to tune";
     return;
   }
 
-  status.textContent = "Filling…";
-  // Yield so the "Filling…" text paints before the (sync) rebuild.
+  status.textContent = "Processing…";
+  // Yield so the "Processing…" text paints before the (sync) rebuild.
   await new Promise((r) => setTimeout(r, 0));
 
-  const { geometry, filled, total } = buildFilledGeometry(curThreshold);
+  const { geometry, filled, total, trimmed } = buildTunedGeometry(curThreshold, curTrim);
   const mat = srcMaterial ? srcMaterial.clone() : new THREE.MeshStandardMaterial({ metalness: 0, roughness: 1 });
   if (geometry.getAttribute("color")) mat.vertexColors = true;
   mat.side = THREE.DoubleSide;          // keep fresh patches visible regardless of winding
@@ -1618,8 +1660,12 @@ async function apply() {
     link.download = "reconstruction_tuned.glb";
     link.style.display = "";
   }
-  const added = geometry.index.count / 3 - welded.faces.length;
-  status.textContent = `Filled ${filled}/${total} boundaries · +${added} triangles`;
+  const netFaces = geometry.index.count / 3 - welded.faces.length;
+  const parts = [];
+  if (curTrim > 0)      parts.push(`trimmed ${trimmed} faces`);
+  if (curThreshold > 0) parts.push(`filled ${filled}/${total} boundaries`);
+  parts.push(`${netFaces >= 0 ? "+" : ""}${netFaces} triangles`);
+  status.textContent = parts.join(" · ");
 }
 
 function scheduleApply() {
@@ -1652,9 +1698,19 @@ window.HoleTune = {
     welded   = buildWorking(srcMesh.geometry);
     allLoops = findBoundaryLoops(welded.faces);
 
+    // Bounding-box diagonal drives the edge-trim threshold.
+    const geo = srcMesh.geometry;
+    geo.computeBoundingBox();
+    bboxDiag = geo.boundingBox ? geo.boundingBox.getSize(new THREE.Vector3()).length() : 1;
+    if (!(bboxDiag > 0)) bboxDiag = 1;
+
+    const trimS = $("edgetrim-slider");
     if (slider) { slider.disabled = false; slider.value = 0; }
+    if (trimS)  { trimS.disabled  = false; trimS.value  = 0; }
     curThreshold = 0;
+    curTrim = 0;
     $("holefill-val").textContent = "off";
+    $("edgetrim-val").textContent = "off";
     apply();                            // sets status + keeps pristine model shown
   },
 
@@ -1664,24 +1720,36 @@ window.HoleTune = {
     scheduleApply();
   },
 
+  setEdgeTrim(v) {
+    curTrim = +v;
+    $("edgetrim-val").textContent = curTrim <= 0
+      ? "off"
+      : `> ${(trimEdgeThreshold(curTrim) / bboxDiag * 100).toFixed(1)}% size`;
+    scheduleApply();
+  },
+
   // Re-show the tuned mesh after returning from the placed view.
   reapply() { if (welded) apply(); },
 
   reset() {
     if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
     srcMesh = null; srcMaterial = null; welded = null; allLoops = [];
-    curThreshold = 0;
+    curThreshold = 0; curTrim = 0; bboxDiag = 1;
     const slider = $("holefill-slider");
     if (slider) { slider.value = 0; slider.disabled = true; }
+    const trimS = $("edgetrim-slider");
+    if (trimS) { trimS.value = 0; trimS.disabled = true; }
     const val = $("holefill-val");    if (val) val.textContent = "off";
+    const tval = $("edgetrim-val");   if (tval) tval.textContent = "off";
     const st  = $("holefill-status"); if (st)  st.textContent = "";
     const link = $("download-link-tuned"); if (link) link.style.display = "none";
     const card = $("tune-card"); if (card) card.style.display = "";
   },
 };
 
-// Global handler referenced by the slider's oninput attribute.
+// Global handlers referenced by the sliders' oninput attributes.
 window.onHoleFill = (v) => window.HoleTune.setThreshold(v);
+window.onEdgeTrim = (v) => window.HoleTune.setEdgeTrim(v);
 </script>
 </body>
 </html>

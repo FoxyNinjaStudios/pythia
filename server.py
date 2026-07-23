@@ -436,7 +436,7 @@ async def log_stream():
 
 # ── Result download ────────────────────────────────────────────────────────────
 
-@app.get("/result/{job_id}")
+@app.api_route("/result/{job_id}", methods=["GET", "HEAD"])
 async def get_result(job_id: str, format: str = "glb"):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
