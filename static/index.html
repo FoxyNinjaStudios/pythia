@@ -581,7 +581,7 @@ model-viewer {
         <label for="holefill-slider">Fill holes (client-side)</label>
         <span id="holefill-val">off</span>
       </div>
-      <input type="range" id="holefill-slider" min="0" max="1000" step="10" value="0"
+      <input type="range" id="holefill-slider" min="0" max="4000" step="10" value="2000"
              oninput="onHoleFill(this.value)" disabled />
       <div class="tune-row">
         <label for="edgetrim-slider">Trim stretched edges (client-side)</label>
@@ -1600,7 +1600,8 @@ function buildTunedGeometry(threshold, trim) {
     idx[3 * i] = outFaces[i][0]; idx[3 * i + 1] = outFaces[i][1]; idx[3 * i + 2] = outFaces[i][2];
   }
   g.setIndex(new THREE.BufferAttribute(idx, 1));
-  g.computeVertexNormals();
+  // Source GLB has no NORMAL attribute (viewers flat-shade it). Leave normals
+  // off so the tuned mesh shades identically instead of appearing smoothed.
   return { geometry: g, filled, total: loops.length, trimmed };
 }
 
@@ -1705,11 +1706,11 @@ window.HoleTune = {
     if (!(bboxDiag > 0)) bboxDiag = 1;
 
     const trimS = $("edgetrim-slider");
-    if (slider) { slider.disabled = false; slider.value = 0; }
+    if (slider) { slider.disabled = false; slider.value = 2000; }
     if (trimS)  { trimS.disabled  = false; trimS.value  = 0; }
-    curThreshold = 0;
+    curThreshold = 2000;
     curTrim = 0;
-    $("holefill-val").textContent = "off";
+    $("holefill-val").textContent = `≤ ${curThreshold} edges`;
     $("edgetrim-val").textContent = "off";
     apply();                            // sets status + keeps pristine model shown
   },
