@@ -46,3 +46,52 @@ shortcut config.
 - `--distill` still exists but is scoped to **stage 2** only. The released SLAT
   weights are not shortcut-distilled, so it remains experimental and off by default.
 - Backward compatibility: an explicit `--steps N` still works and applies to stage 2.
+
+### Changed — memory footprint
+
+- Documented and corrected the memory requirement. Earlier documentation claimed
+  **~48 GB** of unified memory; measured usage is **sustained ~8–9 GB with peak
+  under 20 GB** (peak occurs late, during mesh decode/export, after the GPU stages
+  release their buffers). The supported minimum is now stated as **24 GB**.
+
+### Added — web UI editing & appearance
+
+- **Stencil-based mesh editing** in the web UI: drag box / sphere / cylinder /
+  capsule stencils into the scene, move/rotate/scale them, and geometry inside any
+  stencil is removed. Editing is non-destructive until export.
+- **Client-side hole filling** after stencil editing, so an edited mesh stays
+  watertight.
+- **Client-side texture baking** on GLB download, so downloaded files display
+  correctly in macOS Preview, Quick Look, and USDZ conversion (which ignore
+  per-vertex `COLOR_0`).
+
+### Changed — naming
+
+- Renamed the recommended conda environment from `sam-3d-mlx` to **`sam-3d`** and
+  updated all documented commands. The project does **not** use Apple's MLX
+  framework (it uses PyTorch MPS + hand-written Metal kernels); the old name was
+  misleading. The repository directory is `pythia`.
+
+### Documentation
+
+- Added **Requirements**, **memory profile**, **Why Apple Silicon**, and
+  **recommended configurations** sections.
+- Added **Geometry cleanup**, **Mesh editing**, and **Texture baking** sections.
+- Added an **Upstream and attribution** section recording that the upstream port
+  (`ZimengXiong/Sam3D-Objects-MLX`) has no license, and split *How the port works*
+  into inherited vs. added work.
+- Rewrote the **Licensing** section: commercial enquiries routed to Skysong
+  Innovations (ASU technology transfer), clarified that proprietary components are
+  not in this repository, added a third-party license table, and documented the
+  gated, runtime-downloaded Meta weights.
+- Fixed the web-app port in the README (`8005`, not `8000`).
+
+### Not present (documentation accuracy)
+
+- The `--depth-prep`, `--depth-prep-quality`, `--no-clean`, and `--clean-ratio`
+  CLI flags referenced in some planning docs are **not implemented** in this
+  revision and were intentionally left out of the README. Geometry cleanup (hole
+  filling + floater removal) runs **unconditionally** as part of mesh
+  post-processing; there is currently no flag to disable it or tune a component
+  ratio, and there is no separate depth-edge–trimming stage.
+

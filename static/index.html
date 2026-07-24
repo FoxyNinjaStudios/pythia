@@ -507,17 +507,6 @@ model-viewer {
       </div>
     </div>
 
-    <div class="control-row" style="display:flex;align-items:center;gap:10px;margin:10px 0 2px;">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;">
-        <input type="checkbox" id="layout-toggle" checked />
-        <span>Place in scene <span style="opacity:.6">(estimate real-world pose)</span></span>
-      </label>
-      <label id="layout-refine-wrap" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;opacity:.85;">
-        <input type="checkbox" id="layout-refine-toggle" />
-        <span>Refine <span style="opacity:.6">(slower, CPU)</span></span>
-      </label>
-    </div>
-
     <div class="btn-row">
       <button class="btn-ghost" id="undo-btn" onclick="undo()" disabled title="Undo (⌘Z)">↶ Undo</button>
       <button class="btn-ghost" id="redo-btn" onclick="redo()" disabled title="Redo (⇧⌘Z)">↷ Redo</button>
@@ -644,18 +633,6 @@ function setQuality(btn) {
   document.querySelectorAll("#quality-seg button")
     .forEach(b => b.classList.toggle("active", b === btn));
 }
-
-// Reveal the "Refine" sub-option only when scene placement is enabled.
-document.addEventListener("change", (e) => {
-  if (e.target && e.target.id === "layout-toggle") {
-    const wrap = document.getElementById("layout-refine-wrap");
-    if (wrap) wrap.style.display = e.target.checked ? "flex" : "none";
-    if (!e.target.checked) {
-      const rf = document.getElementById("layout-refine-toggle");
-      if (rf) rf.checked = false;
-    }
-  }
-});
 
 function qualityLabel() {
   const { s1, s2 } = qualitySteps;
@@ -1149,9 +1126,7 @@ async function startReconstruct() {
   ramReset();
 
   const body = { image_id: imageId, mask_b64: lastMaskB64,
-                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2,
-                 layout: !!(document.getElementById("layout-toggle") || {}).checked,
-                 layout_refine: !!(document.getElementById("layout-refine-toggle") || {}).checked };
+                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2 };
   const res  = await fetch("/reconstruct", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -1367,9 +1342,6 @@ function showResult(jobId, elapsed) {
   // Prepare the client-side tuning tool; it auto-generates the tuned GLB export.
   if (window.HoleTune) window.HoleTune.load(url);
 }
-
-let _placedJobId = null;
-let _showingPlaced = false;
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Console
@@ -2142,7 +2114,7 @@ window.HoleTune = {
     scheduleApply();
   },
 
-  // Re-show the tuned mesh after returning from the placed view.
+  // Re-show the tuned mesh.
   reapply() { if (welded) apply(); },
 
   // Bake the current tuned vertex colours into a texture, then download the GLB.

@@ -235,11 +235,6 @@ class ReconstructRequest(BaseModel):
     # Client sends these from the Fast/Medium/Slow presets; default is Fast (8/8).
     stage1_steps: int = 8
     stage2_steps: int = 8
-    # Layout placement: also produce a scene-placed GLB positioning the object in
-    # camera space via the predicted pose. layout_refine adds ICP + render-compare
-    # pose refinement (slower, CPU-only).
-    layout: bool = False
-    layout_refine: bool = False
     # Shortcut-model distillation: sample the flow stages CFG-free with step-size
     # conditioning (~1 eval/step). Much faster with few steps; needs distilled weights.
     # Stage 1 (sparse structure) IS shortcut-distilled in the shipped weights, so it is
@@ -354,8 +349,6 @@ async def reconstruct(req: ReconstructRequest):
         str(mask_path),
         stage1_steps,
         stage2_steps,
-        bool(req.layout),
-        bool(req.layout_refine),
         bool(req.distill),
         bool(req.ss_distill),
     )
@@ -450,16 +443,6 @@ async def get_result(job_id: str, format: str = "glb"):
     if job.error:
         raise HTTPException(500, job.error)
     fmt_raw = str(format).lower()
-    if fmt_raw == "placed":
-        # Scene-placed GLB (object positioned in camera space).
-        path = Path(job.result_path).with_name(Path(job.result_path).stem + "_placed.glb")
-        if not path.exists():
-            raise HTTPException(404, "Placed GLB not available")
-        return FileResponse(
-            str(path),
-            media_type="model/gltf-binary",
-            filename="reconstruction_placed.glb",
-        )
     fmt = "ply" if fmt_raw == "ply" else "glb"
     path = Path(job.result_path).with_suffix(f".{fmt}")
     if not path.exists():
@@ -657,8 +640,6 @@ def _run_reconstruction_sync(
     mask_path: str,
     stage1_steps: int = 8,
     stage2_steps: int = 8,
-    layout: bool = False,
-    layout_refine: bool = False,
     distill: bool = False,
     ss_distill: bool = True,
 ):
@@ -721,8 +702,6 @@ def _run_reconstruction_sync(
             decode_formats=_decode_formats,
             simplify_ratio=0.0,
             vertex_color_source="gaussian",
-            with_layout_postprocess=layout,
-            layout_refine=layout_refine,
             use_stage1_distillation=ss_distill,
             use_stage2_distillation=distill,
         )
@@ -736,20 +715,6 @@ def _run_reconstruction_sync(
         result_ply = str(RESULT_DIR / f"{job_id}.ply")
         job.update("Exporting GLB + PLY…", 95)
         result_mesh.export(result_path, file_type="glb")
-
-        # Scene-placed GLB (object positioned in camera space via predicted pose).
-        placed_mesh = output.get("glb_placed")
-        if placed_mesh is not None:
-            try:
-                placed_path = str(RESULT_DIR / f"{job_id}_placed.glb")
-                placed_mesh.export(placed_path, file_type="glb")
-                iou = output.get("layout_iou")
-                logger.info(
-                    f"[JOB {job_id}] Placed GLB exported"
-                    + (f" (layout IoU {iou})" if iou is not None else "")
-                )
-            except Exception as exc:
-                logger.warning(f"[JOB {job_id}] Placed GLB export failed: {exc}")
 
         # PLY: prefer a real Gaussian splat (optional module); otherwise fall back
         # to exporting the mesh as a .ply so the download link always works.
