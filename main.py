@@ -111,7 +111,8 @@ def run_pipeline(
     mask_dir: str = None,
     mask_index: int = 0,
     output_path: str = "output.glb",
-    inference_steps: int = 12,
+    inference_steps: int = 12,      # stage 2 (SLAT: texture & refinement) — genuine flow matching
+    ss_steps: int = 2,              # stage 1 (sparse structure) — shortcut-distilled, shipped default
     seed: int = 42,
     output_mesh: bool = True,
     cache_dir: str = None,
@@ -123,7 +124,8 @@ def run_pipeline(
     vertex_color_source: str = "gaussian",
     layout: bool = False,
     layout_refine: bool = False,
-    distill: bool = False,
+    distill: bool = False,          # stage 2 (SLAT) distillation — SLAT is NOT distilled; keep off
+    ss_distill: bool = True,        # stage 1 shortcut distillation — required for shortcut sampling
 ):
     """
     Run SAM-3D pipeline: image + mask -> 3D mesh.
@@ -152,6 +154,13 @@ def run_pipeline(
             camera space using the predicted pose (written as <output>_placed.glb).
         layout_refine: If True, refine the pose against the pointmap + mask (ICP +
             render-compare) before placement. Slower (runs on CPU).
+        inference_steps: Stage-2 (SLAT texture & refinement) flow-matching steps. Default 12.
+        ss_steps: Stage-1 (sparse-structure / geometry) steps. This model is shortcut-
+            distilled; 2 is the shipped default. Values above 4 rarely help.
+        distill: Distill stage 2 (SLAT). The released SLAT weights are not distilled, so
+            leave this off. Default False.
+        ss_distill: Use shortcut-distilled sampling for stage 1 (step-size conditioning,
+            CFG-free, ~1 eval/step). Required for the low ss_steps to be valid. Default True.
     """
     from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
 
@@ -220,7 +229,11 @@ def run_pipeline(
     print()
     
     # Run inference
-    print(f"[RUN] Starting inference (steps={inference_steps}, mesh={output_mesh}, simplify={simplify_ratio})...")
+    _ss_mode = "shortcut-distilled" if ss_distill else "flow-matching+CFG"
+    _slat_mode = "shortcut-distilled" if distill else "flow-matching+CFG"
+    print(f"[RUN] Stage 1 (sparse structure): {ss_steps} steps · {_ss_mode}")
+    print(f"[RUN] Stage 2 (SLAT texture/refine): {inference_steps} steps · {_slat_mode}")
+    print(f"[RUN] mesh={output_mesh}, simplify={simplify_ratio}")
     print("-" * 40)
     t_start = time.perf_counter()
     
@@ -229,7 +242,7 @@ def run_pipeline(
         mask,
         seed=seed,
         stage1_only=not output_mesh,  # Full pipeline if requesting mesh
-        stage1_inference_steps=inference_steps,
+        stage1_inference_steps=ss_steps,
         stage2_inference_steps=inference_steps,
         decode_formats=["mesh"] if output_mesh else [],
         simplify_ratio=simplify_ratio,
@@ -240,7 +253,7 @@ def run_pipeline(
         vertex_color_source=vertex_color_source,
         with_layout_postprocess=layout,
         layout_refine=layout_refine,
-        use_stage1_distillation=distill,
+        use_stage1_distillation=ss_distill,
         use_stage2_distillation=distill,
     )
     
@@ -336,7 +349,24 @@ def main():
         "--steps",
         type=int,
         default=12,
-        help="Number of diffusion steps (default: 12, higher=better quality)"
+        help="Stage-2 (SLAT texture & refinement) flow-matching steps only. Default 12. "
+             "This stage is genuine flow matching and is not distilled; 12 is correct."
+    )
+    parser.add_argument(
+        "--ss-steps",
+        type=int,
+        default=2,
+        help="Sparse-structure (geometry) diffusion steps. This model is shortcut-"
+             "distilled; 2 is the shipped default. Values above 4 are unlikely to "
+             "improve quality."
+    )
+    parser.add_argument(
+        "--ss-distill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use shortcut-distilled sampling for stage 1 (step-size conditioning, CFG-"
+             "free, ~1 eval/step). Required for --ss-steps to be valid; pass --no-ss-"
+             "distill to fall back to CFG flow matching (then use ~12 steps). Default on."
     )
     parser.add_argument(
         "--seed",
@@ -416,9 +446,9 @@ def main():
     parser.add_argument(
         "--distill",
         action="store_true",
-        help="Sample both flow stages with the shortcut model (step-size conditioning, "
-             "CFG off, ~1 eval/step) instead of CFG-guided flow matching. Much faster "
-             "with few steps, but requires shortcut-distilled weights. Try --steps 4."
+        help="Also distill STAGE 2 (SLAT). The released SLAT weights are not shortcut-"
+             "distilled, so this is experimental and usually degrades texture quality; "
+             "leave it off. Stage 1 is distilled by default (see --ss-distill)."
     )
 
     args = parser.parse_args()
@@ -443,6 +473,7 @@ def main():
         mask_index=args.mask_index,
         output_path=output_path,
         inference_steps=args.steps,
+        ss_steps=args.ss_steps,
         seed=args.seed,
         output_mesh=output_mesh,
         cache_dir=args.cache_dir,
@@ -455,6 +486,7 @@ def main():
         layout=args.layout,
         layout_refine=args.layout_refine,
         distill=args.distill,
+        ss_distill=args.ss_distill,
     )
 
 

@@ -404,7 +404,14 @@ model-viewer {
   margin-top: 14px;
 }
 .result-actions { flex-wrap: wrap; }
-#lasso-toggle.active { background: #2b6cff; color: #fff; border-color: #2b6cff; }
+
+/* ── Stencil eraser ── */
+#eraser-palette { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+#eraser-palette .palette-label { color: #aaa; font-size: 13px; }
+.stencil-chip { padding: 6px 10px; border: 1px solid #444; border-radius: 6px; background: #1b1b1b;
+                color: #eee; cursor: grab; user-select: none; font-size: 13px; }
+.stencil-chip:active { cursor: grabbing; }
+#er-move.active, #er-rotate.active, #er-scale.active { background: #2b6cff; color: #fff; border-color: #2b6cff; }
 
 /* ── Console ── */
 #console-card {
@@ -574,20 +581,29 @@ model-viewer {
              oninput="onSmooth(this.value)" disabled />
       <div id="holefill-status" class="tune-status"></div>
       <div class="result-actions">
-        <button id="lasso-open-btn" class="btn-secondary" onclick="openLasso()" disabled>✂ Lasso delete</button>
-        <button id="bake-btn" class="btn-secondary" onclick="bakeTexture()" disabled>🔥 Bake texture</button>
-        <a id="download-link-tuned" style="display:none"><button class="btn-secondary">⬇ Download tuned GLB</button></a>
+        <button id="eraser-open-btn" class="btn-secondary" onclick="openEraser()" disabled>🧹 Erase stencils</button>
+        <button id="download-tuned-btn" class="btn-secondary" style="display:none" onclick="downloadTuned()">⬇ Download textured GLB</button>
       </div>
     </div>
-    <!-- Interactive lasso-delete editor (hidden until opened). -->
-    <div id="lasso-editor" style="display:none">
-      <div id="lasso-host" style="position:relative; width:100%; height:520px; background:#111; border-radius:8px; overflow:hidden;"></div>
-      <div id="lasso-status" class="tune-status"></div>
+    <!-- Interactive stencil-erase editor (hidden until opened). -->
+    <div id="eraser-editor" style="display:none">
+      <div id="eraser-palette">
+        <span class="palette-label">Drag a stencil into the scene:</span>
+        <div class="stencil-chip" draggable="true" data-shape="box">◼ Box</div>
+        <div class="stencil-chip" draggable="true" data-shape="sphere">● Sphere</div>
+        <div class="stencil-chip" draggable="true" data-shape="cylinder">⬤ Cylinder</div>
+        <div class="stencil-chip" draggable="true" data-shape="capsule">💊 Capsule</div>
+      </div>
+      <div id="eraser-host" style="position:relative; width:100%; height:520px; background:#111; border-radius:8px; overflow:hidden;"></div>
+      <div id="eraser-status" class="tune-status"></div>
       <div class="result-actions">
-        <button id="lasso-toggle" class="btn-secondary">✏️ Lasso: off</button>
-        <button id="lasso-undo" class="btn-secondary">↶ Undo</button>
-        <button id="lasso-done" class="btn-secondary">✓ Done</button>
-        <button id="lasso-cancel" class="btn-secondary">✕ Cancel</button>
+        <button id="er-move"   class="btn-secondary active">↔ Move</button>
+        <button id="er-rotate" class="btn-secondary">⟳ Rotate</button>
+        <button id="er-scale"  class="btn-secondary">⤢ Scale</button>
+        <button id="er-remove" class="btn-secondary">🗑 Remove</button>
+        <button id="er-clear"  class="btn-secondary">⌫ Clear all</button>
+        <button id="er-done"   class="btn-secondary">✓ Done</button>
+        <button id="er-cancel" class="btn-secondary">✕ Cancel</button>
       </div>
     </div>
   </div>
@@ -1413,6 +1429,7 @@ import * as THREE from "three";
 import { GLTFLoader }   from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 const WELD_EPS = 1e-5;                 // position quantisation for vertex welding
 const loader   = new GLTFLoader();
@@ -1424,7 +1441,7 @@ let welded     = null;                 // cached welded working set
 let curThreshold = 0;                  // hole-fill: fill loops with ≤ this many edges
 let curTrim    = 0;                     // edge-trim slider value (0 = off … 100 = max)
 let curSmooth  = 0;                     // sanding: Taubin smoothing iterations (0 = off)
-let killed     = new Set();             // welded face indices removed by the lasso tool
+let killed     = new Set();             // welded face indices removed by the stencil eraser
 let bboxDiag   = 1;                     // model bounding-box diagonal (edge-trim scale)
 let curBlobURL = null;                 // object URL currently shown / exportable
 let debounceId = null;
@@ -1547,12 +1564,12 @@ function taubinSmooth(pos, faces, iters) {
   return P;
 }
 
-// ── Rebuild geometry: drop lasso-deleted + over-stretched faces, fan-fill holes,
+// ── Rebuild geometry: drop erased + over-stretched faces, fan-fill holes,
 //    then optionally Taubin-smooth ("sand") the surface. ────────────────────────
 function buildTunedGeometry(threshold, trim) {
   const { uPos, uCol, uUv, faces } = welded;
 
-  // 0. Drop faces the lasso tool removed.
+  // 0. Drop faces the stencil eraser removed.
   const baseFaces = killed.size ? faces.filter((_, i) => !killed.has(i)) : faces;
 
   // 1. Trim faces whose longest edge is over the threshold.
@@ -1737,30 +1754,38 @@ async function bakeVertexColorTexture(srcGeom) {
   return { geometry: geom, map, texW, texH };
 }
 
-// ── Interactive lasso-delete editor ───────────────────────────────────────────
-//    Opens a live Three.js viewport (orbit to inspect).  Toggle "Lasso", drag a
-//    freehand loop, and every visible (front-facing) triangle whose centroid falls
-//    inside the loop is removed.  Deletions are stored in `killed` (welded face
-//    indices) so they persist into the tuned export.
-function pointInPoly(x, y, pts) {
-  let inside = false;
-  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-    const xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
-    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
-  }
-  return inside;
-}
+// ── Stencil eraser ────────────────────────────────────────────────────────────
+//    Drag box / sphere / cylinder / capsule stencils into a live viewport, then
+//    move / rotate / scale them (three.js-editor style TransformControls gizmo).
+//    Every triangle whose centroid falls inside ANY stencil is erased.  The
+//    result is stored in `killed` (welded face indices) so the tuned/baked
+//    download picks it up with no other changes.
+const Eraser = {
+  renderer: null, scene: null, camera: null, controls: null, tcontrols: null,
+  mesh: null, geo: null, host: null, ready: false, raf: 0,
+  stencils: [], selected: null, snapshot: null,
+  centroids: null, faceCount: 0, bsphere: null, needRecompute: false,
+  ray: new THREE.Raycaster(), ndc: new THREE.Vector2(),
 
-const Lasso = {
-  renderer: null, scene: null, camera: null, controls: null, mesh: null,
-  overlay: null, octx: null, host: null, lassoOn: false, drawing: false,
-  pts: [], faceMap: [], undoStack: [], snapshot: null, raf: 0, ready: false,
+  // Unit primitives; size is driven by object.scale, so one local-space test
+  // each works under arbitrary translate / rotate / (non-uniform) scale.
+  DEFS: {
+    box:      { geo: () => new THREE.BoxGeometry(1, 1, 1),
+                test: (x, y, z) => Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5 && Math.abs(z) <= 0.5 },
+    sphere:   { geo: () => new THREE.SphereGeometry(0.5, 20, 14),
+                test: (x, y, z) => x * x + y * y + z * z <= 0.25 },
+    cylinder: { geo: () => new THREE.CylinderGeometry(0.5, 0.5, 1, 24),
+                test: (x, y, z) => (x * x + z * z) <= 0.25 && Math.abs(y) <= 0.5 },
+    capsule:  { geo: () => new THREE.CapsuleGeometry(0.35, 0.3, 6, 14),
+                test: (x, y, z) => { const a = 0.15, r = 0.35, dy = Math.max(-a, Math.min(a, y)), e = y - dy;
+                                     return x * x + e * e + z * z <= r * r; } },
+  },
 
-  msg(t) { const s = $("lasso-status"); if (s) s.textContent = t; },
+  msg(t) { const s = $("eraser-status"); if (s) s.textContent = t; },
 
   init() {
     if (this.ready) return;
-    this.host = $("lasso-host");
+    this.host = $("eraser-host");
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio || 1);
     this.host.appendChild(this.renderer.domElement);
@@ -1776,24 +1801,36 @@ const Lasso = {
     dir.position.set(1, 1, 1);
     this.scene.add(dir);
 
-    // 2-D overlay canvas for drawing the lasso path.
-    this.overlay = document.createElement("canvas");
-    Object.assign(this.overlay.style, {
-      position: "absolute", left: "0", top: "0", width: "100%", height: "100%",
-      pointerEvents: "none", cursor: "crosshair",
+    this.tcontrols = new TransformControls(this.camera, this.renderer.domElement);
+    this.tcontrols.addEventListener("dragging-changed", (e) => { this.controls.enabled = !e.value; });
+    this.tcontrols.addEventListener("objectChange", () => { this.needRecompute = true; });
+    this.scene.add(this.tcontrols);            // three 0.160: TransformControls is an Object3D
+
+    const dom = this.renderer.domElement;
+    dom.addEventListener("pointerdown", (e) => this.onPick(e));
+    dom.addEventListener("dragover", (e) => { e.preventDefault(); });
+    dom.addEventListener("drop", (e) => this.onDrop(e));
+    document.querySelectorAll("#eraser-palette [data-shape]").forEach((el) => {
+      el.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/shape", el.dataset.shape); });
+      el.addEventListener("dblclick", () => this.addStencil(el.dataset.shape, null));  // dbl-click = add at centre
     });
-    this.host.appendChild(this.overlay);
-    this.octx = this.overlay.getContext("2d");
 
-    const dom = this.overlay;
-    dom.addEventListener("pointerdown", (e) => this.onDown(e));
-    dom.addEventListener("pointermove", (e) => this.onMove(e));
-    window.addEventListener("pointerup", (e) => this.onUp(e));
+    $("er-move").addEventListener("click", () => this.setMode("translate"));
+    $("er-rotate").addEventListener("click", () => this.setMode("rotate"));
+    $("er-scale").addEventListener("click", () => this.setMode("scale"));
+    $("er-remove").addEventListener("click", () => this.removeSelected());
+    $("er-clear").addEventListener("click", () => this.clearAll());
+    $("er-done").addEventListener("click", () => this.close(true));
+    $("er-cancel").addEventListener("click", () => this.close(false));
 
-    $("lasso-toggle").addEventListener("click", () => this.setLasso(!this.lassoOn));
-    $("lasso-undo").addEventListener("click", () => this.undo());
-    $("lasso-done").addEventListener("click", () => this.close(true));
-    $("lasso-cancel").addEventListener("click", () => this.close(false));
+    window.addEventListener("keydown", (e) => {
+      if ($("eraser-editor").style.display === "none") return;
+      if (e.key === "w") this.setMode("translate");
+      else if (e.key === "e") this.setMode("rotate");
+      else if (e.key === "r") this.setMode("scale");
+      else if (e.key === "Delete" || e.key === "Backspace") this.removeSelected();
+    });
+
     this.ready = true;
   },
 
@@ -1801,16 +1838,19 @@ const Lasso = {
     if (!welded) return;
     this.init();
     this.snapshot = new Set(killed);
-    this.undoStack = [];
+    killed = new Set();                        // stencils fully define erasure here
+    this.stencils = []; this.selected = null;
     $("viewer").style.display = "none";
     $("tune-card").style.display = "none";
-    $("lasso-editor").style.display = "";
+    $("eraser-editor").style.display = "";
     this.resize();
+    this.computeCentroids();
     this.buildMesh(true);
-    this.setLasso(false);
-    this.msg("Orbit to inspect · toggle Lasso, then drag a loop around parts to delete.");
+    this.setMode("translate");
+    this.msg("Drag a shape into the scene · select it, then Move / Rotate / Scale · everything inside is erased.");
     const loop = () => {
       this.raf = requestAnimationFrame(loop);
+      if (this.needRecompute) { this.needRecompute = false; this.recompute(); }
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
     };
@@ -1822,8 +1862,12 @@ const Lasso = {
   close(applyChanges) {
     cancelAnimationFrame(this.raf); this.raf = 0;
     window.removeEventListener("resize", this._onResize);
-    if (!applyChanges) { killed = new Set(this.snapshot); }
-    $("lasso-editor").style.display = "none";
+    if (applyChanges) this.recompute();        // make sure `killed` is final
+    else killed = new Set(this.snapshot);
+    this.tcontrols.detach();
+    for (const m of this.stencils) { this.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.stencils = []; this.selected = null;
+    $("eraser-editor").style.display = "none";
     $("viewer").style.display = "";
     $("tune-card").style.display = "";
     if (applyChanges) apply();
@@ -1831,28 +1875,31 @@ const Lasso = {
 
   resize() {
     const w = this.host.clientWidth || 600, h = this.host.clientHeight || 520;
-    this.renderer.setSize(w, h, false);
+    this.renderer.setSize(w, h);            // updateStyle=true → CSS-size the canvas so it can't overflow the host
     this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
-    const dpr = window.devicePixelRatio || 1;
-    this.overlay.width = w * dpr; this.overlay.height = h * dpr;
-    this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  },
+
+  computeCentroids() {
+    const { uPos, faces } = welded;
+    const nF = faces.length; this.faceCount = nF;
+    const C = new Float32Array(nF * 3);
+    for (let i = 0; i < nF; i++) {
+      const f = faces[i], a = f[0], b = f[1], c = f[2];
+      C[3*i]   = (uPos[3*a]   + uPos[3*b]   + uPos[3*c])   / 3;
+      C[3*i+1] = (uPos[3*a+1] + uPos[3*b+1] + uPos[3*c+1]) / 3;
+      C[3*i+2] = (uPos[3*a+2] + uPos[3*b+2] + uPos[3*c+2]) / 3;
+    }
+    this.centroids = C;
   },
 
   buildMesh(frame) {
     if (this.mesh) { this.scene.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh.material.dispose(); }
-    const { uPos, uCol, faces } = welded;
-    const surviving = []; this.faceMap = [];
-    for (let i = 0; i < faces.length; i++) {
-      if (!killed.has(i)) { surviving.push(faces[i]); this.faceMap.push(i); }
-    }
+    const { uPos, uCol } = welded;
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(uPos), 3));
     if (uCol) g.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(uCol), 3));
-    const idx = new Uint32Array(surviving.length * 3);
-    for (let i = 0; i < surviving.length; i++) {
-      idx[3*i] = surviving[i][0]; idx[3*i+1] = surviving[i][1]; idx[3*i+2] = surviving[i][2];
-    }
-    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    this.geo = g;
+    this.rebuildIndex();
     g.computeVertexNormals();
     const mat = new THREE.MeshStandardMaterial({
       vertexColors: !!uCol, metalness: 0, roughness: 1, side: THREE.DoubleSide,
@@ -1862,7 +1909,7 @@ const Lasso = {
 
     if (frame) {
       g.computeBoundingSphere();
-      const bs = g.boundingSphere;
+      const bs = g.boundingSphere; this.bsphere = bs;
       this.controls.target.copy(bs.center);
       const d = bs.radius * 2.6;
       this.camera.near = bs.radius * 0.01; this.camera.far = bs.radius * 100;
@@ -1872,86 +1919,102 @@ const Lasso = {
     }
   },
 
-  setLasso(on) {
-    this.lassoOn = on;
-    this.overlay.style.pointerEvents = on ? "auto" : "none";
-    this.controls.enabled = !on;
-    const b = $("lasso-toggle");
-    if (b) { b.textContent = on ? "✏️ Lasso: on" : "✏️ Lasso: off"; b.classList.toggle("active", on); }
+  rebuildIndex() {
+    const { faces } = welded, keep = [];
+    for (let i = 0; i < faces.length; i++) if (!killed.has(i)) keep.push(faces[i]);
+    const idx = new Uint32Array(keep.length * 3);
+    for (let i = 0; i < keep.length; i++) { idx[3*i] = keep[i][0]; idx[3*i+1] = keep[i][1]; idx[3*i+2] = keep[i][2]; }
+    this.geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    this.geo.index.needsUpdate = true;
   },
 
-  onDown(e) {
-    if (!this.lassoOn) return;
-    this.drawing = true; this.pts = [];
-    this.addPt(e);
-  },
-  onMove(e) {
-    if (!this.drawing) return;
-    this.addPt(e); this.redraw();
-  },
-  onUp() {
-    if (!this.drawing) return;
-    this.drawing = false;
-    this.select();
-    this.pts = []; this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
-  },
-  addPt(e) {
-    const r = this.overlay.getBoundingClientRect();
-    this.pts.push({ x: e.clientX - r.left, y: e.clientY - r.top });
-  },
-  redraw() {
-    const c = this.octx;
-    c.clearRect(0, 0, this.overlay.width, this.overlay.height);
-    if (this.pts.length < 2) return;
-    c.beginPath();
-    c.moveTo(this.pts[0].x, this.pts[0].y);
-    for (let i = 1; i < this.pts.length; i++) c.lineTo(this.pts[i].x, this.pts[i].y);
-    c.closePath();
-    c.fillStyle = "rgba(80,150,255,0.15)";
-    c.strokeStyle = "rgba(80,150,255,0.9)";
-    c.lineWidth = 1.5; c.fill(); c.stroke();
-  },
-
-  select() {
-    if (this.pts.length < 3) return;
-    const { uPos, faces } = welded;
-    const cam = this.camera;
-    const w = this.host.clientWidth, h = this.host.clientHeight;
+  recompute() {
+    const C = this.centroids, nF = this.faceCount;
+    const inv = this.stencils.map((m) => { m.updateMatrixWorld(); return m.matrixWorld.clone().invert(); });
+    const tests = this.stencils.map((m) => m.userData.test);
     const v = new THREE.Vector3();
-    const A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
-    const ab = new THREE.Vector3(), ac = new THREE.Vector3(), nrm = new THREE.Vector3();
-    const cen = new THREE.Vector3(), dir = new THREE.Vector3();
-    const batch = [];
-    for (const fi of this.faceMap) {
-      const f = faces[fi];
-      A.set(uPos[3*f[0]], uPos[3*f[0]+1], uPos[3*f[0]+2]);
-      B.set(uPos[3*f[1]], uPos[3*f[1]+1], uPos[3*f[1]+2]);
-      C.set(uPos[3*f[2]], uPos[3*f[2]+1], uPos[3*f[2]+2]);
-      cen.copy(A).add(B).add(C).multiplyScalar(1/3);
-      v.copy(cen).project(cam);
-      if (v.z < -1 || v.z > 1) continue;
-      const sx = (v.x * 0.5 + 0.5) * w, sy = (-v.y * 0.5 + 0.5) * h;
-      if (!pointInPoly(sx, sy, this.pts)) continue;
-      ab.subVectors(B, A); ac.subVectors(C, A); nrm.crossVectors(ab, ac);
-      dir.subVectors(cen, cam.position);
-      if (nrm.dot(dir) < 0) batch.push(fi);   // front-facing only
+    killed = new Set();
+    for (let i = 0; i < nF; i++) {
+      const cx = C[3*i], cy = C[3*i+1], cz = C[3*i+2];
+      for (let s = 0; s < inv.length; s++) {
+        v.set(cx, cy, cz).applyMatrix4(inv[s]);
+        if (tests[s](v.x, v.y, v.z)) { killed.add(i); break; }
+      }
     }
-    if (!batch.length) { this.msg("Nothing inside the loop faced the camera."); return; }
-    for (const fi of batch) killed.add(fi);
-    this.undoStack.push(batch);
-    this.buildMesh(false);
-    this.msg(`Deleted ${batch.length} triangles · ${killed.size} total. Undo, Done, or keep lassoing.`);
+    this.rebuildIndex();
+    this.msg(`${this.stencils.length} stencil(s) · ${killed.size} triangles erased · Done to apply.`);
   },
 
-  undo() {
-    const batch = this.undoStack.pop();
-    if (!batch) { this.msg("Nothing to undo."); return; }
-    for (const fi of batch) killed.delete(fi);
-    this.buildMesh(false);
-    this.msg(`Restored ${batch.length} triangles · ${killed.size} deleted.`);
+  addStencil(type, pos) {
+    const def = this.DEFS[type]; if (!def) return;
+    const geo = def.geo();
+    const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color: 0xff4d6d, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide }));
+    m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: 0xff4d6d })));
+    m.userData.test = def.test;
+    m.scale.setScalar(this.bsphere ? this.bsphere.radius * 0.35 : 1);
+    if (pos) m.position.copy(pos);
+    else if (this.bsphere) m.position.copy(this.bsphere.center);
+    this.scene.add(m);
+    this.stencils.push(m);
+    this.selectStencil(m);
+    this.needRecompute = true;
+  },
+
+  onDrop(e) {
+    e.preventDefault();
+    const type = e.dataTransfer.getData("text/shape"); if (!type) return;
+    this.addStencil(type, this.pickPoint(e));
+  },
+
+  pickPoint(e) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(this.ndc, this.camera);
+    if (this.mesh) { const hit = this.ray.intersectObject(this.mesh, false); if (hit.length) return hit[0].point.clone(); }
+    return this.controls.target.clone();
+  },
+
+  onPick(e) {
+    if (this.tcontrols.dragging || this.tcontrols.axis) return;   // gizmo handled it
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(this.ndc, this.camera);
+    const hits = this.ray.intersectObjects(this.stencils, false);
+    if (hits.length) this.selectStencil(hits[0].object);
+    else this.deselect();
+  },
+
+  selectStencil(m) { this.selected = m; this.tcontrols.attach(m); },
+  deselect() { this.selected = null; this.tcontrols.detach(); },
+
+  removeSelected() {
+    if (!this.selected) return;
+    const i = this.stencils.indexOf(this.selected);
+    if (i >= 0) this.stencils.splice(i, 1);
+    this.tcontrols.detach();
+    this.scene.remove(this.selected);
+    this.selected.geometry.dispose(); this.selected.material.dispose();
+    this.selected = null;
+    this.needRecompute = true;
+  },
+
+  clearAll() {
+    this.tcontrols.detach();
+    for (const m of this.stencils) { this.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.stencils = []; this.selected = null;
+    this.needRecompute = true;
+  },
+
+  setMode(mode) {
+    this.tcontrols.setMode(mode);
+    for (const [id, mm] of [["er-move", "translate"], ["er-rotate", "rotate"], ["er-scale", "scale"]]) {
+      const b = $(id); if (b) b.classList.toggle("active", mm === mode);
+    }
   },
 };
-window.openLasso = () => Lasso.open();
+window.openEraser = () => Eraser.open();
 
 // ── Apply the current settings: rebuild, preview, and arm the tuned download ──
 async function apply() {
@@ -1962,8 +2025,8 @@ async function apply() {
     // Nothing tuned → show the pristine server GLB, no re-encode needed.
     if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
     $("viewer").setAttribute("src", window.HoleTune._srcURL);
-    const link = $("download-link-tuned");
-    if (link) link.style.display = "none";
+    const btn = $("download-tuned-btn");
+    if (btn) btn.style.display = "";
     status.textContent = `${allLoops.length} open bound`
       + (allLoops.length === 1 ? "y" : "ies") + " detected · move a slider to tune";
     return;
@@ -1997,12 +2060,8 @@ async function apply() {
   curBlobURL = URL.createObjectURL(blob);
   $("viewer").setAttribute("src", curBlobURL);
 
-  const link = $("download-link-tuned");
-  if (link) {
-    link.href = curBlobURL;
-    link.download = "reconstruction_tuned.glb";
-    link.style.display = "";
-  }
+  const btn = $("download-tuned-btn");
+  if (btn) btn.style.display = "";
   const netFaces = geometry.index.count / 3 - welded.faces.length;
   const parts = [];
   if (curTrim > 0)      parts.push(`trimmed ${trimmed} faces`);
@@ -2052,8 +2111,7 @@ window.HoleTune = {
     if (trimS)  { trimS.disabled  = false; trimS.value  = 0; }
     const smS = $("smooth-slider");
     if (smS) { smS.disabled = false; smS.value = 0; }
-    const lb = $("lasso-open-btn"); if (lb) lb.disabled = false;
-    const bk = $("bake-btn"); if (bk) bk.disabled = false;
+    const lb = $("eraser-open-btn"); if (lb) lb.disabled = false;
     curThreshold = 2000;
     curTrim = 0;
     curSmooth = 0;
@@ -2087,8 +2145,10 @@ window.HoleTune = {
   // Re-show the tuned mesh after returning from the placed view.
   reapply() { if (welded) apply(); },
 
-  // Bake the current tuned vertex colours into a texture and arm the download.
-  async bake() {
+  // Bake the current tuned vertex colours into a texture, then download the GLB.
+  // Baking is the default step before download: it produces a baseColorTexture
+  // (with normals) so macOS Preview / Quick Look render it in full colour.
+  async downloadTuned() {
     if (!welded) return;
     const status = $("holefill-status");
     status.textContent = "Baking texture… (this can take a few seconds)";
@@ -2098,6 +2158,7 @@ window.HoleTune = {
       const { geometry } = buildTunedGeometry(curThreshold, curTrim);
       baked = await bakeVertexColorTexture(geometry);
       baked.geometry.deleteAttribute("color");            // texture now drives colour
+      baked.geometry.computeVertexNormals();              // Quick Look renders normal-less meshes grey
       const mat = new THREE.MeshStandardMaterial({
         map: baked.map, color: 0xffffff, metalness: 0, roughness: 0.8, side: THREE.DoubleSide,
       });
@@ -2110,13 +2171,11 @@ window.HoleTune = {
     if (curBlobURL) URL.revokeObjectURL(curBlobURL);
     curBlobURL = URL.createObjectURL(blob);
     $("viewer").setAttribute("src", curBlobURL);
-    const link = $("download-link-tuned");
-    if (link) {
-      link.href = curBlobURL;
-      link.download = "reconstruction_textured.glb";
-      link.style.display = "";
-    }
-    status.textContent = `Baked ${baked.texW}×${baked.texH} texture · renders in Preview/Quick Look · move a slider to re-tune`;
+    const a = document.createElement("a");
+    a.href = curBlobURL;
+    a.download = "reconstruction_textured.glb";
+    document.body.appendChild(a); a.click(); a.remove();
+    status.textContent = `Baked ${baked.texW}×${baked.texH} texture · downloaded · renders in Preview/Quick Look`;
   },
 
   reset() {
@@ -2130,13 +2189,12 @@ window.HoleTune = {
     if (trimS) { trimS.value = 0; trimS.disabled = true; }
     const smS = $("smooth-slider");
     if (smS) { smS.value = 0; smS.disabled = true; }
-    const lb = $("lasso-open-btn"); if (lb) lb.disabled = true;
-    const bk = $("bake-btn"); if (bk) bk.disabled = true;
+    const lb = $("eraser-open-btn"); if (lb) lb.disabled = true;
     const val = $("holefill-val");    if (val) val.textContent = "off";
     const tval = $("edgetrim-val");   if (tval) tval.textContent = "off";
     const sval = $("smooth-val");     if (sval) sval.textContent = "off";
     const st  = $("holefill-status"); if (st)  st.textContent = "";
-    const link = $("download-link-tuned"); if (link) link.style.display = "none";
+    const btn = $("download-tuned-btn"); if (btn) btn.style.display = "none";
     const card = $("tune-card"); if (card) card.style.display = "";
   },
 };
@@ -2145,7 +2203,7 @@ window.HoleTune = {
 window.onHoleFill = (v) => window.HoleTune.setThreshold(v);
 window.onEdgeTrim = (v) => window.HoleTune.setEdgeTrim(v);
 window.onSmooth   = (v) => window.HoleTune.setSmooth(v);
-window.bakeTexture = () => window.HoleTune.bake();
+window.downloadTuned = () => window.HoleTune.downloadTuned();
 </script>
 </body>
 </html>

@@ -1,0 +1,27 @@
+{
+  "config": "D_ss1",
+  "object": "kid_box",
+  "mask_index": 0,
+  "ss_steps": 1,
+  "stage2_steps": 12,
+  "ss_distill": true,
+  "distill": false,
+  "stage_timings": {
+    "setup": 0.0498090828768909,
+    "depth": 7.872598958201706,
+    "stage1_sparse_structure": 40.19899999955669,
+    "stage2_slat": 434.5438197092153,
+    "mesh_decode": 129.84977500000969,
+    "export_bake": 24.486964708194137,
+    "finalize": 0.00016408273950219154,
+    "total": 637.0021315407939
+  },
+  "stage1_s": 40.19899999955669,
+  "stage2_s": 434.5438197092153,
+  "total_s": 637.0021315407939,
+  "wall_s": 646.6326560829766,
+  "peak_rss_gb": 13.702682495117188,
+  "vertices": 770712,
+  "faces": 1541778,
+  "glb": "tmp/bench/glb/D_ss1__kid_box.glb"
+}

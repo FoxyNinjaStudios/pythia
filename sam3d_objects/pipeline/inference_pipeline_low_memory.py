@@ -8,6 +8,7 @@ reducing peak memory from ~45GB to ~15GB.
 
 import os
 import gc
+import time
 from typing import Union, Optional
 from copy import deepcopy
 import numpy as np
@@ -636,6 +637,16 @@ class InferencePipelineLowMemory:
         """
         logger.info("[LOW-MEM] Starting sequential inference pipeline")
         log_memory("Start of run()")
+
+        # ── Per-stage wall-clock timing (WO-013 T3). Attributes the elapsed time
+        #    since the previous checkpoint to the named stage. Works on both the CLI
+        #    and server paths since both run through this method. ──────────────────
+        _stage_secs = {}
+        _t_mark = {"t": time.perf_counter()}
+        def _ck(label):
+            now = time.perf_counter()
+            _stage_secs[label] = _stage_secs.get(label, 0.0) + (now - _t_mark["t"])
+            _t_mark["t"] = now
         
         image = self.merge_image_and_mask(image, mask)
         
@@ -699,6 +710,7 @@ class InferencePipelineLowMemory:
             # ========================
             # STAGE 0: Depth estimation
             # ========================
+            _ck("setup")
             logger.info("[LOW-MEM] === STAGE 0: Depth Estimation ===")
             
             pointmap_dict = self.compute_pointmap(image)
@@ -731,6 +743,7 @@ class InferencePipelineLowMemory:
             # ========================
             # STAGE 1: Sparse Structure
             # ========================
+            _ck("depth")
             logger.info("[LOW-MEM] === STAGE 1: Sparse Structure Generation ===")
             
             # Load SS generator and embedder
@@ -826,16 +839,28 @@ class InferencePipelineLowMemory:
             log_memory("After Stage 1 complete")
             
             if stage1_only:
+                _ck("stage1_sparse_structure")
+                _ss_steps = stage1_inference_steps or self.ss_inference_steps
+                _ss_mode = "shortcut-distilled" if use_stage1_distillation else "flow-matching+CFG"
+                logger.info("[TIMING] ============ Per-stage wall-clock (stage1-only) ============")
+                for _k in ("setup", "depth", "stage1_sparse_structure"):
+                    if _k in _stage_secs:
+                        logger.info("[TIMING] {:<40} {:8.2f}s".format(_k, _stage_secs[_k]))
+                logger.info("[TIMING] Stage 1: {} steps, {}".format(_ss_steps, _ss_mode))
+                logger.info("[TIMING] Peak RSS: {:.1f} GB".format(get_memory_gb()))
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
                 return {
                     **ss_return_dict,
                     "pointmap": pts.cpu().permute((1, 2, 0)),
                     "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),
+                    "stage_timings": dict(_stage_secs),
+                    "peak_rss_gb": get_memory_gb(),
                 }
             
             # ========================
             # STAGE 2: Structured Latent
             # ========================
+            _ck("stage1_sparse_structure")
             logger.info("[LOW-MEM] === STAGE 2: Structured Latent Generation ===")
             
             coords = ss_return_dict["coords"]
@@ -945,6 +970,7 @@ class InferencePipelineLowMemory:
         # ========================
         # STAGE 3: Decoding
         # ========================
+        _ck("stage2_slat")
         logger.info("[LOW-MEM] === STAGE 3: Decoding ===")
         
         formats = list(decode_formats or self.decode_formats)
@@ -1065,6 +1091,7 @@ class InferencePipelineLowMemory:
                 f"texture_bake={do_bake}, "
                 f"source={bake_source if do_bake else 'vertex-color:' + str(vcolor_desc)})..."
             )
+            _ck("mesh_decode")
             glb = postprocessing_utils.to_glb(
                 app_rep,
                 outputs["mesh"][0],
@@ -1078,6 +1105,7 @@ class InferencePipelineLowMemory:
                 bake_source=bake_source,
             )
             outputs["glb"] = glb
+            _ck("export_bake")
         
         if "gaussian" in outputs:
             outputs["gs"] = outputs["gaussian"][0]
@@ -1123,11 +1151,44 @@ class InferencePipelineLowMemory:
         
         log_memory("End of run()")
         logger.info("[LOW-MEM] Pipeline complete!")
-        
+
+        # ── Per-stage timing summary (WO-013 T3). Logged on both CLI and server
+        #    paths, and attached to the result so callers/benchmarks can read exact
+        #    numbers without parsing logs. ──────────────────────────────────────────
+        _ck("finalize")
+        _ss_steps = stage1_inference_steps or self.ss_inference_steps
+        _slat_steps = stage2_inference_steps or self.slat_inference_steps
+        _ss_mode = "shortcut-distilled" if use_stage1_distillation else "flow-matching+CFG"
+        _slat_mode = "shortcut-distilled" if use_stage2_distillation else "flow-matching+CFG"
+        _ss_nfe = _ss_steps if use_stage1_distillation else round(_ss_steps * 1.5)
+        _slat_nfe = _slat_steps if use_stage2_distillation else round(_slat_steps * 1.5)
+        _order = ["setup", "depth", "stage1_sparse_structure", "stage2_slat",
+                  "mesh_decode", "export_bake", "finalize"]
+        _labels = {
+            "setup": "Setup / preprocess",
+            "depth": "Stage 0  MoGe depth",
+            "stage1_sparse_structure": f"Stage 1  sparse structure ({_ss_steps} steps, {_ss_mode}, ~{_ss_nfe} NFE)",
+            "stage2_slat": f"Stage 2  SLAT texture/refine ({_slat_steps} steps, {_slat_mode}, ~{_slat_nfe} NFE)",
+            "mesh_decode": "Stage 3  mesh decode",
+            "export_bake": "Export / texture bake",
+            "finalize": "Finalize / layout",
+        }
+        _total = sum(_stage_secs.values())
+        logger.info("[TIMING] ============ Per-stage wall-clock ============")
+        for _k in _order:
+            if _k in _stage_secs:
+                logger.info("[TIMING] {:<54} {:8.2f}s".format(_labels[_k], _stage_secs[_k]))
+        logger.info("[TIMING] {:<54} {:8.2f}s".format("TOTAL", _total))
+        logger.info("[TIMING] Peak RSS: {:.1f} GB".format(get_memory_gb()))
+        logger.info("[TIMING] =============================================")
+
         result = {
             **ss_return_dict,
             **outputs,
         }
+        result["stage_timings"] = dict(_stage_secs)
+        result["stage_timings"]["total"] = _total
+        result["peak_rss_gb"] = get_memory_gb()
         if intrinsics is not None:
             result["intrinsics"] = intrinsics
         

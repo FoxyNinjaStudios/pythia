@@ -240,8 +240,11 @@ class ReconstructRequest(BaseModel):
     # pose refinement (slower, CPU-only).
     layout: bool = False
     layout_refine: bool = False
-    # Shortcut-model distillation: sample both flow stages CFG-free with step-size
+    # Shortcut-model distillation: sample the flow stages CFG-free with step-size
     # conditioning (~1 eval/step). Much faster with few steps; needs distilled weights.
+    # Stage 1 (sparse structure) IS shortcut-distilled in the shipped weights, so it is
+    # on by default; stage 2 (SLAT) is genuine flow matching, so `distill` (stage 2) is off.
+    ss_distill: bool = True
     distill: bool = False
 
 
@@ -354,6 +357,7 @@ async def reconstruct(req: ReconstructRequest):
         bool(req.layout),
         bool(req.layout_refine),
         bool(req.distill),
+        bool(req.ss_distill),
     )
 
     return {"job_id": job_id}
@@ -656,6 +660,7 @@ def _run_reconstruction_sync(
     layout: bool = False,
     layout_refine: bool = False,
     distill: bool = False,
+    ss_distill: bool = True,
 ):
     """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
@@ -718,7 +723,7 @@ def _run_reconstruction_sync(
             vertex_color_source="gaussian",
             with_layout_postprocess=layout,
             layout_refine=layout_refine,
-            use_stage1_distillation=distill,
+            use_stage1_distillation=ss_distill,
             use_stage2_distillation=distill,
         )
 

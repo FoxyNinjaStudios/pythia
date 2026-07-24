@@ -102,7 +102,10 @@ python main.py \
 | `--image` | Input image path |
 | `--mask` / `--mask-dir` + `--mask-index` | Object mask (single file or SAM-style directory) |
 | `--mesh` | Output a smooth GLB mesh (otherwise voxel STL) |
-| `--steps` | Diffusion steps (default: 12; higher = better, slower) |
+| `--steps` | Stage-2 (SLAT texture & refinement) flow-matching steps (default: 12). Stage 2 is genuine flow matching and is not distilled. |
+| `--ss-steps` | Stage-1 (sparse-structure / geometry) steps (default: 2). This stage is **shortcut-distilled** in the shipped weights, so 2 steps is the intended default; values above 4 rarely help. |
+| `--ss-distill` / `--no-ss-distill` | Use shortcut-distilled sampling for stage 1 (step-size conditioning, CFG-free, ~1 eval/step). On by default and required for the low `--ss-steps` to be valid; pass `--no-ss-distill` to fall back to CFG flow matching (then use ~12 steps). |
+| `--distill` | Also distill **stage 2** (SLAT). The released SLAT weights are not shortcut-distilled, so this is experimental and usually degrades texture; leave it off. |
 | `--simplify` | Mesh decimation ratio (`0.0` = none … `0.95` = heavy) |
 | `--vertex-color-source` | `gaussian` (saturated, recommended) or `mesh` |
 | `--bake` | Bake a UV texture atlas instead of per-vertex color |
@@ -209,6 +212,12 @@ Apple Silicon:
    unified memory.
 6. **Portable appearance** — Gaussian-splat export and a PyTorch3D-based UV
    texture baker replace the original CUDA/nvdiffrast texturing path.
+7. **Shortcut-distilled stage 1** — the sparse-structure stage ships as a
+   *shortcut* model (step-size-conditioned, CFG-free). It is now sampled that way
+   by default (`--ss-steps 2 --ss-distill`), decoupled from the stage-2 SLAT step
+   count. Earlier revisions of this port ran stage 1 as plain CFG flow matching
+   with the stage-2 step count, which both wasted evals and did not match the
+   shipped configuration. See the [CHANGELOG](CHANGELOG.md).
 
 ## Troubleshooting
 
