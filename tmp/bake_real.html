@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+const out = document.getElementById("out");
+const log = (...a) => { out.textContent += "\n" + a.join(" "); console.log(...a); };
+window.__done = false;
+
+const renderer = new THREE.WebGLRenderer({ antialias:false, alpha:true });
+
+function stats(px) {
+  let sum=0, mx=0, mn=255, nz=0, distinct=new Set();
+  for (let i=0;i<px.length;i+=4){ const r=px[i],g=px[i+1],b=px[i+2],m=Math.max(r,g,b);
+    sum+=m; if(m>mx)mx=m; if(m<mn)mn=m; if(m>0)nz++; if(nz<50000) distinct.add((r>>4)+","+(g>>4)+","+(b>>4)); }
+  return { mean:(sum/(px.length/4)).toFixed(1), max:mx, min:mn, nonzero:nz, distinctColors:distinct.size };
+}
+
+async function main() {
+  const gltf = await new GLTFLoader().loadAsync("results/014417c5-86fd-4f65-a6d6-6b6f1b8aab2c.glb");
+  let mesh=null; gltf.scene.traverse(o=>{ if(!mesh&&o.isMesh) mesh=o; });
+  const geo = mesh.geometry;
+  const col = geo.getAttribute("color");
+  log("has color attr:", !!col, "count:", col && col.count, "itemSize:", col && col.itemSize, "normalized:", col && col.normalized, "arrayType:", col && col.array.constructor.name);
+  // color value range via getX
+  let cmin=9,cmax=-9,cmean=0;
+  for(let i=0;i<col.count;i+=997){ const v=col.getX(i); cmin=Math.min(cmin,v); cmax=Math.max(cmax,v); cmean+=v; }
+  log("color getX sampled  min:",cmin.toFixed(3),"max:",cmax.toFixed(3));
+
+  // Build small atlas bake on FIRST 60000 triangles to keep it quick
+  const nonIdx = geo.index ? geo.toNonIndexed() : geo.clone();
+  const posAll = nonIdx.getAttribute("position");
+  const colAll = nonIdx.getAttribute("color");
+  const Tall = posAll.count/3;
+  const T = Math.min(Tall, 60000);
+  log("total triangles:", Tall, "baking first", T);
+
+  const cols=Math.ceil(Math.sqrt(T)), rows=Math.ceil(T/cols);
+  const cell=6, texW=cols*cell, texH=rows*cell;
+  const pu=1/texW,pv=1/texH,du=1/cols,dv=1/rows;
+
+  // sub geometry of first T triangles
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(posAll.array.slice(0, T*9), 3));
+  g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(T*9), 3));
+  // copy colors via getX/Y/Z to normalize
+  const cArr = g.getAttribute("color").array;
+  for (let i=0;i<T*3;i++){ cArr[3*i]=colAll.getX(i); cArr[3*i+1]=colAll.getY(i); cArr[3*i+2]=colAll.getZ(i); }
+  const uv=new Float32Array(T*6);
+  for(let t=0;t<T;t++){ const cx=t%cols,cy=(t/cols)|0,u0=cx*du,v0=cy*dv,o=t*6;
+    uv[o]=u0+pu;uv[o+1]=v0+pv;uv[o+2]=u0+du-pu;uv[o+3]=v0+pv;uv[o+4]=u0+pu;uv[o+5]=v0+dv-pv; }
+  g.setAttribute("uv", new THREE.BufferAttribute(uv,2));
+
+  renderer.setSize(texW, texH, false);
+  renderer.setClearColor(0x000000, 0);
+  const rt=new THREE.WebGLRenderTarget(texW,texH,{depthBuffer:false});
+  const mat=new THREE.RawShaderMaterial({ side:THREE.DoubleSide,
+    vertexShader:`precision highp float; attribute vec3 position; attribute vec3 color; attribute vec2 uv; varying vec3 vColor;
+      void main(){ vColor=color; gl_Position=vec4(uv*2.0-1.0,0.0,1.0); }`,
+    fragmentShader:`precision highp float; varying vec3 vColor;
+      vec3 l2s(vec3 c){ return mix(1.055*pow(max(c,0.0),vec3(1.0/2.4))-0.055, c*12.92, step(c,vec3(0.0031308))); }
+      void main(){ gl_FragColor=vec4(l2s(vColor),1.0); }`,
+  });
+  const m=new THREE.Mesh(g,mat); m.frustumCulled=false;
+  const scene=new THREE.Scene(); scene.add(m);
+  renderer.setRenderTarget(rt); renderer.clear(); renderer.render(scene,new THREE.Camera());
+  const px=new Uint8Array(texW*texH*4);
+  renderer.readRenderTargetPixels(rt,0,0,texW,texH,px);
+  renderer.setRenderTarget(null);
+  log("TEXTURE stats (pre-dilate):", JSON.stringify(stats(px)));
+
+  // Also render WITHOUT sRGB encode to compare
+  window.__done = true;
+  log("done");
+}
+main().catch(e=>{ log("ERROR:", e.message||e); console.error(e); window.__done=true; });
+</script>
+</body>
+</html>

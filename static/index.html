@@ -570,11 +570,12 @@ model-viewer {
         <label for="smooth-slider">Sand / smooth (client-side)</label>
         <span id="smooth-val">off</span>
       </div>
-      <input type="range" id="smooth-slider" min="0" max="15" step="1" value="0"
+      <input type="range" id="smooth-slider" min="0" max="60" step="1" value="0"
              oninput="onSmooth(this.value)" disabled />
       <div id="holefill-status" class="tune-status"></div>
       <div class="result-actions">
         <button id="lasso-open-btn" class="btn-secondary" onclick="openLasso()" disabled>✂ Lasso delete</button>
+        <button id="bake-btn" class="btn-secondary" onclick="bakeTexture()" disabled>🔥 Bake texture</button>
         <a id="download-link-tuned" style="display:none"><button class="btn-secondary">⬇ Download tuned GLB</button></a>
       </div>
     </div>
@@ -1628,6 +1629,114 @@ function meshToGLB(mesh) {
   });
 }
 
+// ── Client-side vertex-colour → texture bake ──────────────────────────────────
+//    Some PBR viewers (macOS Preview / Quick Look) ignore COLOR_0 and show the
+//    mesh untextured.  This bakes the per-vertex colours into a baseColorTexture
+//    entirely in-browser: assign a trivial per-triangle atlas, render the mesh in
+//    UV space (gl_Position from UV) writing the interpolated vertex colour, read
+//    the pixels back, dilate a few px to kill seam bleed, and attach as a map.
+let bakeRenderer = null;
+
+function dilateAtlas(px, w, h, iters) {
+  const N = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+  for (let it = 0; it < iters; it++) {
+    const src = px.slice();
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const o = (y * w + x) * 4;
+        if (src[o + 3] !== 0) continue;               // texel already filled
+        let r = 0, g = 0, b = 0, n = 0;
+        for (const [dx, dy] of N) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const no = (ny * w + nx) * 4;
+          if (src[no + 3] !== 0) { r += src[no]; g += src[no + 1]; b += src[no + 2]; n++; }
+        }
+        if (n) { px[o] = r / n | 0; px[o + 1] = g / n | 0; px[o + 2] = b / n | 0; px[o + 3] = 255; }
+      }
+    }
+  }
+}
+
+// Returns { geometry (non-indexed, atlas UVs), map (CanvasTexture) }.
+async function bakeVertexColorTexture(srcGeom) {
+  const geom = srcGeom.index ? srcGeom.toNonIndexed() : srcGeom.clone();
+  const T = geom.getAttribute("position").count / 3;      // triangle count
+  if (!geom.getAttribute("color")) throw "mesh has no vertex colours to bake";
+
+  // 1. One right-triangle cell per triangle in a square grid atlas.
+  const cols = Math.ceil(Math.sqrt(T));
+  const rows = Math.ceil(T / cols);
+  const MAXTEX = 4096;
+  const cell = Math.max(3, Math.min(8, Math.floor(MAXTEX / Math.max(cols, rows))));
+  const texW = cols * cell, texH = rows * cell;
+  const pu = 1 / texW, pv = 1 / texH;                     // 1-texel padding inset
+  const du = 1 / cols, dv = 1 / rows;
+  const uv = new Float32Array(T * 6);
+  for (let t = 0; t < T; t++) {
+    const cx = t % cols, cy = (t / cols) | 0;
+    const u0 = cx * du, v0 = cy * dv, o = t * 6;
+    uv[o]     = u0 + pu;       uv[o + 1] = v0 + pv;        // corner A
+    uv[o + 2] = u0 + du - pu;  uv[o + 3] = v0 + pv;        // corner B
+    uv[o + 4] = u0 + pu;       uv[o + 5] = v0 + dv - pv;   // corner C
+  }
+  geom.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+
+  // 2. Render the mesh in UV space, encoding linear vertex colour → sRGB bytes.
+  if (!bakeRenderer) bakeRenderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+  bakeRenderer.setSize(texW, texH, false);
+  bakeRenderer.setClearColor(0x000000, 0);                // alpha 0 marks empty texels
+  const rt = new THREE.WebGLRenderTarget(texW, texH, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false,
+  });
+  const mat = new THREE.RawShaderMaterial({
+    side: THREE.DoubleSide,
+    vertexShader: `
+      precision highp float;
+      attribute vec3 position; attribute vec3 color; attribute vec2 uv;
+      varying vec3 vColor;
+      void main() { vColor = color; gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0); }`,
+    fragmentShader: `
+      precision highp float;
+      varying vec3 vColor;
+      vec3 lin2srgb(vec3 c){
+        return mix(1.055 * pow(max(c, 0.0), vec3(1.0/2.4)) - 0.055, c * 12.92, step(c, vec3(0.0031308)));
+      }
+      void main() { gl_FragColor = vec4(lin2srgb(vColor), 1.0); }`,
+  });
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.frustumCulled = false;                             // UV-space verts ignore the camera
+  const scene = new THREE.Scene(); scene.add(mesh);
+  bakeRenderer.setRenderTarget(rt);
+  bakeRenderer.clear();
+  bakeRenderer.render(scene, new THREE.Camera());
+  const px = new Uint8Array(texW * texH * 4);
+  bakeRenderer.readRenderTargetPixels(rt, 0, 0, texW, texH, px);
+  bakeRenderer.setRenderTarget(null);
+  rt.dispose(); mat.dispose();
+
+  // 3. Bleed colours into empty texels, then force opaque.
+  dilateAtlas(px, texW, texH, Math.max(2, cell - 1));
+  for (let i = 3; i < px.length; i += 4) px[i] = 255;
+
+  // 4. Pixels are already in the UV/atlas orientation the shader wrote — copy
+  //    straight into a canvas and export the texture with flipY = false so the
+  //    UVs sample it identically in both the preview and the exported GLB.
+  const canvas = document.createElement("canvas");
+  canvas.width = texW; canvas.height = texH;
+  const img = new ImageData(new Uint8ClampedArray(px), texW, texH);
+  canvas.getContext("2d").putImageData(img, 0, 0);
+  const map = new THREE.CanvasTexture(canvas);
+  map.flipY = false;
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.minFilter = THREE.LinearFilter;
+  map.magFilter = THREE.LinearFilter;
+  map.generateMipmaps = false;
+  map.needsUpdate = true;
+
+  return { geometry: geom, map, texW, texH };
+}
+
 // ── Interactive lasso-delete editor ───────────────────────────────────────────
 //    Opens a live Three.js viewport (orbit to inspect).  Toggle "Lasso", drag a
 //    freehand loop, and every visible (front-facing) triangle whose centroid falls
@@ -1865,8 +1974,14 @@ async function apply() {
   await new Promise((r) => setTimeout(r, 0));
 
   const { geometry, filled, total, trimmed } = buildTunedGeometry(curThreshold, curTrim);
-  const mat = srcMaterial ? srcMaterial.clone() : new THREE.MeshStandardMaterial({ metalness: 0, roughness: 1 });
+  const mat = srcMaterial ? srcMaterial.clone() : new THREE.MeshStandardMaterial();
   if (geometry.getAttribute("color")) mat.vertexColors = true;
+  // glTF defaults to metallic 1.0, which renders as black in PBR viewers with no
+  // environment map, and any tinted baseColor multiplies the colours down. Force
+  // a neutral dielectric so the exported GLB reads correctly everywhere.
+  if (!mat.map) mat.color.set(0xffffff);
+  mat.metalness = 0;
+  mat.roughness = 0.8;
   mat.side = THREE.DoubleSide;          // keep fresh patches visible regardless of winding
   mat.needsUpdate = true;
   const mesh = new THREE.Mesh(geometry, mat);
@@ -1938,6 +2053,7 @@ window.HoleTune = {
     const smS = $("smooth-slider");
     if (smS) { smS.disabled = false; smS.value = 0; }
     const lb = $("lasso-open-btn"); if (lb) lb.disabled = false;
+    const bk = $("bake-btn"); if (bk) bk.disabled = false;
     curThreshold = 2000;
     curTrim = 0;
     curSmooth = 0;
@@ -1971,6 +2087,38 @@ window.HoleTune = {
   // Re-show the tuned mesh after returning from the placed view.
   reapply() { if (welded) apply(); },
 
+  // Bake the current tuned vertex colours into a texture and arm the download.
+  async bake() {
+    if (!welded) return;
+    const status = $("holefill-status");
+    status.textContent = "Baking texture… (this can take a few seconds)";
+    await new Promise((r) => setTimeout(r, 0));
+    let baked, blob;
+    try {
+      const { geometry } = buildTunedGeometry(curThreshold, curTrim);
+      baked = await bakeVertexColorTexture(geometry);
+      baked.geometry.deleteAttribute("color");            // texture now drives colour
+      const mat = new THREE.MeshStandardMaterial({
+        map: baked.map, color: 0xffffff, metalness: 0, roughness: 0.8, side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(baked.geometry, mat);
+      blob = await meshToGLB(mesh);
+    } catch (e) {
+      status.textContent = "Bake failed: " + e;
+      return;
+    }
+    if (curBlobURL) URL.revokeObjectURL(curBlobURL);
+    curBlobURL = URL.createObjectURL(blob);
+    $("viewer").setAttribute("src", curBlobURL);
+    const link = $("download-link-tuned");
+    if (link) {
+      link.href = curBlobURL;
+      link.download = "reconstruction_textured.glb";
+      link.style.display = "";
+    }
+    status.textContent = `Baked ${baked.texW}×${baked.texH} texture · renders in Preview/Quick Look · move a slider to re-tune`;
+  },
+
   reset() {
     if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
     srcMesh = null; srcMaterial = null; welded = null; allLoops = [];
@@ -1983,6 +2131,7 @@ window.HoleTune = {
     const smS = $("smooth-slider");
     if (smS) { smS.value = 0; smS.disabled = true; }
     const lb = $("lasso-open-btn"); if (lb) lb.disabled = true;
+    const bk = $("bake-btn"); if (bk) bk.disabled = true;
     const val = $("holefill-val");    if (val) val.textContent = "off";
     const tval = $("edgetrim-val");   if (tval) tval.textContent = "off";
     const sval = $("smooth-val");     if (sval) sval.textContent = "off";
@@ -1996,6 +2145,7 @@ window.HoleTune = {
 window.onHoleFill = (v) => window.HoleTune.setThreshold(v);
 window.onEdgeTrim = (v) => window.HoleTune.setEdgeTrim(v);
 window.onSmooth   = (v) => window.HoleTune.setSmooth(v);
+window.bakeTexture = () => window.HoleTune.bake();
 </script>
 </body>
 </html>

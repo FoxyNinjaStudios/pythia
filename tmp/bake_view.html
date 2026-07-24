@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+</head>
+<body style="margin:0;background:#111">
+<pre id="out" style="color:#0f0;position:absolute;z-index:2;margin:4px">running…</pre>
+<model-viewer id="mv" style="width:100vw;height:100vh;background:#111" camera-controls shadow-intensity="1"></model-viewer>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+const out=document.getElementById("out"); const log=(...a)=>{out.textContent+="\n"+a.join(" ");console.log(...a);};
+window.__done=false;
+const renderer=new THREE.WebGLRenderer({antialias:false,alpha:true});
+function dilate(px,w,h,iters){const N=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+  for(let it=0;it<iters;it++){const s=px.slice();for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=(y*w+x)*4;if(s[o+3]!==0)continue;let r=0,g=0,b=0,n=0;for(const[dx,dy]of N){const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;const no=(ny*w+nx)*4;if(s[no+3]!==0){r+=s[no];g+=s[no+1];b+=s[no+2];n++;}}if(n){px[o]=r/n|0;px[o+1]=g/n|0;px[o+2]=b/n|0;px[o+3]=255;}}}}
+async function main(){
+  const gltf=await new GLTFLoader().loadAsync("results/014417c5-86fd-4f65-a6d6-6b6f1b8aab2c.glb");
+  let mesh=null;gltf.scene.traverse(o=>{if(!mesh&&o.isMesh)mesh=o;});
+  const g=mesh.geometry.toNonIndexed();
+  const posAll=g.getAttribute("position"),colAll=g.getAttribute("color");
+  const T=posAll.count/3;
+  const cols=Math.ceil(Math.sqrt(T)),rows=Math.ceil(T/cols);
+  const MAXTEX=4096,cell=Math.max(3,Math.min(8,Math.floor(MAXTEX/Math.max(cols,rows))));
+  const texW=cols*cell,texH=rows*cell;
+  log("T",T,"cell",cell,"tex",texW+"x"+texH);
+  const pu=1/texW,pv=1/texH,du=1/cols,dv=1/rows;
+  // normalize colors to VEC3 float
+  const cArr=new Float32Array(T*9);
+  for(let i=0;i<T*3;i++){cArr[3*i]=colAll.getX(i);cArr[3*i+1]=colAll.getY(i);cArr[3*i+2]=colAll.getZ(i);}
+  g.setAttribute("color",new THREE.BufferAttribute(cArr,3));
+  const uv=new Float32Array(T*6);
+  for(let t=0;t<T;t++){const cx=t%cols,cy=(t/cols)|0,u0=cx*du,v0=cy*dv,o=t*6;uv[o]=u0+pu;uv[o+1]=v0+pv;uv[o+2]=u0+du-pu;uv[o+3]=v0+pv;uv[o+4]=u0+pu;uv[o+5]=v0+dv-pv;}
+  g.setAttribute("uv",new THREE.BufferAttribute(uv,2));
+  renderer.setSize(texW,texH,false);renderer.setClearColor(0x000000,0);
+  const rt=new THREE.WebGLRenderTarget(texW,texH,{depthBuffer:false});
+  const rmat=new THREE.RawShaderMaterial({side:THREE.DoubleSide,
+    vertexShader:`precision highp float;attribute vec3 position;attribute vec3 color;attribute vec2 uv;varying vec3 vColor;void main(){vColor=color;gl_Position=vec4(uv*2.0-1.0,0.0,1.0);}`,
+    fragmentShader:`precision highp float;varying vec3 vColor;vec3 l2s(vec3 c){return mix(1.055*pow(max(c,0.0),vec3(1.0/2.4))-0.055,c*12.92,step(c,vec3(0.0031308)));}void main(){gl_FragColor=vec4(l2s(vColor),1.0);}`});
+  const rm=new THREE.Mesh(g,rmat);rm.frustumCulled=false;const sc=new THREE.Scene();sc.add(rm);
+  renderer.setRenderTarget(rt);renderer.clear();renderer.render(sc,new THREE.Camera());
+  const px=new Uint8Array(texW*texH*4);renderer.readRenderTargetPixels(rt,0,0,texW,texH,px);renderer.setRenderTarget(null);
+  dilate(px,texW,texH,Math.max(2,cell-1));for(let i=3;i<px.length;i+=4)px[i]=255;
+  const canvas=document.createElement("canvas");canvas.width=texW;canvas.height=texH;
+  canvas.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(px),texW,texH),0,0);
+  const map=new THREE.CanvasTexture(canvas);map.flipY=false;map.colorSpace=THREE.SRGBColorSpace;map.minFilter=THREE.LinearFilter;map.magFilter=THREE.LinearFilter;map.generateMipmaps=false;map.needsUpdate=true;
+  g.deleteAttribute("color");
+  const smat=new THREE.MeshStandardMaterial({map,color:0xffffff,metalness:0,roughness:0.8,side:THREE.DoubleSide});
+  const outMesh=new THREE.Mesh(g,smat);
+  const buf=await new Promise((res,rej)=>new GLTFExporter().parse(outMesh,res,rej,{binary:true}));
+  const url=URL.createObjectURL(new Blob([buf],{type:"model/gltf-binary"}));
+  document.getElementById("mv").src=url;
+  log("model-viewer src set, GLB bytes",buf.byteLength);
+  window.__done=true;
+}
+main().catch(e=>{log("ERROR:",e.message||e);console.error(e);window.__done=true;});
+</script>
+</body>
+</html>
