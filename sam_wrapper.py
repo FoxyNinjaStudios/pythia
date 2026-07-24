@@ -136,6 +136,91 @@ def predict_mask(
     return (np.clip(prob, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
+# ---------------------------------------------------------------------------
+# SAM 3 – text / concept ("promptable concept segmentation") — optional path
+# ---------------------------------------------------------------------------
+#
+# SAM 2 (above) needs point clicks. SAM 3 additionally accepts a short text
+# phrase ("chair", "blue mug") and segments every matching instance. The web UI
+# exposes this as an optional mode; for single-object reconstruction we collapse
+# the returned instances to the single highest-confidence one. Weights come from
+# the gated Hugging Face repo ``facebook/sam3`` (same Meta auth flow as SAM 3D)
+# and are loaded lazily so this model is only pulled/held when text mode is used.
+
+import os
+
+_SAM3_MODEL_ID = os.environ.get("SAM3_MODEL_ID", "facebook/sam3")
+_sam3_model = None
+_sam3_processor = None
+
+
+def _get_sam3():
+    """Lazily load the SAM 3 model + processor (singleton)."""
+    global _sam3_model, _sam3_processor
+    if _sam3_model is None:
+        from transformers import Sam3Model, Sam3Processor
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        print(f"[SAM3] Loading {_SAM3_MODEL_ID} on {device}… (first run downloads gated weights)")
+        _sam3_processor = Sam3Processor.from_pretrained(_SAM3_MODEL_ID)
+        _sam3_model = Sam3Model.from_pretrained(_SAM3_MODEL_ID).to(device).eval()
+        print("[SAM3] Ready.")
+    return _sam3_model, _sam3_processor
+
+
+def predict_mask_text(
+    image: np.ndarray,
+    text: str,
+    score_threshold: float = 0.3,
+) -> np.ndarray:
+    """
+    Predict a segmentation mask from a text (concept) prompt using SAM 3.
+
+    Parameters
+    ----------
+    image           : (H, W, 3) uint8 RGB image
+    text            : concept phrase, e.g. "chair" or "blue mug"
+    score_threshold : minimum instance confidence to keep
+
+    Returns
+    -------
+    (H, W) uint8 mask (255 = foreground, 0 = background). Empty if the phrase is
+    blank or SAM 3 finds no matching instance. The mask is returned hard-edged;
+    the downstream ``smooth_mask``/``refine_mask`` pass anti-aliases it to the
+    same soft-alpha contract as the point-prompt path.
+    """
+    text = (text or "").strip()
+    H, W = image.shape[:2]
+    if not text:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    model, processor = _get_sam3()
+    device = next(model.parameters()).device
+
+    pil = PILImage.fromarray(image)
+    inputs = processor(images=pil, text=text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    results = processor.post_process_instance_segmentation(
+        outputs,
+        threshold=score_threshold,
+        mask_threshold=0.5,
+        target_sizes=[(H, W)],
+    )[0]
+
+    masks = results.get("masks")
+    scores = results.get("scores")
+    if masks is None or len(masks) == 0:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    # Text prompts return every matching instance; reconstruction wants a single
+    # object, so keep the highest-confidence one.
+    best = int(torch.as_tensor(scores).argmax())
+    m = np.asarray(masks[best].detach().to("cpu").numpy())
+    return (m > 0.5).astype(np.uint8) * 255
+
+
 def _refine_mask(prob: np.ndarray, image: Optional[np.ndarray] = None) -> np.ndarray:
     """Clean a SAM mask into a solid, smooth-edged silhouette using SAM's own
     per-pixel confidence.

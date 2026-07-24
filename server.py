@@ -224,8 +224,11 @@ jobs: Dict[str, JobState] = {}
 
 class SegmentRequest(BaseModel):
     image_id:        str
-    positive_points: List[Dict[str, float]]
+    positive_points: List[Dict[str, float]] = []
     negative_points: Optional[List[Dict[str, float]]] = []
+    # Optional SAM 3 text/concept prompt. When non-empty, segmentation runs in
+    # text mode (SAM 3) and the point prompts are ignored.
+    text:            Optional[str] = None
 
 
 class ReconstructRequest(BaseModel):
@@ -290,11 +293,15 @@ async def segment(req: SegmentRequest):
 
     image = np.array(PILImage.open(img_path).convert("RGB"))
 
+    text = (req.text or "").strip()
     loop = asyncio.get_event_loop()
-    mask = await loop.run_in_executor(
-        None,
-        lambda: _sam_predict(image, req.positive_points, req.negative_points),
-    )
+    if text:
+        mask = await loop.run_in_executor(None, lambda: _sam_predict_text(image, text))
+    else:
+        mask = await loop.run_in_executor(
+            None,
+            lambda: _sam_predict(image, req.positive_points, req.negative_points),
+        )
     mask = smooth_mask(mask)
 
     from sam_wrapper import mask_to_base64_png
@@ -462,6 +469,11 @@ async def get_result(job_id: str, format: str = "glb"):
 def _sam_predict(image, positive_points, negative_points):
     from sam_wrapper import predict_mask
     return predict_mask(image, positive_points, negative_points)
+
+
+def _sam_predict_text(image, text):
+    from sam_wrapper import predict_mask_text
+    return predict_mask_text(image, text)
 
 
 def smooth_mask(

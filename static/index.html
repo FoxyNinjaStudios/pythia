@@ -498,6 +498,21 @@ model-viewer {
       <div class="hint" style="margin-left:auto; color: var(--text)" id="point-count">0 points</div>
     </div>
 
+    <div class="quality-row" style="flex-wrap:wrap; gap:8px;">
+      <span class="label">Segment by</span>
+      <div class="seg" id="segmode-seg">
+        <button type="button" id="segmode-point" class="active" onclick="setSegMode('point')" title="Click points on the object (SAM 2)">Points</button>
+        <button type="button" id="segmode-text" onclick="setSegMode('text')" title="Describe the object in words (SAM 3)">Text</button>
+      </div>
+      <div id="segtext-wrap" style="display:none; flex:1 1 100%; gap:6px; align-items:center;">
+        <input id="segtext-input" type="text" autocomplete="off"
+               placeholder="Describe the object — e.g. “chair”, “blue mug” (SAM 3)"
+               style="flex:1; min-width:0; background:var(--panel,#161616); color:var(--text,#eee); border:1px solid var(--border,#333); border-radius:8px; padding:8px 10px; font-size:0.85rem;"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();runTextSegment();}"/>
+        <button type="button" class="btn-secondary" id="segtext-btn" onclick="runTextSegment()">Segment</button>
+      </div>
+    </div>
+
     <div class="quality-row">
       <span class="label">Quality</span>
       <div class="seg" id="quality-seg">
@@ -969,6 +984,9 @@ async function afterMarkersChange() {
   redrawMarkers();
   updatePointCount();
   updateHistoryButtons();
+  // In text (SAM 3) mode the mask comes from the concept prompt, not clicks —
+  // don't let stray point edits override it.
+  if (segMode === 'text') return;
   const hasPos = markers.some(m => m.label === 1);
   document.getElementById("generate-btn").disabled = !hasPos;
   if (hasPos) {
@@ -1023,6 +1041,59 @@ function redrawMarkers() {
 // SAM segmentation
 // ─────────────────────────────────────────────────────────────────────────────
 let segmentController = null;
+
+// 'point' → SAM 2 click prompts (default) · 'text' → SAM 3 concept prompt
+let segMode = 'point';
+
+function setSegMode(mode) {
+  segMode = mode;
+  const p = document.getElementById('segmode-point');
+  const t = document.getElementById('segmode-text');
+  const w = document.getElementById('segtext-wrap');
+  if (p) p.classList.toggle('active', mode === 'point');
+  if (t) t.classList.toggle('active', mode === 'text');
+  if (w) w.style.display = mode === 'text' ? 'flex' : 'none';
+  if (mode === 'text') {
+    const inp = document.getElementById('segtext-input');
+    if (inp) inp.focus();
+  }
+}
+
+async function runTextSegment() {
+  const inp  = document.getElementById('segtext-input');
+  const text = ((inp && inp.value) || '').trim();
+  const gen  = document.getElementById('generate-btn');
+  if (!imageId) return;
+  if (!text) { lastMaskB64 = null; clearMask(); if (gen) gen.disabled = true; return; }
+
+  if (segmentController) segmentController.abort();
+  segmentController = new AbortController();
+
+  const btn = document.getElementById('segtext-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Segmenting…'; }
+  try {
+    const res  = await fetch('/segment', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ image_id: imageId, positive_points: [], negative_points: [], text }),
+      signal:  segmentController.signal,
+    });
+    const data = await res.json();
+    lastMaskB64 = data.mask_b64 || null;
+    if (lastMaskB64) {
+      drawMask(lastMaskB64);
+      if (gen) gen.disabled = false;
+    } else {
+      clearMask();
+      if (gen) gen.disabled = true;
+      alert('SAM 3 found no “' + text + '” in the image. Try a different word.');
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error('Text segment error:', err);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Segment'; }
+  }
+}
 
 async function runSegment() {
   if (!imageId || markers.filter(m => m.label === 1).length === 0) {
