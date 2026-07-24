@@ -471,51 +471,26 @@ def smooth_mask(
     blur_frac: float = 0.004,
     keep_largest: bool = True,
 ) -> np.ndarray:
-    """Clean a SAM mask before reconstruction.
+    """Clean and anti-alias a SAM mask before reconstruction.
 
-    Fills pinholes, removes speckles, optionally keeps only the largest blob,
-    and smooths the jagged boundary (blur -> re-threshold). Kernel sizes are a
-    fraction of the image's shorter side so the amount of smoothing is
-    resolution-independent. Returns a uint8 0/255 mask (same as the input).
+    Fills pinholes, removes speckles, keeps only the largest blob, and rebuilds
+    the jagged boundary as an anti-aliased *soft alpha* (signed-distance-field
+    smoothstep) instead of a hard 0/255 edge. The low-memory pipeline reads the
+    mask as a raw, non-binarized alpha channel, so that sub-pixel coverage
+    survives into the geometry stage and cleans up the silhouette. ``blur_frac``
+    controls the feather half-width. Returns a uint8 0..255 (soft) mask.
     """
-    import cv2
+    from sam_wrapper import refine_mask
 
-    m = (np.asarray(mask) > 127).astype(np.uint8) * 255
-    if m.ndim == 3:
-        m = m[..., -1]
+    return refine_mask(
+        mask,
+        close_frac=close_frac,
+        open_frac=open_frac,
+        feather_frac=blur_frac,
+        keep_largest=keep_largest,
+        soft=True,
+    )
 
-    short = max(1, min(m.shape[:2]))
-
-    def _odd(frac: float, lo: int = 3) -> int:
-        k = int(round(short * frac))
-        k = max(lo, k)
-        return k | 1  # force odd
-
-    # 1) close then open: fill pinholes, then drop speckles
-    if close_frac > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(close_frac), _odd(close_frac)))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
-    if open_frac > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(open_frac), _odd(open_frac)))
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-
-    # 2) keep only the largest connected component (drops stray islands)
-    if keep_largest:
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
-        if n > 2:  # background + >1 blob
-            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-            m = np.where(labels == largest, 255, 0).astype(np.uint8)
-
-    # 3) blur -> threshold: round the jaggies
-    if blur_frac > 0:
-        ksize = _odd(blur_frac)
-        m = cv2.GaussianBlur(m, (ksize, ksize), 0)
-        m = (m > 127).astype(np.uint8) * 255
-
-    if not m.any():
-        # Never hand back an empty mask if the original had something.
-        return (np.asarray(mask) > 127).astype(np.uint8) * 255
-    return m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -710,6 +685,16 @@ def _run_reconstruction_sync(
         # vertex from the Gaussian appearance field). Vertex color is more accurate
         # than the UV bake here, so just export it directly.
         result_mesh = output["glb"]
+
+        # Sand off the 64^3 voxel staircase on oblique silhouettes. The 2D mask is
+        # full-res/soft; the geometry grid is not, so the step lives in the mesh.
+        # Volume-preserving Taubin keeps thin parts (legs) while removing stepping.
+        try:
+            from mesh_utils import taubin_smooth
+
+            result_mesh = taubin_smooth(result_mesh, iterations=10)
+        except Exception as exc:
+            logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
 
         result_path = str(RESULT_DIR / f"{job_id}.glb")
         result_ply = str(RESULT_DIR / f"{job_id}.ply")

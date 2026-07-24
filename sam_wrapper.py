@@ -124,11 +124,16 @@ def predict_mask(
     # foreground probability (confidence).
     prob = _sigmoid(masks[best])
 
-    # Post-processing (_refine_mask / _smooth_contour) is intentionally UNPLUGGED
-    # here: the Hiera-Large mask is clean on its own, and the extra smoothing can
-    # distort edges. The refinement code is kept below and can be re-enabled by
-    # switching the return to ``_refine_mask(prob, image)``.
-    return (prob >= 0.5).astype(np.uint8) * 255
+    # SAM's mask decoder is only ~256x256, so ``prob`` is a smooth confidence field
+    # bilinearly upsampled to full resolution. Hard-thresholding it per pixel
+    # (``prob >= 0.5``) is what turns that smooth ramp into a coarse ~4px staircase
+    # on oblique edges. Instead we return SAM's confidence *directly* as an
+    # anti-aliased 0..255 alpha: the visible 0.5 boundary is unchanged, but the
+    # sub-pixel coverage along the silhouette is preserved. The low-memory pipeline
+    # reads the mask as a raw (non-binarized) alpha channel, so this anti-aliasing
+    # survives all the way into reconstruction. Downstream cleanup (``refine_mask``)
+    # keeps this soft edge rather than re-thresholding it.
+    return (np.clip(prob, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 
 def _refine_mask(prob: np.ndarray, image: Optional[np.ndarray] = None) -> np.ndarray:
@@ -281,3 +286,117 @@ def base64_png_to_mask(b64: str) -> np.ndarray:
     """Decode a base64 PNG string to a (H, W) uint8 numpy mask."""
     data = base64.b64decode(b64)
     return np.array(PILImage.open(io.BytesIO(data)).convert("L"))
+
+
+def refine_mask(
+    mask: np.ndarray,
+    close_frac: float = 0.006,
+    open_frac: float = 0.004,
+    feather_frac: float = 0.004,
+    keep_largest: bool = True,
+    soft: bool = True,
+) -> np.ndarray:
+    """Clean and (optionally) anti-alias a SAM mask before reconstruction.
+
+    Topology cleanup (fill pinholes, drop speckles/islands, fill interior holes)
+    runs on a binary working copy — those operations genuinely need a hard mask.
+    The returned *edge* is anti-aliased so the ~256px SAM decoder staircase does
+    not survive as a hard per-pixel jag on oblique edges:
+
+    * If the input already carries a soft (anti-aliased) alpha — e.g. SAM's own
+      sub-pixel confidence field from ``predict_mask`` — that ramp is
+      *preserved*: the cleaned silhouette selects which region to keep, but the
+      boundary values come straight from SAM. This is the important case: the
+      anti-aliasing is produced at mask-generation time and must not be thrown
+      away here.
+    * If the input is genuinely hard-edged (e.g. a binary file mask from the
+      CLI), the boundary is rebuilt as fractional coverage via a signed-distance
+      field (the SDF-text-rendering trick): coverage = smoothstep across a
+      +/- feather-pixel ramp centred on the silhouette.
+
+    Either way the low-memory pipeline reads the mask as a *raw, non-binarized*
+    alpha channel, so this soft coverage survives into the geometry stage.
+
+    Kernel and feather sizes are a fraction of the image's shorter side, so the
+    amount of smoothing is resolution-independent. Returns a uint8 0..255 mask
+    (soft/anti-aliased by default; pass ``soft=False`` for the legacy hard
+    binary output).
+    """
+    import cv2
+
+    src = np.asarray(mask).astype(np.float32)
+    if src.ndim == 3:
+        src = src[..., -1]
+    if src.size and src.max() <= 1.0:  # tolerate 0..1 input
+        src = src * 255.0
+    binary = (src > 127).astype(np.uint8) * 255
+
+    short = max(1, min(binary.shape[:2]))
+
+    def _odd(frac: float, lo: int = 3) -> int:
+        k = int(round(short * frac))
+        return max(lo, k) | 1
+
+    # 1) close then open: fill pinholes, then shave speckles.
+    if close_frac > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(close_frac),) * 2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
+    if open_frac > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(open_frac),) * 2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k)
+
+    # 2) keep only the largest connected component (drop stray islands).
+    if keep_largest:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+        if n > 2:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            binary = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    # 2b) fill interior holes so the silhouette is solid (flood-fill background).
+    #     Pad a 1px background border first so the flood seed at (0,0) is always
+    #     background even when the object touches the frame corner (otherwise the
+    #     flood leaks and the whole frame is marked solid).
+    fg = (binary > 0).astype(np.uint8)
+    bordered = np.pad(fg, 1, mode="constant", constant_values=0)
+    ff = bordered.copy()
+    ff_mask = np.zeros((bordered.shape[0] + 2, bordered.shape[1] + 2), np.uint8)
+    cv2.floodFill(ff, ff_mask, (0, 0), 1)  # fill exterior background
+    holes = (ff == 0).astype(np.uint8)     # background unreachable from border = holes
+    region = ((bordered | holes)[1:-1, 1:-1]).astype(np.uint8)  # solid silhouette
+
+    if not region.any():
+        # Never hand back an empty mask if the original had something in it.
+        return (src > 127).astype(np.uint8) * 255
+
+    if not soft:
+        return region * 255
+
+    feather = max(1.5, short * feather_frac)
+
+    # Does the *input* already carry anti-aliased (fractional) coverage? SAM's
+    # confidence field does; a hard binary file mask does not.
+    frac_px = int(((src > 8) & (src < 247)).sum())
+    input_is_soft = frac_px > max(64, int(0.0005 * src.size))
+
+    if input_is_soft:
+        # 3a) Preserve SAM's own sub-pixel ramp. Keep the soft values in a band
+        #     around the cleaned silhouette (dilate the solid region by the
+        #     feather so the outer <0.5 side of the ramp survives), zero distant
+        #     halos / dropped islands, and force filled holes to solid.
+        rad = max(1, int(round(feather)))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1))
+        keep = cv2.dilate(region, k)
+        out = src * keep
+        out[(region == 1) & (src < 127)] = 255.0  # solidify filled holes
+        return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+    # 3b) Hard input: synthesise anti-aliasing with a signed distance field.
+    #     distanceTransform gives the distance to the nearest opposite pixel;
+    #     inside minus outside is a signed field (>0 inside, <0 outside, 0 on the
+    #     silhouette). A smoothstep over +/- ``feather`` pixels yields fractional
+    #     coverage — no re-thresholding, so the anti-aliasing is preserved.
+    dist_in = cv2.distanceTransform(region, cv2.DIST_L2, 3)
+    dist_out = cv2.distanceTransform(1 - region, cv2.DIST_L2, 3)
+    sdf = dist_in - dist_out
+    coverage = np.clip(0.5 + sdf / (2.0 * feather), 0.0, 1.0)
+    return (coverage * 255.0 + 0.5).astype(np.uint8)

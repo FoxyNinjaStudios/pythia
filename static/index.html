@@ -1074,15 +1074,20 @@ function drawMask(b64) {
     tc.drawImage(maskImg, 0, 0, dw, dh);
     const src  = tc.getImageData(0, 0, dw, dh).data;
 
-    // Step 2: build tinted overlay in the same temp canvas
+    // Step 2: build tinted overlay in the same temp canvas.
+    // Use the mask's SOFT coverage (0-255) as the overlay alpha instead of a
+    // hard >127 test, so the tinted edge is anti-aliased and diagonal/curved
+    // boundaries don't show a sawtooth. src[i] is the (bilinearly downscaled)
+    // per-pixel coverage; scale the base overlay alpha by it.
     const out  = tc.createImageData(dw, dh);
     const od   = out.data;
     for (let i = 0; i < src.length; i += 4) {
-      if (src[i] > 127) {   // R > 127 → foreground
+      const cov = src[i] / 255;   // soft foreground coverage 0..1
+      if (cov > 0.003) {          // skip fully-background pixels
         od[i]     = 46;
         od[i + 1] = 55;
         od[i + 2] = 123;
-        od[i + 3] = 185;    // α ≈ 0.65 (darker overlay)
+        od[i + 3] = Math.round(185 * cov);   // α ≈ 0.65·coverage → AA edge
       }
     }
     tc.putImageData(out, 0, 0);

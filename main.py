@@ -124,6 +124,8 @@ def run_pipeline(
     vertex_color_source: str = "gaussian",
     distill: bool = False,          # stage 2 (SLAT) distillation — SLAT is NOT distilled; keep off
     ss_distill: bool = True,        # stage 1 shortcut distillation — required for shortcut sampling
+    refine_mask: bool = False,      # opt-in: clean + anti-alias (soft-alpha) the mask before use
+    smooth_iterations: int = 0,     # opt-in: Taubin-smooth the mesh to de-stair the 64^3 voxel grid
 ):
     """
     Run SAM-3D pipeline: image + mask -> 3D mesh.
@@ -204,6 +206,13 @@ def run_pipeline(
         raise ValueError("Must provide either --mask or --mask-dir + --mask-index")
     
     print(f"  Mask shape: {mask.shape}")
+
+    # Optional: clean + anti-alias the mask (soft alpha) before reconstruction.
+    # Off by default so intentionally hard-edged batch masks are left untouched.
+    if refine_mask:
+        from sam_wrapper import refine_mask as _refine_mask
+        mask = _refine_mask((mask.astype(np.uint8) * 255) if mask.dtype == bool else mask)
+        print(f"  Mask refined (soft alpha): {mask.shape}, dtype={mask.dtype}")
     print()
     
     # Initialize pipeline
@@ -272,6 +281,15 @@ def run_pipeline(
         # to_glb already produced a colored/textured trimesh (per-vertex color by
         # default, or a baked UV atlas when --bake). Write both GLB and PLY.
         mesh = output["glb"]
+        # Optional: sand off the 64^3 voxel staircase on oblique silhouettes
+        # (the 2D mask is full-res/soft; the geometry grid is not).
+        if smooth_iterations and smooth_iterations > 0:
+            try:
+                from mesh_utils import taubin_smooth
+                mesh = taubin_smooth(mesh, iterations=smooth_iterations)
+                print(f"[MESH] Taubin-smoothed ({smooth_iterations} iterations)")
+            except Exception as e:
+                print(f"[MESH] smoothing skipped: {e}")
         mesh.export(output_path, file_type='glb')
         print(f"[OUTPUT] Mesh saved to: {output_path}")
         ply_path = os.path.splitext(output_path)[0] + ".ply"
@@ -419,6 +437,24 @@ def main():
              "leave it off. Stage 1 is distilled by default (see --ss-distill)."
     )
 
+    parser.add_argument(
+        "--refine-mask",
+        action="store_true",
+        help="Clean and anti-alias (soft-alpha) the mask before reconstruction: fill "
+             "pinholes, drop speckles/islands, and feather the jagged SAM boundary into "
+             "sub-pixel coverage (survives into the geometry stage). Off by default so "
+             "intentionally hard-edged batch masks are left untouched."
+    )
+    parser.add_argument(
+        "--smooth",
+        type=int,
+        default=0,
+        metavar="ITERS",
+        help="Taubin-smooth the output mesh by ITERS iterations to sand off the 64^3 "
+             "voxel staircase on oblique edges (volume-preserving, keeps thin parts). "
+             "0 = off (default). ~10 removes stepping; higher over-rounds sharp corners."
+    )
+
     args = parser.parse_args()
     
     if not args.mask and not args.mask_dir:
@@ -453,6 +489,8 @@ def main():
         vertex_color_source=args.vertex_color_source,
         distill=args.distill,
         ss_distill=args.ss_distill,
+        refine_mask=args.refine_mask,
+        smooth_iterations=args.smooth,
     )
 
 
