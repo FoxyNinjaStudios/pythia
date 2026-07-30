@@ -309,13 +309,21 @@ async def lifespan(app_instance):
     asyncio.get_event_loop().run_in_executor(None, _preload_sam)
     yield
 
+# Resolve the static directory both in development and when frozen into a
+# PyInstaller executable (which unpacks bundled data under sys._MEIPASS).
+if hasattr(sys, "_MEIPASS"):
+    base_path = sys._MEIPASS          # PyInstaller runtime extraction dir
+else:
+    base_path = os.path.abspath(".")  # normal development run
+static_dir = os.path.join(base_path, "static")
+
 app = FastAPI(title="SAM-3D Interactive Demo", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.get("/")
 async def root():
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(static_dir, "index.html"))
 
 
 # ── Model status ────────────────────────────────────────────────────────────────
@@ -677,6 +685,15 @@ async def upload_image(file: UploadFile = File(...)):
 
     image_id = str(uuid.uuid4())
     img.save(UPLOAD_DIR / f"{image_id}.png")
+
+    # Text/concept segmentation is the default UI mode, so start loading the SAM 3
+    # text model now that an image is in play. Runs in a worker thread so the
+    # upload response is not blocked; the model is ready by the first segment.
+    try:
+        asyncio.get_event_loop().run_in_executor(None, _load_text_seg_model)
+    except Exception:
+        pass
+
     return {"image_id": image_id, "width": img.width, "height": img.height}
 
 
@@ -742,13 +759,14 @@ async def reconstruct(req: ReconstructRequest):
     jobs[job_id].img_path  = str(img_path)
     jobs[job_id].mask_path = str(mask_path)
 
-    # Free SAM's cached image embeddings first so the memory-hungry low-memory 3D
-    # pipeline gets full MPS headroom. Without this the point-prompt path leaves
-    # SAM 2.1's feature pyramid pinned in unified memory and reconstruction runs
-    # several times slower under memory compression than the text-prompt path.
+    # Free every 2-D segmentation model (SAM 2 points + SAM 3 text) before the
+    # memory-hungry low-memory 3D pipeline starts, so they don't compete for
+    # unified memory. The point-prompt path otherwise leaves SAM 2.1's feature
+    # pyramid pinned and reconstruction runs several times slower under memory
+    # compression than the text-prompt path.
     try:
-        from sam_wrapper import release_sam_memory
-        release_sam_memory()
+        from sam_wrapper import unload_segmentation_models
+        unload_segmentation_models()
     except Exception:
         pass
 
@@ -953,6 +971,15 @@ def _sam_predict(image, positive_points, negative_points):
 def _sam_predict_text(image, text):
     from sam_wrapper import predict_mask_text
     return predict_mask_text(image, text)
+
+
+def _load_text_seg_model():
+    """Load the SAM 3 text/concept model (worker-thread target for /upload)."""
+    try:
+        from sam_wrapper import preload_text_model
+        preload_text_model()
+    except Exception as exc:
+        logger.warning("Text seg model preload failed: %s", exc)
 
 
 def _run_part_segmentation_sync(
@@ -1225,6 +1252,7 @@ def _run_reconstruction_sync(
     _mem_thread = threading.Thread(target=_mem_sampler, name=f"mem-{job_id}", daemon=True)
     _mem_thread.start()
 
+    pipeline = None
     try:
         image = np.array(PILImage.open(img_path).convert("RGB"))
         mask  = np.array(PILImage.open(mask_path).convert("L"))
@@ -1306,6 +1334,15 @@ def _run_reconstruction_sync(
         _mem_stop.set()
         job.sample_mem()          # one final reading so the graph ends at the peak
         root_logger.removeHandler(handler)
+        # Unload the 3-D reconstruction model now the job is done so its weights
+        # and working buffers are released back to the OS.
+        pipeline = None
+        import gc
+        gc.collect()
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1313,19 +1350,15 @@ def _run_reconstruction_sync(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _preload_sam():
-    # Text (SAM 3) segmentation is the default UI mode, so eagerly load its
-    # weights on startup for an instant first segmentation. The SAM 2 point
-    # checkpoint is a small download kept ready for the secondary point mode.
+    # Ensure the SAM 2 point checkpoint is on disk so the secondary point mode is
+    # ready without a first-click download. The segmentation models themselves
+    # are loaded on demand (text model on image upload, point model on first
+    # point click) so idle memory stays low.
     try:
         from sam_wrapper import ensure_sam_weights
         ensure_sam_weights()
     except Exception as exc:
         logger.warning(f"SAM 2 weight preload failed: {exc}")
-    try:
-        from sam_wrapper import preload_text_model
-        preload_text_model()
-    except Exception as exc:
-        logger.warning(f"SAM 3 text model preload failed: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

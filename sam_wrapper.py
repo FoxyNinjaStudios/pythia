@@ -104,6 +104,54 @@ def release_sam_memory() -> None:
         torch.mps.empty_cache()
 
 
+def _free_torch_memory() -> None:
+    """Run a GC pass and release cached Metal (MPS) allocations.
+
+    The launcher hides MPS from PyTorch so the 3-D stages fall back to the CPU,
+    which makes ``torch.backends.mps.is_available()`` return ``False`` even
+    though SAM's weights really do live on Metal. So we empty the MPS cache
+    unconditionally (guarded) rather than gating on ``is_available()``.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def unload_point_model() -> None:
+    """Fully unload the SAM 2 point-prompt predictor (weights + caches).
+
+    Unlike :func:`release_sam_memory` (which only drops the per-image feature
+    cache and keeps the weights resident), this drops the whole predictor so its
+    weights are freed from unified memory.
+    """
+    global _predictor, _amg
+    _predictor = None
+    _amg = None
+    _free_torch_memory()
+
+
+def unload_text_model() -> None:
+    """Fully unload the SAM 3 text/concept model (model + processor)."""
+    global _sam3_model, _sam3_processor
+    _sam3_model = None
+    _sam3_processor = None
+    _free_torch_memory()
+
+
+def unload_segmentation_models() -> None:
+    """Unload every 2-D segmentation model (SAM 2 points + SAM 3 text).
+
+    Called right before the memory-hungry 3-D reconstruction starts so the two
+    segmentation models do not compete with it for unified memory.
+    """
+    unload_point_model()
+    unload_text_model()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
