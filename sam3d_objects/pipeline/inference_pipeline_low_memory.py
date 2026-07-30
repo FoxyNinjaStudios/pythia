@@ -1,0 +1,1084 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+Low-memory inference pipeline for SAM-3D.
+
+This pipeline loads models sequentially and deletes them after use,
+reducing peak memory from ~45GB to ~15GB.
+"""
+
+import os
+import gc
+import time
+from typing import Union, Optional
+from copy import deepcopy
+import numpy as np
+import torch
+from tqdm import tqdm
+from loguru import logger
+from PIL import Image
+from omegaconf import OmegaConf
+from hydra.utils import instantiate
+from safetensors.torch import load_file
+
+from pytorch3d.renderer import look_at_view_transform
+from pytorch3d.transforms import Transform3d
+
+from sam3d_objects.model.backbone.dit.embedder.pointmap import PointPatchEmbed
+from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
+from sam3d_objects.pipeline.inference_pipeline_pointmap import (
+    InferencePipelinePointMap,
+    camera_to_pytorch3d_camera,
+)
+from sam3d_objects.data.dataset.tdfy.img_and_mask_transforms import get_mask
+from sam3d_objects.data.dataset.tdfy.transforms_3d import DecomposedTransform
+from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
+from sam3d_objects.pipeline.inference_utils import (
+    get_pose_decoder,
+    SLAT_MEAN,
+    SLAT_STD,
+    downsample_sparse_structure,
+    prune_sparse_structure,
+)
+from sam3d_objects.model.io import (
+    load_model_from_checkpoint,
+    filter_and_remove_prefix_state_dict_fn,
+)
+from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
+from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils
+
+
+def force_gc():
+    """Aggressive garbage collection and cache clearing."""
+    gc.collect()
+    gc.collect()
+    gc.collect()
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        try:
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        except:
+            pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def delete_model_completely(model, name="model"):
+    """Fully delete a model and all its parameters from memory."""
+    if model is None:
+        return
+    
+    try:
+        # Move to CPU first
+        model.cpu()
+        
+        # Delete all parameters
+        for param in model.parameters():
+            param.data = torch.empty(0)
+            if param.grad is not None:
+                param.grad = None
+        
+        # Delete all buffers
+        for buffer_name, buffer in list(model.named_buffers()):
+            buffer.data = torch.empty(0)
+        
+        # Clear any cached properties
+        if hasattr(model, '_modules'):
+            model._modules.clear()
+        
+        del model
+        logger.info(f"[LOW-MEM] Deleted {name}")
+    except Exception as e:
+        logger.warning(f"[LOW-MEM] Failed to delete {name}: {e}")
+    
+    force_gc()
+
+
+def get_memory_gb():
+    """Get current memory usage in GB."""
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_maxrss / (1024 ** 3)
+    except:
+        return -1
+
+
+def log_memory(stage: str):
+    """Log current memory usage."""
+    mem = get_memory_gb()
+    if mem > 0:
+        logger.info(f"[LOW-MEM] {stage}: {mem:.1f} GB")
+
+
+# =============================================================================
+# CACHING UTILITIES
+# =============================================================================
+
+def save_cache(data: dict, cache_path: str):
+    """Save intermediate outputs to cache file."""
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(data, cache_path)
+    logger.info(f"[CACHE] Saved to {cache_path}")
+
+def load_cache(cache_path: str) -> Optional[dict]:
+    """Load intermediate outputs from cache file."""
+    if os.path.exists(cache_path):
+        logger.info(f"[CACHE] Loading from {cache_path}")
+        return torch.load(cache_path, weights_only=False)
+    return None
+
+def get_cache_path(cache_dir: str, stage: str, input_hash: str) -> str:
+    """Get cache file path for a given stage."""
+    return os.path.join(cache_dir, f"{stage}_{input_hash}.pt")
+
+def compute_input_hash(image: np.ndarray, mask: np.ndarray) -> str:
+    """Compute a hash of the input for cache key."""
+    import hashlib
+    # Simple hash based on image shape and a sample of pixel values
+    data = f"{image.shape}_{mask.shape}_{image.mean():.4f}_{mask.sum()}"
+    return hashlib.md5(data.encode()).hexdigest()[:12]
+
+
+class InferencePipelineLowMemory:
+    """
+    Low-memory version of InferencePipelinePointMap.
+    
+    Key difference: Models are loaded on-demand and deleted after each stage.
+    This reduces peak memory from ~45GB to ~15GB at the cost of loading time.
+    """
+    
+    def __init__(
+        self,
+        config_path: str,
+        depth_model=None,
+        clip_pointmap_beyond_scale=None,
+        device="cpu",
+        dtype="float16",
+        cache_dir: Optional[str] = None,
+    ):
+        """
+        Initialize the low-memory pipeline.
+        
+        Unlike the regular pipeline, models are NOT loaded here.
+        They are loaded on-demand during run().
+        
+        Args:
+            cache_dir: Optional directory for caching intermediate outputs.
+                      If provided, stages can be skipped if cache exists.
+        """
+        self.config_path = config_path
+        self.workspace_dir = os.path.dirname(config_path)
+        self.config = OmegaConf.load(config_path)
+        self.device = torch.device(device)
+        self.dtype = self._get_dtype(dtype)
+        self.clip_pointmap_beyond_scale = clip_pointmap_beyond_scale
+        self.cache_dir = cache_dir
+        
+        # Pipeline settings from config
+        self.decode_formats = self.config.get("decode_formats", ["mesh"])
+        self.pad_size = self.config.get("pad_size", 1.0)
+        self.version = self.config.get("version", "v0")
+        self.downsample_ss_dist = self.config.get("downsample_ss_dist", 0)
+        # Max surface-voxel count before the sparse structure is factor-2
+        # downsampled (which silently halves the effective grid). The ceiling is
+        # an int32-indexing limit in mesh decoding: max(int32)/(64*768) ~= 43691.
+        self.ss_max_coords = self.config.get("ss_max_coords", 42000)
+        # Size-aware full-res budget: even when full_res_geometry is on, only keep
+        # objects at native 64³ while their pruned surface shell stays under this
+        # count. Above it the mesh decode gets expensive (large objects can run
+        # ~4-8x slower), so those fall back to the halved path for speed. Raise it
+        # (or set SAM3D_FULL_RES_MAX_COORDS=42000) to always stay native.
+        self.ss_full_res_max_coords = int(
+            os.environ.get(
+                "SAM3D_FULL_RES_MAX_COORDS",
+                self.config.get("ss_full_res_max_coords", 30000),
+            )
+        )
+        self.ss_inference_steps = self.config.get("ss_inference_steps", 25)
+        self.ss_rescale_t = self.config.get("ss_rescale_t", 3)
+        self.ss_cfg_strength = self.config.get("ss_cfg_strength", 7)
+        self.ss_cfg_interval = self.config.get("ss_cfg_interval", [0, 500])
+        self.ss_cfg_strength_pm = self.config.get("ss_cfg_strength_pm", 0.0)
+        self.slat_inference_steps = self.config.get("slat_inference_steps", 25)
+        self.slat_rescale_t = self.config.get("slat_rescale_t", 3)
+        self.slat_cfg_strength = self.config.get("slat_cfg_strength", 5)
+        self.slat_cfg_interval = self.config.get("slat_cfg_interval", [0, 500])
+        self.slat_mean = torch.tensor(self.config.get("slat_mean", SLAT_MEAN))
+        self.slat_std = torch.tensor(self.config.get("slat_std", SLAT_STD))
+        
+        # Initialize preprocessors (lightweight, keep in memory)
+        self.ss_preprocessor = instantiate(self.config.ss_preprocessor)
+        self.slat_preprocessor = instantiate(self.config.slat_preprocessor)
+        
+        # Pose decoder (lightweight)
+        pose_decoder_name = self.config.get("pose_decoder_name", "default")
+        self.pose_decoder = get_pose_decoder(pose_decoder_name)
+        
+        # Store depth model config but don't instantiate yet
+        self.depth_model_config = self.config.get("depth_model", None)
+        self.depth_model = depth_model  # Can be pre-loaded externally
+        
+        # Track what's currently loaded
+        self._loaded_models = {}
+        
+        if cache_dir:
+            logger.info(f"[LOW-MEM] Pipeline initialized with cache at: {cache_dir}")
+        else:
+            logger.info(f"[LOW-MEM] Pipeline initialized (no caching)")
+        log_memory("After init")
+    
+    @staticmethod
+    def _get_dtype(dtype):
+        if dtype == "bfloat16":
+            return torch.bfloat16
+        elif dtype == "float16":
+            return torch.float16
+        elif dtype == "float32":
+            return torch.float32
+        else:
+            raise NotImplementedError(f"Unknown dtype: {dtype}")
+    
+    def _load_model(self, config_key: str, ckpt_key: str, state_dict_fn=None):
+        """Load a model on-demand."""
+        config_path = os.path.join(self.workspace_dir, self.config[config_key])
+        ckpt_path = os.path.join(self.workspace_dir, self.config[ckpt_key])
+        
+        logger.info(f"[LOW-MEM] Loading {config_key}...")
+        config = OmegaConf.load(config_path)
+        
+        # Remove pretrained path if present (we're loading separately)
+        if "pretrained_ckpt_path" in config:
+            del config["pretrained_ckpt_path"]
+        
+        model = instantiate(config)
+        
+        if ckpt_path.endswith(".safetensors"):
+            state_dict = load_file(ckpt_path, device="cpu")
+            if state_dict_fn is not None:
+                state_dict = state_dict_fn(state_dict)
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            if state_dict_fn is not None:
+                state_dict = state_dict_fn(state_dict)
+            model.load_state_dict(state_dict, strict=False)
+        
+        model = model.to(self.device)
+        model.eval()
+        
+        log_memory(f"After loading {config_key}")
+        return model
+    
+    def _load_generator(self, config_key: str, ckpt_key: str):
+        """Load a generator model with condition embedder."""
+        config_path = os.path.join(self.workspace_dir, self.config[config_key])
+        ckpt_path = os.path.join(self.workspace_dir, self.config[ckpt_key])
+        
+        logger.info(f"[LOW-MEM] Loading {config_key} with embedder...")
+        full_config = OmegaConf.load(config_path)
+        
+        # Load generator backbone
+        gen_config = full_config["module"]["generator"]["backbone"]
+        state_dict_fn = filter_and_remove_prefix_state_dict_fn("_base_models.generator.")
+        
+        generator = instantiate(gen_config)
+        
+        if ckpt_path.endswith(".safetensors"):
+            state_dict = load_file(ckpt_path, device="cpu")
+        else:
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint)
+        
+        gen_state_dict = state_dict_fn(state_dict.copy())
+        generator.load_state_dict(gen_state_dict, strict=False)
+        generator = generator.to(self.device)
+        generator.eval()
+        
+        # Load condition embedder
+        cond_embedder = None
+        if "condition_embedder" in full_config["module"]:
+            cond_config = full_config["module"]["condition_embedder"]["backbone"]
+            cond_state_dict_fn = filter_and_remove_prefix_state_dict_fn("_base_models.condition_embedder.")
+            cond_embedder = instantiate(cond_config)
+            cond_state_dict = cond_state_dict_fn(state_dict.copy())
+            cond_embedder.load_state_dict(cond_state_dict, strict=False)
+            cond_embedder = cond_embedder.to(self.device)
+            cond_embedder.eval()
+        
+        log_memory(f"After loading {config_key}")
+        return generator, cond_embedder
+    
+    def _load_depth_model(self):
+        """Load the depth model (MoGe) on demand."""
+        if self.depth_model is not None:
+            return self.depth_model
+        
+        if self.depth_model_config is None:
+            raise ValueError("No depth model config provided")
+        
+        logger.info("[LOW-MEM] Loading depth model (MoGe)...")
+        self.depth_model = instantiate(self.depth_model_config)
+        
+        # Move to MPS for GPU acceleration (instead of CPU). MoGe always runs on
+        # Metal when the hardware supports it, even though the 3-D reconstruction
+        # stages are CPU-only (the launcher hides MPS from is_available()).
+        # SAM3D_MOGE_DEVICE=mps, set by the launcher, keeps MoGe on Metal; its
+        # output is moved to CPU in compute_pointmap so the handoff is safe.
+        _moge_metal = (
+            os.environ.get("SAM3D_MOGE_DEVICE") == "mps"
+            or torch.backends.mps.is_available()
+        )
+        if _moge_metal and hasattr(self.depth_model, 'model'):
+            logger.info("[LOW-MEM] Moving depth model to MPS for GPU acceleration")
+            self.depth_model.device = torch.device("mps")
+            self.depth_model.model.to("mps")
+        
+        log_memory("After loading depth model")
+        return self.depth_model
+    
+    def _unload_depth_model(self):
+        """Unload the depth model."""
+        if self.depth_model is not None:
+            if hasattr(self.depth_model, 'model'):
+                delete_model_completely(self.depth_model.model, "depth_model.model")
+            self.depth_model = None
+            force_gc()
+            log_memory("After unloading depth model")
+    
+    def image_to_float(self, image):
+        image = np.array(image)
+        image = image / 255
+        image = image.astype(np.float32)
+        return image
+    
+    def merge_image_and_mask(self, image, mask):
+        """Merge image and mask into RGBA format.
+        
+        Properly converts boolean masks to uint8 format (0-255).
+        """
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        image = np.array(image)
+        
+        if mask is not None:
+            mask = np.array(mask)
+            # Convert boolean mask to uint8 (0 or 255)
+            if mask.dtype == bool:
+                mask = mask.astype(np.uint8) * 255
+            # Ensure mask is uint8 with proper range
+            if mask.max() <= 1:
+                mask = (mask * 255).astype(np.uint8)
+            if mask.ndim == 2:
+                mask = mask[..., None]
+            # Combine RGB with mask as alpha
+            image = np.concatenate([image[..., :3], mask], axis=-1)
+        
+        return image
+
+    
+    def compute_pointmap(self, image):
+        """Compute pointmap using MoGe depth model."""
+        loaded_image = self.image_to_float(image)
+        loaded_image = torch.from_numpy(loaded_image)
+        loaded_mask = loaded_image[..., -1]
+        loaded_image = loaded_image.permute(2, 0, 1).contiguous()[:3]
+        
+        depth_model = self._load_depth_model()
+        
+        with torch.no_grad():
+            with torch.inference_mode():
+                output = depth_model(loaded_image)
+        
+        # Move pointmaps to CPU for pytorch3d Transform3d (MPS not supported)
+        pointmaps = output["pointmaps"].float().cpu()
+        camera_convention_transform = (
+            Transform3d()
+            .rotate(camera_to_pytorch3d_camera(device="cpu").rotation)
+            .to("cpu")
+        )
+        points_tensor = camera_convention_transform.transform_points(pointmaps)
+        intrinsics = output.get("intrinsics", None)
+        if intrinsics is not None:
+            intrinsics = intrinsics.cpu() if hasattr(intrinsics, 'cpu') else intrinsics
+        
+        points_tensor = points_tensor.permute(2, 0, 1)
+        
+        point_map_tensor = {
+            "pointmap": points_tensor,
+            "pts_color": loaded_image.cpu(),
+        }
+        
+        if intrinsics is None:
+            intrinsics_result = infer_intrinsics_from_pointmap(
+                points_tensor.permute(1, 2, 0), device="cpu"
+            )
+            point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
+        else:
+            point_map_tensor["intrinsics"] = intrinsics
+        
+        return point_map_tensor
+    
+    def preprocess_image(self, image, preprocessor, pointmap=None):
+        """Preprocess image for model input."""
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+        
+        rgba_image = torch.from_numpy(self.image_to_float(image))
+        rgba_image = rgba_image.permute(2, 0, 1).contiguous()
+        rgb_image = rgba_image[:3]
+        rgb_image_mask = get_mask(rgba_image, None, "ALPHA_CHANNEL")
+        
+        preprocessor_return_dict = preprocessor._process_image_mask_pointmap_mess(
+            rgb_image, rgb_image_mask, pointmap
+        )
+        
+        _item = preprocessor_return_dict
+        item = {
+            "mask": _item["mask"][None].to(self.device),
+            "image": _item["image"][None].to(self.device),
+            "rgb_image": _item["rgb_image"][None].to(self.device),
+            "rgb_image_mask": _item["rgb_image_mask"][None].to(self.device),
+        }
+        
+        if pointmap is not None and preprocessor.pointmap_transform != (None,):
+            item["pointmap"] = _item["pointmap"][None].to(self.device)
+            item["rgb_pointmap"] = _item["rgb_pointmap"][None].to(self.device)
+            item["pointmap_scale"] = _item["pointmap_scale"][None].to(self.device)
+            item["pointmap_shift"] = _item["pointmap_shift"][None].to(self.device)
+            item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
+            item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
+        
+        return item
+    
+    @staticmethod
+    def _down_sample_img(img_3chw: torch.Tensor):
+        x = img_3chw.unsqueeze(0)
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.0
+        max_side = max(x.shape[2], x.shape[3])
+        scale_factor = 1.0
+        if max_side > 3800:
+            scale_factor = 0.125
+        elif max_side > 1900:
+            scale_factor = 0.25
+        elif max_side > 1200:
+            scale_factor = 0.5
+        x = torch.nn.functional.interpolate(
+            x, scale_factor=(scale_factor, scale_factor),
+            mode="bilinear", align_corners=False, antialias=True,
+        )
+        return x.squeeze(0)
+    
+    def run(
+        self,
+        image: Union[None, Image.Image, np.ndarray],
+        mask: Union[None, Image.Image, np.ndarray] = None,
+        seed: Optional[int] = None,
+        stage1_only=False,
+        with_mesh_postprocess=True,
+        with_texture_baking=True,
+        use_vertex_color=True,
+        stage1_inference_steps=None,
+        stage2_inference_steps=None,
+        use_stage1_distillation=False,
+        use_stage2_distillation=False,
+        decode_formats=None,
+        use_cache: bool = True,
+        simplify_ratio: float = 0.0,
+        load_slat: str = None,
+        texture_bake: bool = False,
+        texture_bake_source: str = "gaussian",
+        texture_size: int = 2048,
+        vertex_color_source: str = "gaussian",
+        full_res_geometry: bool = False,
+    ) -> dict:
+        """
+        Run the full inference pipeline with sequential model loading.
+        
+        Each model is loaded, used, then deleted before loading the next.
+        
+        Args:
+            use_cache: If True and cache_dir is set, load cached stages and save new results.
+            simplify_ratio: Ratio of triangles to remove during mesh simplification (0.0=none, 0.95=heavy).
+            load_slat: Path to a cached SLAT .pt file to load directly (skips stages 0-2).
+            use_stage1_distillation / use_stage2_distillation: If True, sample the
+                corresponding flow stage with the shortcut model (step-size
+                conditioning, CFG off, ~1 network eval per step) instead of
+                CFG-guided flow matching. Faster with far fewer steps, but requires
+                shortcut-distilled weights (is_shortcut_model=True in the generator
+                config). See arXiv:2410.12557.
+        """
+        logger.info("[LOW-MEM] Starting sequential inference pipeline")
+        log_memory("Start of run()")
+
+        # ── Per-stage wall-clock timing (WO-013 T3). Attributes the elapsed time
+        #    since the previous checkpoint to the named stage. Works on both the CLI
+        #    and server paths since both run through this method. ──────────────────
+        _stage_secs = {}
+        _t_mark = {"t": time.perf_counter()}
+        def _ck(label):
+            now = time.perf_counter()
+            _stage_secs[label] = _stage_secs.get(label, 0.0) + (now - _t_mark["t"])
+            _t_mark["t"] = now
+        
+        image = self.merge_image_and_mask(image, mask)
+        
+        # Compute input hash for caching
+        input_hash = None
+        slat_from_cache = False
+        slat = None
+        ss_return_dict = {}
+        pts = None
+        pts_colors = None
+        intrinsics = None
+        
+        # Check if we should load SLAT from a specific file
+        if load_slat:
+            logger.info(f"[CACHE] Loading SLAT from: {load_slat}")
+            slat_cache = torch.load(load_slat, map_location="cpu")
+            slat = sp.SparseTensor(
+                coords=slat_cache["coords"].to(self.device),
+                feats=slat_cache["feats"].to(self.device)
+            )
+            ss_return_dict["translation"] = slat_cache.get("ss_return_dict_translation")
+            ss_return_dict["scale"] = slat_cache.get("ss_return_dict_scale")
+            ss_return_dict["coords"] = slat_cache.get("coords")
+            ss_return_dict["rotation"] = slat_cache.get("ss_return_dict_rotation")
+            intrinsics = slat_cache.get("intrinsics")
+            pts = slat_cache.get("pts")
+            pts_colors = slat_cache.get("pts_colors")
+            slat_from_cache = True
+            logger.info(f"[CACHE] Loaded SLAT with {slat.coords.shape[0]} voxels - skipping Stages 0, 1, 2!")
+        elif self.cache_dir and use_cache:
+            np_image = np.array(image) if isinstance(image, Image.Image) else image
+            np_mask = np.array(mask) if isinstance(mask, (Image.Image, np.ndarray)) else np.zeros((1,))
+            input_hash = compute_input_hash(np_image, np_mask)
+            logger.info(f"[CACHE] Input hash: {input_hash}")
+            
+            # Check if SLAT is cached (allows skipping Stages 0, 1, 2)
+            slat_cache_path = get_cache_path(self.cache_dir, "stage2_slat", input_hash)
+            slat_cache = load_cache(slat_cache_path)
+            if slat_cache is not None:
+                logger.info("[CACHE] Found cached SLAT - skipping Stages 0, 1, 2!")
+                slat = sp.SparseTensor(
+                    coords=slat_cache["coords"].to(self.device),
+                    feats=slat_cache["feats"].to(self.device)
+                )
+                ss_return_dict["translation"] = slat_cache.get("ss_return_dict_translation")
+                ss_return_dict["scale"] = slat_cache.get("ss_return_dict_scale")
+                ss_return_dict["coords"] = slat_cache.get("coords")
+                ss_return_dict["rotation"] = slat_cache.get("ss_return_dict_rotation")
+                intrinsics = slat_cache.get("intrinsics")
+                pts = slat_cache.get("pts")
+                pts_colors = slat_cache.get("pts_colors")
+                slat_from_cache = True
+        
+        # Skip Stages 0, 1, 2 if SLAT was loaded from cache
+        if not slat_from_cache:
+            # ========================
+            # STAGE 0: Depth estimation
+            # ========================
+            _ck("setup")
+            logger.info("[LOW-MEM] === STAGE 0: Depth Estimation ===")
+            
+            pointmap_dict = self.compute_pointmap(image)
+            pointmap = pointmap_dict["pointmap"]
+            pts = self._down_sample_img(pointmap)
+            pts_colors = self._down_sample_img(pointmap_dict["pts_color"])
+            # Camera intrinsics (cached alongside the SLAT for reuse).
+            intrinsics = pointmap_dict.get("intrinsics")
+            
+            # Unload depth model immediately
+            self._unload_depth_model()
+            log_memory("After depth stage complete")
+            
+            # Preprocess images
+            ss_input_dict = self.preprocess_image(image, self.ss_preprocessor, pointmap=pointmap)
+            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            
+            if seed is not None:
+                torch.manual_seed(seed)
+            
+            # ========================
+            # STAGE 1: Sparse Structure
+            # ========================
+            _ck("depth")
+            logger.info("[LOW-MEM] === STAGE 1: Sparse Structure Generation ===")
+            
+            # Load SS generator and embedder
+            ss_generator, ss_condition_embedder = self._load_generator(
+                "ss_generator_config_path", "ss_generator_ckpt_path"
+            )
+            
+            # Load SS decoder
+            ss_decoder = self._load_model("ss_decoder_config_path", "ss_decoder_ckpt_path")
+            
+            # Configure generator
+            inference_steps = stage1_inference_steps or self.ss_inference_steps
+            ss_generator.inference_steps = inference_steps
+            ss_generator.reverse_fn.interval = self.ss_cfg_interval
+            ss_generator.rescale_t = self.ss_rescale_t
+            ss_generator.reverse_fn.backbone.condition_embedder.normalize_images = True
+            ss_generator.reverse_fn.unconditional_handling = "add_flag"
+            # Shortcut-model distillation (arXiv:2410.12557): the shortcut sampler
+            # conditions on step size d = 1/steps and runs CFG-free (1 NFE/step), so
+            # it needs far fewer steps. Default is CFG-guided flow matching, which is
+            # higher fidelity but 2 NFEs/step. Mirrors upstream's use_distillation.
+            if use_stage1_distillation:
+                ss_generator.no_shortcut = False
+                ss_generator.reverse_fn.strength = 0
+                ss_generator.reverse_fn.strength_pm = 0
+            else:
+                ss_generator.no_shortcut = True
+                ss_generator.reverse_fn.strength = self.ss_cfg_strength
+                ss_generator.reverse_fn.strength_pm = self.ss_cfg_strength_pm
+            
+            # Run stage 1
+            with torch.no_grad():
+                with torch.inference_mode():
+                    bs = ss_input_dict["image"].shape[0]
+                    
+                    if hasattr(ss_generator.reverse_fn.backbone, "latent_mapping"):
+                        latent_shape_dict = {
+                            k: (bs,) + (v.pos_emb.shape[0], v.input_layer.in_features)
+                            for k, v in ss_generator.reverse_fn.backbone.latent_mapping.items()
+                        }
+                    else:
+                        latent_shape_dict = (bs,) + (4096, 8)
+                    
+                    # Get condition embeddings
+                    if ss_condition_embedder is not None:
+                        cond_tokens = ss_condition_embedder(**ss_input_dict)
+                        condition_args = (cond_tokens,)
+                        condition_kwargs = {}
+                    else:
+                        condition_args = ()
+                        condition_kwargs = ss_input_dict
+                    
+                    return_dict = ss_generator(
+                        latent_shape_dict,
+                        ss_input_dict["image"].device,
+                        *condition_args,
+                        **condition_kwargs,
+                    )
+                    
+                    if not hasattr(ss_generator.reverse_fn.backbone, "latent_mapping"):
+                        return_dict = {"shape": return_dict}
+                    
+                    shape_latent = return_dict["shape"]
+                    ss = ss_decoder(
+                        shape_latent.permute(0, 2, 1).contiguous()
+                        .view(shape_latent.shape[0], 8, 16, 16, 16)
+                    )
+                    coords = torch.argwhere(ss > 0)[:, [0, 2, 3, 4]].int()
+                    
+                    return_dict["coords_original"] = coords
+                    original_shape = coords.shape
+                    # No-retraining higher-grid win: keep large objects at native
+                    # 64³ instead of letting downsample_sparse_structure halve them.
+                    # Surface-voxel pruning drops interior voxels (which never define
+                    # the visible surface), so the coord count falls below the
+                    # int32-safe mesh-decode ceiling and the factor-2 downsample no
+                    # longer fires. Lossless for the silhouette. On by default;
+                    # disable with SAM3D_FULL_RES_GEOMETRY=0 (costs decode memory/time).
+                    _full_res = full_res_geometry or os.environ.get(
+                        "SAM3D_FULL_RES_GEOMETRY", "1"
+                    ) != "0"
+                    # Force the fast, low-memory decode path for EVERY object: always
+                    # factor-2 downsample the sparse structure regardless of surface
+                    # voxel count. The native (full-res) path expands far more voxels in
+                    # mesh decode, so it can run ~8x slower and use ~2x peak RAM for
+                    # visually identical results (verified: 65s/12.5GB halved vs
+                    # 509s/21.3GB native on the same object). Set SAM3D_FORCE_DOWNSAMPLE=0
+                    # to restore the adaptive keep-native-when-small behavior.
+                    _force_downsample = os.environ.get(
+                        "SAM3D_FORCE_DOWNSAMPLE", "1"
+                    ) != "0"
+                    _prune_dist = max(self.downsample_ss_dist, 1) if _full_res else self.downsample_ss_dist
+                    if _prune_dist > 0:
+                        coords = prune_sparse_structure(coords, max_neighbor_axes_dist=_prune_dist)
+                    _n_surface = coords.shape[0]
+                    # Size-aware guard: keep small/medium objects native, but cap the
+                    # budget for full-res so huge objects still get halved for speed.
+                    _guard = (
+                        min(self.ss_full_res_max_coords, self.ss_max_coords)
+                        if _full_res
+                        else self.ss_max_coords
+                    )
+                    coords, downsample_factor = downsample_sparse_structure(
+                        coords,
+                        max_coords=_guard,
+                        force=_force_downsample,
+                        subsample_cap=self.ss_max_coords,
+                    )
+                    if downsample_factor > 1:
+                        if _force_downsample:
+                            logger.info(
+                                f"[SS] forced fast path: surface shell {_n_surface} "
+                                f"grid halved (downsample_factor={downsample_factor}) for "
+                                f"decode speed / low memory. Set SAM3D_FORCE_DOWNSAMPLE=0 "
+                                f"to keep small objects at native 64³."
+                            )
+                        elif _full_res and _n_surface <= self.ss_max_coords:
+                            logger.info(
+                                f"[SS] size-aware guard: surface shell {_n_surface} "
+                                f"exceeds full-res budget {self.ss_full_res_max_coords}; "
+                                f"grid halved (downsample_factor={downsample_factor}) for "
+                                f"decode speed. Raise SAM3D_FULL_RES_MAX_COORDS to keep it native."
+                            )
+                        else:
+                            logger.warning(
+                                f"[SS] surface voxels exceeded {self.ss_max_coords}; grid "
+                                f"halved (downsample_factor={downsample_factor}). Object rendered "
+                                f"below native 64³." + (" Even after interior-voxel pruning the "
+                                "surface shell is too large for the int32 mesh-decode ceiling."
+                                if _full_res else " Set SAM3D_FULL_RES_GEOMETRY=1 to prune interior "
+                                "voxels first.")
+                            )
+                    logger.info(
+                        f"Downsampled coords from {original_shape[0]} to {coords.shape[0]} "
+                        f"(prune_dist={_prune_dist}, downsample_factor={downsample_factor})"
+                    )
+                    return_dict["coords"] = coords
+                    return_dict["downsample_factor"] = downsample_factor
+            
+            # Run pose decoder
+            pointmap_scale = ss_input_dict.get("pointmap_scale", None)
+            pointmap_shift = ss_input_dict.get("pointmap_shift", None)
+            return_dict.update(self.pose_decoder(return_dict, scene_scale=pointmap_scale, scene_shift=pointmap_shift))
+            return_dict["scale"] = return_dict["scale"] * return_dict["downsample_factor"]
+            
+            ss_return_dict = return_dict
+            
+            # Unload stage 1 models
+            delete_model_completely(ss_generator, "ss_generator")
+            delete_model_completely(ss_decoder, "ss_decoder")
+            delete_model_completely(ss_condition_embedder, "ss_condition_embedder")
+            ss_generator = ss_decoder = ss_condition_embedder = None
+            force_gc()
+            log_memory("After Stage 1 complete")
+            
+            if stage1_only:
+                _ck("stage1_sparse_structure")
+                _ss_steps = stage1_inference_steps or self.ss_inference_steps
+                _ss_mode = "shortcut-distilled" if use_stage1_distillation else "flow-matching+CFG"
+                logger.info("[TIMING] ============ Per-stage wall-clock (stage1-only) ============")
+                for _k in ("setup", "depth", "stage1_sparse_structure"):
+                    if _k in _stage_secs:
+                        logger.info("[TIMING] {:<40} {:8.2f}s".format(_k, _stage_secs[_k]))
+                logger.info("[TIMING] Stage 1: {} steps, {}".format(_ss_steps, _ss_mode))
+                logger.info("[TIMING] Peak RSS: {:.1f} GB".format(get_memory_gb()))
+                ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
+                return {
+                    **ss_return_dict,
+                    "pointmap": pts.cpu().permute((1, 2, 0)),
+                    "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),
+                    "stage_timings": dict(_stage_secs),
+                    "peak_rss_gb": get_memory_gb(),
+                }
+            
+            # ========================
+            # STAGE 2: Structured Latent
+            # ========================
+            _ck("stage1_sparse_structure")
+            logger.info("[LOW-MEM] === STAGE 2: Structured Latent Generation ===")
+            
+            coords = ss_return_dict["coords"]
+            
+            # Load SLAT generator
+            slat_generator, slat_condition_embedder = self._load_generator(
+                "slat_generator_config_path", "slat_generator_ckpt_path"
+            )
+            
+            # Move SLAT generator to MPS for GPU acceleration (critical for performance)
+            if torch.backends.mps.is_available():
+                mps_device = torch.device("mps")
+                logger.info(f"[LOW-MEM] Moving SLAT generator to MPS for GPU acceleration")
+                slat_generator.to(mps_device)
+                if slat_condition_embedder is not None:
+                    slat_condition_embedder.to(mps_device)
+            
+            # Configure generator
+            inference_steps = stage2_inference_steps or self.slat_inference_steps
+            slat_generator.inference_steps = inference_steps
+            slat_generator.reverse_fn.interval = self.slat_cfg_interval
+            slat_generator.rescale_t = self.slat_rescale_t
+            # See stage 1: shortcut distillation vs CFG-guided flow matching.
+            if use_stage2_distillation:
+                slat_generator.no_shortcut = False
+                slat_generator.reverse_fn.strength = 0
+            else:
+                slat_generator.no_shortcut = True
+                slat_generator.reverse_fn.strength = self.slat_cfg_strength
+            
+            # Run stage 2
+            with torch.no_grad():
+                with torch.inference_mode():
+                    latent_shape = (slat_input_dict["image"].shape[0],) + (coords.shape[0], 8)
+                    
+                    # Config has slat_condition_input_mapping: [] (empty list)
+                    # This means all inputs go as kwargs to the embedder
+                    if slat_condition_embedder is not None:
+                        # Move all tensor inputs to MPS to match embedder device
+                        if torch.backends.mps.is_available():
+                            mps_device = torch.device("mps")
+                            for key, value in slat_input_dict.items():
+                                if isinstance(value, torch.Tensor):
+                                    slat_input_dict[key] = value.to(mps_device)
+                        # Pass all inputs as kwargs (matching config with empty mapping)
+                        cond_tokens = slat_condition_embedder(**slat_input_dict)
+                        condition_args = (cond_tokens, coords.cpu().numpy())
+                        condition_kwargs = {}
+                    else:
+                        # When no embedder, just pass coords
+                        condition_args = (coords.cpu().numpy(),)
+                        condition_kwargs = slat_input_dict
+                    
+                    slat_raw = slat_generator(
+                        latent_shape,
+                        slat_input_dict["image"].device,
+                        *condition_args,
+                        **condition_kwargs,
+                    )
+                    
+                    slat = sp.SparseTensor(coords=coords, feats=slat_raw[0]).to(self.device)
+                    slat = slat * self.slat_std.to(self.device) + self.slat_mean.to(self.device)
+            
+            # Unload stage 2 models
+            delete_model_completely(slat_generator, "slat_generator")
+            delete_model_completely(slat_condition_embedder, "slat_condition_embedder")
+            slat_generator = slat_condition_embedder = None
+            force_gc()
+            log_memory("After Stage 2 complete")
+            
+            # Always save SLAT with timestamp for easy experimentation
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            slat_save_name = f"slat_{timestamp}.pt"
+            if self.cache_dir:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                slat_save_path = os.path.join(self.cache_dir, slat_save_name)
+            else:
+                slat_save_path = slat_save_name
+                
+            torch.save({
+                "coords": slat.coords.cpu(),
+                "feats": slat.feats.cpu(),
+                "ss_return_dict_translation": ss_return_dict.get("translation"),
+                "ss_return_dict_scale": ss_return_dict.get("scale"),
+                "ss_return_dict_rotation": ss_return_dict.get("rotation"),
+                "intrinsics": intrinsics.cpu() if isinstance(intrinsics, torch.Tensor) else intrinsics,
+                "pts": pts.cpu() if pts is not None else None,
+                "pts_colors": pts_colors.cpu() if pts_colors is not None else None,
+            }, slat_save_path)
+            logger.info(f"[CACHE] Saved SLAT to: {slat_save_path}")
+            
+            # Also save to cache_dir if configured
+            if self.cache_dir and use_cache and input_hash:
+                slat_cache_path = get_cache_path(self.cache_dir, "stage2_slat", input_hash)
+                save_cache({
+                    "coords": slat.coords.cpu(),
+                    "feats": slat.feats.cpu(),
+                    "ss_return_dict_translation": ss_return_dict.get("translation"),
+                    "ss_return_dict_scale": ss_return_dict.get("scale"),
+                    "ss_return_dict_rotation": ss_return_dict.get("rotation"),
+                    "intrinsics": intrinsics.cpu() if isinstance(intrinsics, torch.Tensor) else intrinsics,
+                    "pts": pts.cpu() if pts is not None else None,
+                    "pts_colors": pts_colors.cpu() if pts_colors is not None else None,
+                }, slat_cache_path)
+        
+        # ========================
+        # STAGE 3: Decoding
+        # ========================
+        _ck("stage2_slat")
+        logger.info("[LOW-MEM] === STAGE 3: Decoding ===")
+        
+        formats = list(decode_formats or self.decode_formats)
+        # A Gaussian-sourced texture bake needs the Gaussian appearance rep decoded
+        # alongside the mesh. Per-vertex color from the Gaussian needs it too.
+        _need_gaussian = (
+            (texture_bake and texture_bake_source == "gaussian")
+            or (not texture_bake and vertex_color_source == "gaussian")
+        )
+        if "mesh" in formats and _need_gaussian and "gaussian" not in formats:
+            formats.append("gaussian")
+        outputs = {}
+        
+        if "mesh" in formats:
+            # Chunked mesh decoding to fit in 48GB RAM
+            # The mesh decoder expands 25K→1.5M voxels, requiring ~60GB
+            # By chunking spatially, we reduce peak memory to ~20GB per chunk
+            
+            logger.info("[LOW-MEM] Loading mesh decoder...")
+            slat_decoder_mesh = self._load_model(
+                "slat_decoder_mesh_config_path", "slat_decoder_mesh_ckpt_path"
+            )
+            # Ensure float32 for maximum quality and MPS compatibility
+            slat_decoder_mesh = slat_decoder_mesh.float()
+            
+            # Move mesh decoder to MPS for GPU acceleration
+            # Added synchronization in upsample blocks to prevent OOM
+            if torch.backends.mps.is_available():
+                mps_device = torch.device("mps")
+                logger.info("[LOW-MEM] Moving mesh decoder to MPS for GPU acceleration")
+                slat_decoder_mesh.to(mps_device)
+                # Ensure SLAT is float32 for maximum decoder quality
+                slat = slat.to(device=mps_device, dtype=torch.float32)
+            
+            with torch.no_grad():
+                # Single-pass decode in float32 for maximum quality
+                # The memory-safe attention fix in masked_sdpa.py handles the MPS buffer limits
+                meshes = slat_decoder_mesh(slat)
+                outputs["mesh"] = meshes
+                
+                if len(meshes) > 0:
+                    logger.info(f"[LOW-MEM] Decoded mesh: {meshes[0].vertices.shape[0]} vertices, {meshes[0].faces.shape[0]} faces")
+                else:
+                    logger.warning("[LOW-MEM] Mesh decoding failed to produce results!")
+            
+            delete_model_completely(slat_decoder_mesh, "slat_decoder_mesh")
+            slat_decoder_mesh = None
+            force_gc()
+            log_memory("After mesh decoding")
+        
+        if "gaussian" in formats:
+            # Load GS decoder. Unlike the mesh decoder this is light (a transformer
+            # over the sparse SLAT tokens, no full-res voxel expansion).
+            logger.info("[LOW-MEM] Loading gaussian decoder...")
+            slat_decoder_gs = self._load_model(
+                "slat_decoder_gs_config_path", "slat_decoder_gs_ckpt_path"
+            ).float()
+            # The base SparseTransformer forward casts activations to self.dtype
+            # (float16 per config); .float() converts params but not that flag, so
+            # also flip the torso to fp32 to avoid a Half/Float matmul mismatch
+            # (which surfaces as a hard Metal assertion on MPS).
+            if hasattr(slat_decoder_gs, "convert_to_fp32"):
+                slat_decoder_gs.convert_to_fp32()
+
+            # Decode on the same device the SLAT already lives on (MPS after the
+            # mesh branch); the decoder's perturbation buffer is auto-registered on
+            # that device too, so staying there avoids CPU/MPS tensor mixing.
+            slat_decoder_gs.to(slat.device)
+            slat_gs = slat if slat.feats.dtype == torch.float32 else sp.SparseTensor(
+                coords=slat.coords, feats=slat.feats.float()
+            )
+
+            with torch.no_grad():
+                outputs["gaussian"] = slat_decoder_gs(slat_gs)
+                if len(outputs["gaussian"]) > 0:
+                    logger.info(
+                        f"[LOW-MEM] Decoded gaussian: {outputs['gaussian'][0].get_xyz.shape[0]} gaussians"
+                    )
+
+            delete_model_completely(slat_decoder_gs, "slat_decoder_gs")
+            slat_decoder_gs = None
+            force_gc()
+            log_memory("After gaussian decoding")
+        
+        # Post-process outputs
+        if "mesh" in outputs:
+            gaussian_rep = outputs.get("gaussian", [None])[0]
+
+            # Decide the color path (all portable — no CUDA rasterizer):
+            #   texture_bake=False  -> per-vertex color on the mesh.
+            #   texture_bake=True   -> bake a UV texture atlas, from the Gaussian
+            #                          color field (source="gaussian") or from mesh
+            #                          vertex colors (source="vertex").
+            do_bake = texture_bake
+            bake_source = texture_bake_source
+            if do_bake and bake_source == "gaussian" and gaussian_rep is None:
+                logger.warning(
+                    "[LOW-MEM] Gaussian rep unavailable; falling back to vertex-color bake"
+                )
+                bake_source = "vertex"
+
+            if do_bake:
+                # Baking: app_rep is the Gaussian only for a gaussian-source bake.
+                app_rep = gaussian_rep if bake_source == "gaussian" else None
+                vcolor_desc = None
+            else:
+                # Per-vertex color: pass the Gaussian so to_glb colors vertices from
+                # its (saturated) appearance field instead of the washed-out mesh
+                # decoder head. Falls back to decoder colors if unavailable.
+                app_rep = gaussian_rep if vertex_color_source == "gaussian" else None
+                vcolor_desc = (
+                    "gaussian" if app_rep is not None
+                    else ("mesh" if vertex_color_source == "gaussian" else vertex_color_source)
+                )
+
+            logger.info(
+                f"[LOW-MEM] Post-processing mesh (simplify={simplify_ratio}, "
+                f"texture_bake={do_bake}, "
+                f"source={bake_source if do_bake else 'vertex-color:' + str(vcolor_desc)})..."
+            )
+            _ck("mesh_decode")
+            glb = postprocessing_utils.to_glb(
+                app_rep,
+                outputs["mesh"][0],
+                simplify=simplify_ratio,
+                texture_size=texture_size,
+                verbose=True,
+                with_mesh_postprocess=with_mesh_postprocess,
+                with_texture_baking=do_bake,
+                use_vertex_color=not do_bake,
+                bake_backend="portable",
+                bake_source=bake_source,
+            )
+            outputs["glb"] = glb
+            _ck("export_bake")
+        
+        if "gaussian" in outputs:
+            outputs["gs"] = outputs["gaussian"][0]
+        
+        log_memory("End of run()")
+        logger.info("[LOW-MEM] Pipeline complete!")
+
+        # ── Per-stage timing summary (WO-013 T3). Logged on both CLI and server
+        #    paths, and attached to the result so callers/benchmarks can read exact
+        #    numbers without parsing logs. ──────────────────────────────────────────
+        _ck("finalize")
+        _ss_steps = stage1_inference_steps or self.ss_inference_steps
+        _slat_steps = stage2_inference_steps or self.slat_inference_steps
+        _ss_mode = "shortcut-distilled" if use_stage1_distillation else "flow-matching+CFG"
+        _slat_mode = "shortcut-distilled" if use_stage2_distillation else "flow-matching+CFG"
+        _ss_nfe = _ss_steps if use_stage1_distillation else round(_ss_steps * 1.5)
+        _slat_nfe = _slat_steps if use_stage2_distillation else round(_slat_steps * 1.5)
+        _order = ["setup", "depth", "stage1_sparse_structure", "stage2_slat",
+                  "mesh_decode", "export_bake", "finalize"]
+        _labels = {
+            "setup": "Setup / preprocess",
+            "depth": "Stage 0  MoGe depth",
+            "stage1_sparse_structure": f"Stage 1  sparse structure ({_ss_steps} steps, {_ss_mode}, ~{_ss_nfe} NFE)",
+            "stage2_slat": f"Stage 2  SLAT texture/refine ({_slat_steps} steps, {_slat_mode}, ~{_slat_nfe} NFE)",
+            "mesh_decode": "Stage 3  mesh decode",
+            "export_bake": "Export / texture bake",
+            "finalize": "Finalize / layout",
+        }
+        _total = sum(_stage_secs.values())
+        logger.info("[TIMING] ============ Per-stage wall-clock ============")
+        for _k in _order:
+            if _k in _stage_secs:
+                logger.info("[TIMING] {:<54} {:8.2f}s".format(_labels[_k], _stage_secs[_k]))
+        logger.info("[TIMING] {:<54} {:8.2f}s".format("TOTAL", _total))
+        logger.info("[TIMING] Peak RSS: {:.1f} GB".format(get_memory_gb()))
+        logger.info("[TIMING] =============================================")
+
+        result = {
+            **ss_return_dict,
+            **outputs,
+        }
+        result["stage_timings"] = dict(_stage_secs)
+        result["stage_timings"]["total"] = _total
+        result["peak_rss_gb"] = get_memory_gb()
+        if intrinsics is not None:
+            result["intrinsics"] = intrinsics
+        
+        # Only include pointmap if it was computed (not when loading from cache)
+        if pts is not None:
+            result["pointmap"] = pts.cpu().permute((1, 2, 0))
+            result["pointmap_colors"] = pts_colors.cpu().permute((1, 2, 0))
+        
+        return result
+

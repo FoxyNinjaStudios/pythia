@@ -1,0 +1,3622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SAM-3D · Object Reconstruction</title>
+<!-- Import map must precede every module script so bare "three" specifiers resolve. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+      integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0f1117;
+  --surface:  #1a1d27;
+  --border:   #2e3247;
+  --accent:   #5b6ef5;
+  --accent2:  #7c3aed;
+  --green:    #22c55e;
+  --red:      #ef4444;
+  --text:     #e2e8f0;
+  --muted:    #64748b;
+  --radius:   12px;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* ── Header ── */
+header {
+  width: 100%;
+  padding: 20px 32px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+header h1 { font-size: 1.25rem; font-weight: 600; }
+header span.badge {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* ── Main layout ── */
+main {
+  width: 100%;
+  max-width: 1100px;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* ── Step card ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+}
+.card-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+/* ── Upload drop zone ── */
+#drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 48px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+#drop-zone:hover, #drop-zone.dragover {
+  border-color: var(--accent);
+  background: rgba(91,110,245,.06);
+  color: var(--text);
+}
+#drop-zone .icon { font-size: 2.5rem; margin-bottom: 10px; }
+#drop-zone input { display: none; }
+
+/* ── Canvas / image workspace ── */
+/* ── Step 2: two-column layout (image left · options & info right) ── */
+.annotate-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
+  gap: 24px;
+  align-items: start;
+}
+.annotate-left { min-width: 0; }
+.annotate-right { display: flex; flex-direction: column; min-width: 0; }
+.annotate-right > :first-child { margin-top: 0; }   /* column already spaces rows */
+@media (max-width: 760px) {
+  .annotate-grid { grid-template-columns: 1fr; }     /* stack on small screens */
+}
+
+#viewport {
+  position: relative;
+  max-width: fit-content;
+  max-height: 60vh;
+  margin: 0 auto;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0b0d13;
+  touch-action: none;
+}
+#workspace {
+  position: relative;
+  display: block;
+  cursor: crosshair;
+  line-height: 0;  /* remove gap below img */
+  transform-origin: 0 0;
+  will-change: transform;
+}
+#workspace.panning { cursor: grabbing; }
+#workspace.pannable { cursor: grab; }
+#workspace img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+#workspace canvas {
+  position: absolute;
+  top: 0; left: 0;
+  pointer-events: none;
+  width: 100%;
+  height: 100%;
+}
+#marker-canvas { pointer-events: none; }
+
+/* ── Zoom toolbar ── */
+#zoom-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  justify-content: center;
+}
+#zoom-bar button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+#zoom-bar button:hover { border-color: var(--accent); }
+#zoom-bar button.wide { width: auto; padding: 0 12px; font-size: 0.8rem; gap: 6px; }
+#zoom-level {
+  min-width: 52px;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Hint row ── */
+.hints {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.hint { display: flex; align-items: center; gap: 6px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.dot.green  { background: var(--green); }
+.dot.red    { background: var(--red);   }
+
+/* ── Buttons ── */
+.btn-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+button {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s, transform .1s;
+}
+button:active { transform: scale(0.97); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+.btn-secondary {
+  background: var(--border);
+  color: var(--text);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+/* ── Quality preset ── */
+.quality-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+.quality-row .label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg button {
+  border: none;
+  border-radius: 0;
+  padding: 8px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  background: transparent;
+  color: var(--muted);
+  border-right: 1px solid var(--border);
+}
+.seg button:last-child { border-right: none; }
+.seg button.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+.seg button .sub {
+  display: block;
+  font-size: 0.65rem;
+  font-weight: 500;
+  opacity: .8;
+}
+
+/* ── Progress ── */
+#progress-card { display: none; }
+.progress-track {
+  background: var(--border);
+  border-radius: 99px;
+  height: 8px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  transition: width .4s ease;
+  width: 0%;
+}
+#progress-msg {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+#progress-time {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+#eta-time { color: var(--text); opacity: .75; }
+#result-time {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+#result-time b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* ── Live RAM graph ── */
+#ram-card { display: none; }
+.ram-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ram-head b { color: var(--text); }
+.ram-head .ram-peak { color: var(--accent2); }
+#ram-canvas {
+  width: 100%;
+  height: 160px;
+  display: block;
+  border-radius: 8px;
+  background: #111;
+}
+
+/* Client-side mesh tuning (Three.js) */
+.tune-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.tune-row #holefill-val,
+.tune-row #edgetrim-val {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+#holefill-slider,
+#edgetrim-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+#edgetrim-slider { margin-bottom: 4px; }
+.tune-status {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-height: 1em;
+}
+
+/* Reconstruction preview: shows the segmentation mask (with a shimmer sweep to
+   read as an indeterminate progress bar) in the same 500px slot the finished
+   3-D model appears in. */
+.recon-preview {
+  position: relative;
+  width: 100%;
+  height: 500px;
+  border-radius: 8px;
+  background: #111;
+  overflow: hidden;
+  margin: 14px 0 4px;
+}
+.recon-preview img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: .9;
+  filter: brightness(.55);
+  /* Make black pixels read as transparent against the dark backdrop. */
+  mix-blend-mode: screen;
+}
+.recon-preview .shimmer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(100deg,
+    transparent 20%,
+    rgba(124,58,237,.20) 40%,
+    rgba(91,110,245,.42) 50%,
+    rgba(124,58,237,.20) 60%,
+    transparent 80%);
+  background-size: 220% 100%;
+  animation: shimmer-sweep 1.4s linear infinite;
+}
+@keyframes shimmer-sweep {
+  0%   { background-position: 120% 0; }
+  100% { background-position: -120% 0; }
+}
+
+/* ── Result ── */
+#result-card { display: none; }
+.result-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.result-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.result-toolbar button { padding: 8px 14px; font-size: 0.8rem; }
+#result-stage { position: relative; }
+model-viewer {
+  width: 100%;
+  height: 500px;
+  border-radius: 8px;
+  background: #111;
+}
+#eraser-stage { display: none; }
+#eraser-host {
+  position: relative;
+  width: 100%;
+  height: 500px;
+  background: #111;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.result-actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+
+/* ── Tools overlay sidebar ── */
+#tools-sidebar, #export-sidebar, #models-sidebar {
+  position: fixed; top: 0; right: 0;
+  height: 100vh; width: 360px; max-width: 88vw;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -14px 0 46px rgba(0,0,0,.45);
+  transform: translateX(101%);
+  transition: transform .3s cubic-bezier(.4,0,.2,1);
+  z-index: 50;
+  display: flex; flex-direction: column;
+}
+#tools-sidebar.open, #export-sidebar.open, #models-sidebar.open { transform: translateX(0); }
+
+/* ── Model status cards ── */
+.model-card {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 14px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg); margin-bottom: 10px;
+}
+.model-top { display: flex; align-items: flex-start; gap: 12px; }
+.model-card .model-ic {
+  width: 38px; height: 38px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 9px; background: var(--surface);
+  border: 1px solid var(--border); color: var(--accent); font-size: 1rem;
+}
+.model-card .model-meta { flex: 1 1 auto; min-width: 0; }
+.model-card .model-name { font-size: .86rem; font-weight: 600; }
+.model-card .model-role { color: var(--muted); font-size: .72rem; margin-top: 2px; }
+.model-card .model-sub  { color: var(--muted); font-size: .7rem; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.model-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: .68rem; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+  white-space: nowrap;
+}
+.model-badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.model-badge.loaded { color: #34d399; background: rgba(52,211,153,.12); }
+.model-badge.downloaded { color: #60a5fa; background: rgba(96,165,250,.12); }
+.model-badge.not_downloaded { color: #f87171; background: rgba(248,113,113,.12); }
+#models-status.loading { color: var(--muted); font-size: .8rem; }
+
+/* ── Model download actions ── */
+.model-action { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.model-action button { padding: 7px 12px; font-size: .78rem; }
+.model-dl-msg { font-size: .72rem; color: var(--muted); line-height: 1.4; }
+.model-dl-msg.error { color: #f87171; }
+.model-dl-msg a { color: var(--accent); }
+.mini-spin {
+  width: 14px; height: 14px; flex: 0 0 auto;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: mini-spin .7s linear infinite;
+}
+@keyframes mini-spin { to { transform: rotate(360deg); } }
+
+/* ── Hugging Face auth block ── */
+.hf-auth { margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+.hf-auth .hf-row { display: flex; gap: 8px; margin-top: 8px; }
+.hf-auth input {
+  flex: 1 1 auto; min-width: 0; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; font-size: .78rem;
+}
+.hf-auth button { padding: 7px 12px; font-size: .78rem; white-space: nowrap; }
+.hf-status { font-size: .72rem; margin-top: 8px; }
+.hf-status.ok { color: #34d399; }
+.hf-status.err { color: #f87171; }
+
+
+/* While the stencil 3D editor is active the Tools sidebar is open. Left-align
+   and cap the main column to the space beside the panel so the 3D editing
+   stage is never covered by the sidebar. */
+body.editing-3d { align-items: flex-start; }
+body.editing-3d main { max-width: calc(100vw - 400px); }
+
+/* ── Export format cards ── */
+.fmt-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 11px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); margin-bottom: 8px; cursor: pointer;
+  transition: border-color .15s, transform .1s;
+}
+.fmt-card:hover { border-color: var(--accent); }
+.fmt-card:active { transform: scale(.99); }
+.fmt-card.busy { opacity: .6; pointer-events: none; }
+.fmt-card .fmt-meta { display: flex; flex-direction: column; gap: 2px; }
+.fmt-card .fmt-name { font-size: .85rem; font-weight: 600; }
+.fmt-card .fmt-ext  { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .04em; }
+.fmt-card .fmt-size { color: var(--accent); font-variant-numeric: tabular-nums; font-size: .78rem; white-space: nowrap; }
+.opt-row { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 6px; font-size: .8rem; }
+.opt-row select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 6px; font-size: .78rem;
+}
+.export-progress { margin: 12px 0 4px; }
+.export-progress-bar {
+  height: 8px; border-radius: 6px; background: var(--bg);
+  border: 1px solid var(--border); overflow: hidden;
+}
+.export-progress-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  transition: width .2s ease;
+}
+.export-progress-label { margin-top: 6px; font-size: .75rem; color: var(--muted); }
+.tools-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 18px 20px; border-bottom: 1px solid var(--border);
+}
+.tools-head h2 {
+  font-size: 0.95rem; font-weight: 600;
+  display: flex; align-items: center; gap: 9px;
+}
+.tools-head h2 i { color: var(--accent); }
+.tools-close {
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.tools-close:hover { color: var(--text); border-color: var(--accent); }
+.tools-body { flex: 1; overflow-y: auto; padding: 20px; }
+.tool-group { margin-bottom: 24px; }
+.tool-group:last-child { margin-bottom: 0; }
+.tool-group h3 {
+  font-size: 0.66rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); font-weight: 700; margin-bottom: 12px;
+}
+.tool-hint {
+  font-size: 0.75rem; color: var(--muted); line-height: 1.5; margin-bottom: 12px;
+}
+#stencil-group { border-top: 1px solid var(--border); padding-top: 20px; }
+.tools-body input[type="range"] {
+  width: 100%; accent-color: var(--accent); cursor: pointer; margin-bottom: 12px;
+}
+.tools-body .tune-row { margin-bottom: 4px; }
+.tools-body .tune-row span { color: var(--accent); font-variant-numeric: tabular-nums; }
+.tool-btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.tool-btn-row:last-child { margin-bottom: 0; }
+.tool-btn-row button { flex: 1 1 auto; padding: 9px 12px; font-size: 0.8rem; }
+
+/* ── Stencil eraser ── */
+#stencil-group.disabled { opacity: 0.5; pointer-events: none; }
+#eraser-palette { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 8px; }
+.stencil-chip {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  aspect-ratio: 1 / 1; text-align: center;
+  padding: 8px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text);
+  cursor: grab; user-select: none; font-size: 0.68rem; line-height: 1.1;
+}
+.stencil-chip i { color: var(--accent); font-size: 1.5rem; }
+.stencil-chip:hover { border-color: var(--accent); background: var(--bg-alt, var(--bg)); }
+.stencil-chip:active { cursor: grabbing; }
+#er-move.active, #er-rotate.active, #er-scale.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+}
+
+/* ── Responsive ── */
+@media (max-width: 860px) {
+  header { padding: 14px 18px; flex-wrap: wrap; }
+  main { padding: 22px 14px; gap: 20px; }
+  .card { padding: 18px; }
+  model-viewer, #eraser-host { height: 400px; }
+}
+@media (max-width: 600px) {
+  header h1 { font-size: 1.1rem; }
+  header .badge { display: none; }
+  model-viewer, #eraser-host { height: 320px; }
+  #tools-sidebar, #export-sidebar, #models-sidebar {
+    top: auto; bottom: 0; right: 0;
+    width: 100%; max-width: 100%; height: 84vh;
+    border-left: none; border-top: 1px solid var(--border);
+    border-radius: 18px 18px 0 0;
+    transform: translateY(101%);
+  }
+  #tools-sidebar.open, #export-sidebar.open, #models-sidebar.open { transform: translateY(0); }
+  /* Sidebar becomes a bottom sheet here, so the 3D stage can stay full width. */
+  body.editing-3d { align-items: center; }
+  body.editing-3d main { max-width: 1100px; }
+}
+
+/* ── Console ── */
+#console-card {
+  display: none;
+}
+#console-output {
+  background: #0d0d0d;
+  color: #a8ffa8;
+  font-family: 'Menlo', 'Consolas', monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 12px 14px;
+  height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#console-output .err { color: #ff6b6b; }
+#console-output .warn { color: #ffd93d; }
+
+/* ── Utility ── */
+.hidden { display: none !important; }
+.section { display: none; }
+.section.active { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+    <rect width="28" height="28" rx="7" fill="url(#g1)"/>
+    <path d="M8 14 L14 8 L20 14 L14 20 Z" fill="white" opacity=".9"/>
+    <defs>
+      <linearGradient id="g1" x1="0" y1="0" x2="28" y2="28">
+        <stop offset="0%"   stop-color="#5b6ef5"/>
+        <stop offset="100%" stop-color="#7c3aed"/>
+      </linearGradient>
+    </defs>
+  </svg>
+  <h1>SAM-3D</h1>
+  <span class="badge">Apple Silicon</span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+    <button class="btn-ghost" onclick="toggleModels()"><i class="fa-solid fa-microchip"></i> Models</button>
+    <button class="btn-ghost" onclick="restartApp()"><i class="fa-solid fa-arrow-left"></i> Try another image</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- ─── Step 1 : Upload ─────────────────────────────────────────────── -->
+  <div class="card" id="step-upload">
+    <div class="card-title">Step 1 - Upload image</div>
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()"
+         ondragover="onDragOver(event)" ondragleave="onDragLeave(event)"
+         ondrop="onDrop(event)">
+      <div class="icon"><i class="fa-regular fa-image"></i></div>
+      <div>Drop an image here, or click to browse</div>
+      <div style="font-size:.75rem;margin-top:6px;opacity:.6">PNG · JPG · WebP</div>
+      <input type="file" id="file-input" accept="image/*" onchange="onFileInput(event)"/>
+    </div>
+  </div>
+
+  <!-- ─── Step 2 : Annotate ───────────────────────────────────────────── -->
+  <div class="card hidden" id="step-annotate">
+    <div class="card-title">Step 2 - Describe the object</div>
+
+    <div class="annotate-grid">
+      <div class="annotate-left">
+        <div id="viewport">
+          <div id="workspace">
+            <img id="base-img" alt="Uploaded image" draggable="false"/>
+            <canvas id="mask-canvas"></canvas>
+            <canvas id="marker-canvas"></canvas>
+          </div>
+        </div>
+
+        <div id="zoom-bar">
+          <button title="Zoom out" onclick="zoomAtCenter(1/1.25)"><i class="fa-solid fa-minus"></i></button>
+          <span id="zoom-level">100%</span>
+          <button title="Zoom in" onclick="zoomAtCenter(1.25)"><i class="fa-solid fa-plus"></i></button>
+          <button class="wide" title="Zoom to fit" onclick="resetZoom()"><i class="fa-solid fa-expand"></i> Fit</button>
+        </div>
+      </div>
+
+      <div class="annotate-right">
+        <div class="hints" id="point-hints" style="display:none;">
+          <div class="hint"><div class="dot green"></div> Left-click - add object point</div>
+          <div class="hint"><div class="dot red"></div>   Right-click - mark background</div>
+          <div class="hint" style="color: var(--text)">Scroll to zoom · drag to pan</div>
+          <div class="hint" style="margin-left:auto; color: var(--text)" id="point-count">0 points</div>
+        </div>
+
+        <div class="quality-row" style="flex-wrap:wrap; gap:8px;">
+          <span class="label">Segment by</span>
+          <div class="seg" id="segmode-seg">
+            <button type="button" id="segmode-text" class="active" onclick="setSegMode('text')" title="Describe the object in words (SAM 3)">Text</button>
+            <button type="button" id="segmode-point" onclick="setSegMode('point')" title="Click points on the object (SAM 2)">Points</button>
+          </div>
+          <div id="segtext-wrap" style="display:flex; flex:1 1 100%; gap:6px; align-items:center;">
+            <input id="segtext-input" type="text" autocomplete="off"
+                   placeholder="Describe the object - e.g. “chair”, “blue mug” (SAM 3)"
+                   style="flex:1; min-width:0; background:var(--panel,#161616); color:var(--text,#eee); border:1px solid var(--border,#333); border-radius:8px; padding:8px 10px; font-size:0.85rem;"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();runTextSegment();}"/>
+            <button type="button" class="btn-secondary" id="segtext-btn" onclick="runTextSegment()">Segment</button>
+          </div>
+        </div>
+
+        <div class="quality-row">
+          <span class="label">Quality</span>
+          <div class="seg" id="quality-seg">
+            <button type="button" data-s1="8"  data-s2="8"  data-steps="8 / 8"   onclick="setQuality(this)" class="active" title="Fastest - 8 / 8 steps">Fast<span class="sub"></span></button>
+            <button type="button" data-s1="25" data-s2="12" data-steps="25 / 12" onclick="setQuality(this)" title="Balanced - 25 / 12 steps">Medium<span class="sub"></span></button>
+            <button type="button" data-s1="40" data-s2="20" data-steps="40 / 20" onclick="setQuality(this)" title="Best geometry, slowest - 40 / 20 steps">Slow<span class="sub"></span></button>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-ghost" id="undo-btn" onclick="undo()" disabled title="Undo (⌘Z)"><i class="fa-solid fa-rotate-left"></i> Undo</button>
+          <button class="btn-ghost" id="redo-btn" onclick="redo()" disabled title="Redo (⇧⌘Z)"><i class="fa-solid fa-rotate-right"></i> Redo</button>
+          <button class="btn-ghost" onclick="clearMarkers()"><i class="fa-solid fa-xmark"></i> Clear all</button>
+          <button class="btn-primary" id="generate-btn" onclick="startReconstruct()" disabled>
+            Generate 3D <i class="fa-solid fa-arrow-right"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Step 3 : Progress ───────────────────────────────────────────── -->
+  <div class="card" id="progress-card">
+    <div class="card-title">Step 3 - Reconstructing…</div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <div id="progress-msg">Initialising pipeline…</div>
+    <div id="progress-time">
+      <span id="elapsed-time">Elapsed 0:00</span>
+      <span id="eta-time"></span>
+    </div>
+    <div class="recon-preview" id="recon-preview">
+      <img id="recon-mask-img" alt="segmentation mask" />
+      <div class="shimmer"></div>
+    </div>
+  </div>
+
+  <!-- ─── Step 4 : Result ─────────────────────────────────────────────── -->
+  <div class="card" id="result-card">
+    <div class="result-head">
+      <div class="card-title" style="margin-bottom:0">Result - 3D Object</div>
+      <div class="result-toolbar">
+        <button class="btn-secondary" onclick="toggleTools()"><i class="fa-solid fa-sliders"></i> Tools</button>
+        <button id="download-open-btn" class="btn-primary" style="display:none" onclick="openExport()"><i class="fa-solid fa-download"></i> Download</button>
+      </div>
+    </div>
+    <div id="result-time"></div>
+
+    <div id="result-stage">
+      <model-viewer id="viewer"
+        auto-rotate
+        camera-controls
+        shadow-intensity="1"
+        ar
+        ar-modes="webxr scene-viewer quick-look">
+      </model-viewer>
+
+      <!-- Interactive stencil-erase 3D stage (shown only while editing). -->
+      <div id="eraser-stage">
+        <div id="eraser-host"></div>
+        <div id="eraser-status" class="tune-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Tools overlay sidebar (mesh · color · stencil eraser) ───────── -->
+  <aside id="tools-sidebar" aria-hidden="true">
+    <div class="tools-head">
+      <h2><i class="fa-solid fa-sliders"></i> Tools</h2>
+      <button class="tools-close" onclick="closeTools()" aria-label="Close tools"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="tools-body">
+      <div class="tool-group">
+        <h3>Mesh</h3>
+        <div class="tune-row">
+          <label for="holefill-slider">Fill holes</label>
+          <span id="holefill-val">off</span>
+        </div>
+        <input type="range" id="holefill-slider" min="0" max="20000" step="50" value="2000"
+               oninput="onHoleFill(this.value)" disabled />
+        <div class="tune-row">
+          <label for="edgetrim-slider">Trim stretched edges</label>
+          <span id="edgetrim-val">off</span>
+        </div>
+        <input type="range" id="edgetrim-slider" min="0" max="100" step="1" value="0"
+               oninput="onEdgeTrim(this.value)" disabled />
+        <div class="tune-row">
+          <label for="smooth-slider">Sand / smooth</label>
+          <span id="smooth-val">off</span>
+        </div>
+        <input type="range" id="smooth-slider" min="0" max="60" step="1" value="0"
+               oninput="onSmooth(this.value)" disabled />
+        <div class="tune-row">
+          <label for="cutfillet-slider">Cut fillet (border radius)</label>
+          <span id="cutfillet-val">flat</span>
+        </div>
+        <input type="range" id="cutfillet-slider" min="0" max="90" step="1" value="0"
+               oninput="onCutFillet(this.value)" disabled />
+      </div>
+
+      <div class="tool-group">
+        <h3>Color</h3>
+        <div class="tune-row">
+          <label for="saturation-slider">Saturation</label>
+          <span id="saturation-val">off</span>
+        </div>
+        <input type="range" id="saturation-slider" min="0" max="200" step="1" value="100"
+               oninput="onSaturation(this.value)" disabled />
+        <div class="tune-row">
+          <label for="contrast-slider">Contrast</label>
+          <span id="contrast-val">off</span>
+        </div>
+        <input type="range" id="contrast-slider" min="50" max="200" step="1" value="100"
+               oninput="onContrast(this.value)" disabled />
+        <div class="tune-row">
+          <label for="brightness-slider">Brightness</label>
+          <span id="brightness-val">off</span>
+        </div>
+        <input type="range" id="brightness-slider" min="50" max="200" step="1" value="100"
+               oninput="onBrightness(this.value)" disabled />
+      </div>
+
+      <div id="holefill-status" class="tune-status"></div>
+
+      <div class="tool-group disabled" id="stencil-group">
+        <h3>Stencil eraser</h3>
+        <p class="tool-hint">Drag a shape onto the model - the 3D editor opens automatically. Then move / rotate / scale it; anything inside is erased.</p>
+        <div id="eraser-palette">
+          <div class="stencil-chip" draggable="true" data-shape="box"><i class="fa-solid fa-cube"></i><span>Box</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="roundedbox"><i class="fa-solid fa-square"></i><span>Rounded</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="sphere"><i class="fa-solid fa-circle"></i><span>Sphere</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="cylinder"><i class="fa-solid fa-database"></i><span>Cylinder</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="capsule"><i class="fa-solid fa-capsules"></i><span>Capsule</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="cone"><i class="fa-solid fa-caret-up"></i><span>Cone</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="wedge"><i class="fa-solid fa-play fa-rotate-270"></i><span>Wedge</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="torus"><i class="fa-solid fa-ring"></i><span>Torus</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="slab"><i class="fa-solid fa-window-minimize"></i><span>Slab</span></div>
+          <div class="stencil-chip" draggable="true" data-shape="plane"><i class="fa-solid fa-scissors"></i><span>Plane cut</span></div>
+        </div>
+        <div class="tool-btn-row">
+          <button id="er-move"   class="btn-secondary active"><i class="fa-solid fa-up-down-left-right"></i> Move</button>
+          <button id="er-rotate" class="btn-secondary"><i class="fa-solid fa-rotate"></i> Rotate</button>
+          <button id="er-scale"  class="btn-secondary"><i class="fa-solid fa-maximize"></i> Scale</button>
+        </div>
+        <div class="tool-btn-row">
+          <button id="er-remove" class="btn-secondary"><i class="fa-solid fa-trash"></i> Remove</button>
+          <button id="er-clear"  class="btn-secondary"><i class="fa-solid fa-trash-can"></i> Clear all</button>
+        </div>
+        <div class="tool-btn-row">
+          <button id="er-done"   class="btn-primary"   style="display:none"><i class="fa-solid fa-check"></i> Done</button>
+          <button id="er-cancel" class="btn-secondary" style="display:none"><i class="fa-solid fa-xmark"></i> Cancel</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ─── Export overlay sidebar (formats · optimization) ──────────────── -->
+  <aside id="export-sidebar" aria-hidden="true">
+    <div class="tools-head">
+      <h2><i class="fa-solid fa-download"></i> Export</h2>
+      <button class="tools-close" onclick="closeExport()" aria-label="Close export"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="tools-body">
+      <div class="tool-group">
+        <h3>Optimization</h3>
+        <div class="tune-row">
+          <label for="opt-decimate">Simplify mesh</label>
+          <span id="opt-decimate-val">off</span>
+        </div>
+        <input type="range" id="opt-decimate" min="0" max="90" step="5" value="0" oninput="onExportOpt()" />
+        <div class="opt-row">
+          <label for="opt-texsize">Texture size</label>
+          <select id="opt-texsize" onchange="onExportOpt()">
+            <option value="512">512 px</option>
+            <option value="1024">1024 px</option>
+            <option value="2048" selected>2048 px</option>
+            <option value="4096">4096 px</option>
+          </select>
+        </div>
+        <div class="opt-row">
+          <label for="opt-texfmt">Texture format</label>
+          <select id="opt-texfmt" onchange="onExportOpt()">
+            <option value="jpeg" selected>JPEG (smaller)</option>
+            <option value="png">PNG (lossless)</option>
+          </select>
+        </div>
+        <div class="opt-row">
+          <label for="opt-bake">Bake texture</label>
+          <input type="checkbox" id="opt-bake" onchange="onExportOpt()" checked />
+        </div>
+        <p class="tool-hint">On: color lives in a texture → shows in macOS Quick&nbsp;Look / Preview (larger file). Off: per-vertex color like the SAM export → much smaller (~5&nbsp;MB), shows in model-viewer / three.js / Blender but gray in Quick&nbsp;Look.</p>
+        <div class="opt-row">
+          <label for="opt-compress">Meshopt compress</label>
+          <input type="checkbox" id="opt-compress" onchange="onExportOpt()" />
+        </div>
+        <p class="tool-hint">GLB only. Much smaller, but needs a modern viewer (model-viewer, three.js, Blender). Leave off for macOS Quick&nbsp;Look / Finder preview.</p>
+        <p class="tool-hint" id="opt-counts">-</p>
+      </div>
+
+      <div class="tool-group">
+        <h3>Format</h3>
+        <div id="format-list"></div>
+        <div id="export-progress" class="export-progress" hidden>
+          <div class="export-progress-bar"><div class="export-progress-fill" id="export-progress-fill"></div></div>
+          <div class="export-progress-label" id="export-progress-label">Preparing…</div>
+        </div>
+        <div id="export-status" class="tune-status"></div>
+      </div>
+
+      <div class="tool-group">
+        <h3>Functional parts</h3>
+        <p class="tool-hint">Split the model into separate named objects (e.g. tyres / glass / body, cushion / frame) by <b>color</b> - the most reliable cue - so downstream tools can recolor and texture each part on its own. Runs on the server and downloads a multi-object GLB with the same accurate per-vertex color as the single-file download. Does not change the model above.</p>
+        <div class="opt-row">
+          <label for="opt-parts-density">Parts</label>
+          <select id="opt-parts-density">
+            <option value="3">3 colors</option>
+            <option value="4">4 colors</option>
+            <option value="6" selected>6 colors</option>
+            <option value="8">8 colors</option>
+            <option value="10">10 colors</option>
+          </select>
+        </div>
+        <div id="parts-list"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ─── Models overlay sidebar (download / load status) ─────────────── -->
+  <aside id="models-sidebar" aria-hidden="true">
+    <div class="tools-head">
+      <h2><i class="fa-solid fa-microchip"></i> Models</h2>
+      <button class="tools-close" onclick="closeModels()" aria-label="Close models"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="tools-body">
+      <div class="tool-group">
+        <p class="tool-hint">Status of the three models this app uses. <span style="color:#34d399">Loaded</span> = in memory, <span style="color:#60a5fa">Downloaded</span> = on disk, <span style="color:#f87171">Missing</span> = not downloaded yet.</p>
+
+        <div id="models-status" class="loading">Loading…</div>
+        <div class="tool-btn-row">
+          <button class="btn-secondary" onclick="loadModelsStatus()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ─── Live RAM graph ─────────────────────────────────────────────────── -->
+  <div class="card" id="ram-card">
+    <div class="card-title">Memory usage</div>
+    <div class="ram-head">
+      <span>Process RSS <b id="ram-current">0.0 GB</b> · peak <span class="ram-peak" id="ram-peak">0.0 GB</span></span>
+      <span id="ram-total"></span>
+    </div>
+    <canvas id="ram-canvas"></canvas>
+  </div>
+
+  <!-- ─── Console ────────────────────────────────────────────────────────── -->
+  <div class="card" id="console-card">
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Console</span>
+      <button class="btn-ghost" style="padding:4px 10px;font-size:0.75rem" onclick="clearConsole()">Clear</button>
+    </div>
+    <div id="console-output"></div>
+  </div>
+
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+let imageId   = null;
+let imgW = 0, imgH = 0;          // natural image dimensions
+let markers   = [];              // [{x,y,label}]  label: 1=pos, 0=neg
+let lastMaskB64 = null;
+let resultJobId = null;          // job id of the finished reconstruction (for post-processing)
+let qualitySteps = { s1: 8, s2: 8 };   // Fast preset (stage1 / stage2 inference steps)
+
+function setQuality(btn) {
+  qualitySteps = { s1: +btn.dataset.s1, s2: +btn.dataset.s2 };
+  document.querySelectorAll("#quality-seg button")
+    .forEach(b => b.classList.toggle("active", b === btn));
+}
+
+function qualityLabel() {
+  const { s1, s2 } = qualitySteps;
+  if (s1 <= 8)  return "Fast";
+  if (s1 <= 25) return "Medium";
+  return "Slow";
+}
+
+// ── Timing / ETA ──────────────────────────────────────────────────────────────
+let _timerStart = 0;      // ms epoch when reconstruction started
+let _timerId    = null;   // setInterval handle for the live elapsed clock
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Seed estimates (seconds) shown before any real run has been measured on this
+// machine. Derived from a fixed-overhead + per-step model:
+//   ~60s overhead + ~5s per inference step across both stages.
+//   Fast 8/8 = 16 steps, Medium 25/12 = 37, Slow 40/20 = 60.
+const SEED_ESTIMATES = {
+  "8_8":   140,   // ~2:20
+  "25_12": 245,   // ~4:05
+  "40_20": 360,   // ~6:00
+};
+
+// Persisted per-preset timings. Each entry is { sec, measured }.
+//   measured=false → still a seed estimate; measured=true → from a real run.
+function loadEstTimes() {
+  try { return JSON.parse(localStorage.getItem("estTimes") || "{}"); }
+  catch { return {}; }
+}
+
+// On first load, seed localStorage with the estimates so the UI shows concrete
+// numbers immediately. Seeds never overwrite already-measured values.
+function seedEstTimes() {
+  const t = loadEstTimes();
+  let changed = false;
+  for (const [k, sec] of Object.entries(SEED_ESTIMATES)) {
+    if (t[k] === undefined) { t[k] = { sec, measured: false }; changed = true; }
+  }
+  if (changed) localStorage.setItem("estTimes", JSON.stringify(t));
+}
+
+function saveEstTime(key, seconds) {
+  const t = loadEstTimes();
+  const prev = t[key];
+  if (prev && prev.measured) {
+    // Blend real runs with an exponential moving average so the estimate
+    // adapts to this machine while staying stable across runs.
+    t[key] = { sec: Math.round(prev.sec * 0.6 + seconds * 0.4), measured: true };
+  } else {
+    // First real run replaces the seed estimate outright.
+    t[key] = { sec: Math.round(seconds), measured: true };
+  }
+  localStorage.setItem("estTimes", JSON.stringify(t));
+}
+
+// Fit a linear model  sec = a + b*totalSteps  from the presets that have real
+// measurements, so any un-measured preset is extrapolated from actual data on
+// this machine. Falls back to the seed model (60s + 5s/step) when nothing has
+// been measured yet.
+function fitModel() {
+  const t = loadEstTimes();
+  const pts = [];
+  for (const [k, e] of Object.entries(t)) {
+    if (!e || !e.measured || typeof e.sec !== "number") continue;
+    const [s1, s2] = k.split("_").map(Number);
+    pts.push([s1 + s2, e.sec]);
+  }
+  if (pts.length === 0) return { a: 60, b: 5 };          // seed model
+  if (pts.length === 1) {                                 // anchor the seed slope
+    const [x, y] = pts[0];
+    return { a: y - 5 * x, b: 5 };
+  }
+  let n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;   // least-squares fit
+  for (const [x, y] of pts) { sx += x; sy += y; sxx += x * x; sxy += x * y; }
+  const denom = n * sxx - sx * sx;
+  if (denom === 0) return { a: sy / n, b: 0 };
+  const b = (n * sxy - sx * sy) / denom;
+  const a = (sy - b * sx) / n;
+  return { a, b };
+}
+
+// Estimate total runtime for a preset. A measured preset uses its own recorded
+// time; anything else is extrapolated from the fitted model.
+function estimateSeconds(s1, s2) {
+  const entry = loadEstTimes()[`${s1}_${s2}`];
+  if (entry && entry.measured && typeof entry.sec === "number") return entry.sec;
+  const { a, b } = fitModel();
+  return Math.max(1, a + b * (s1 + s2));
+}
+
+// Fill each preset button's sub-label with its steps + current time estimate.
+function refreshPresetEstimates() {
+  document.querySelectorAll("#quality-seg button").forEach(b => {
+    const sec = estimateSeconds(+b.dataset.s1, +b.dataset.s2);
+    b.querySelector(".sub").textContent = `${b.dataset.steps} · ~${fmtDuration(sec)}`;
+  });
+}
+
+seedEstTimes();
+refreshPresetEstimates();
+
+const baseImg      = document.getElementById("base-img");
+const maskCanvas   = document.getElementById("mask-canvas");
+const markerCanvas = document.getElementById("marker-canvas");
+const maskCtx      = maskCanvas.getContext("2d");
+const markerCtx    = markerCanvas.getContext("2d");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload
+// ─────────────────────────────────────────────────────────────────────────────
+function onDragOver(e)  { e.preventDefault(); document.getElementById("drop-zone").classList.add("dragover"); }
+function onDragLeave(e) { document.getElementById("drop-zone").classList.remove("dragover"); }
+function onDrop(e) {
+  e.preventDefault();
+  onDragLeave(e);
+  const f = e.dataTransfer.files[0];
+  if (f) uploadFile(f);
+}
+function onFileInput(e) {
+  const f = e.target.files[0];
+  if (f) uploadFile(f);
+}
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const res  = await fetch("/upload", { method: "POST", body: fd });
+  const data = await res.json();
+  imageId = data.image_id;
+  imgW    = data.width;
+  imgH    = data.height;
+
+  // Fresh image → reset markers, mask and undo/redo history
+  markers = [];
+  lastMaskB64 = null;
+  resetHistory();
+  updatePointCount();
+  document.getElementById("generate-btn").disabled = true;
+
+  // Show image on canvas
+  const objectUrl = URL.createObjectURL(file);
+  baseImg.src = objectUrl;
+  baseImg.onload = () => {
+    // Reveal the card FIRST so the image has a rendered size, then sync canvas
+    document.getElementById("step-upload").classList.add("hidden");
+    document.getElementById("step-annotate").classList.remove("hidden");
+    requestAnimationFrame(() => syncCanvasSize());
+  };
+}
+
+// Displayed (layout) size of the image - NOT affected by the zoom transform,
+// so the canvas coordinate system stays stable while zooming/panning.
+function displaySize() {
+  return { w: baseImg.offsetWidth, h: baseImg.offsetHeight };
+}
+
+function syncCanvasSize() {
+  const { w, h } = displaySize();
+  const dpr  = window.devicePixelRatio || 1;
+  // physical pixels
+  maskCanvas.width   = markerCanvas.width   = Math.round(w * dpr);
+  maskCanvas.height  = markerCanvas.height  = Math.round(h * dpr);
+  maskCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  markerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  resetZoom();
+  redrawMarkers();
+}
+
+window.addEventListener("resize", () => { if (imageId) syncCanvasSize(); });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Marker interaction
+// ─────────────────────────────────────────────────────────────────────────────
+const workspace = document.getElementById("workspace");
+const viewport  = document.getElementById("viewport");
+
+// ── Zoom & pan ──
+let zoom = 1, panX = 0, panY = 0;
+const MIN_ZOOM = 1, MAX_ZOOM = 8;
+
+function applyTransform() {
+  workspace.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  workspace.classList.toggle("pannable", zoom > 1);
+  document.getElementById("zoom-level").textContent = Math.round(zoom * 100) + "%";
+}
+
+function clampPan() {
+  const { w, h } = displaySize();
+  const contentW = w * zoom, contentH = h * zoom;
+  const vpW = viewport.clientWidth, vpH = viewport.clientHeight;
+  panX = contentW <= vpW ? (vpW - contentW) / 2
+                         : Math.min(0, Math.max(vpW - contentW, panX));
+  panY = contentH <= vpH ? (vpH - contentH) / 2
+                         : Math.min(0, Math.max(vpH - contentH, panY));
+}
+
+// Zoom keeping the image point under (clientX, clientY) fixed on screen.
+function zoomAt(clientX, clientY, factor) {
+  const prev = zoom;
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+  if (zoom === prev) return;
+  const vpRect = viewport.getBoundingClientRect();
+  const ux = clientX - vpRect.left, uy = clientY - vpRect.top;
+  // image-space point under cursor stays put: pan = u - imgPt * zoom
+  panX = ux - ((ux - panX) / prev) * zoom;
+  panY = uy - ((uy - panY) / prev) * zoom;
+  clampPan();
+  applyTransform();
+}
+
+function zoomAtCenter(factor) {
+  const vpRect = viewport.getBoundingClientRect();
+  zoomAt(vpRect.left + viewport.clientWidth / 2,
+         vpRect.top  + viewport.clientHeight / 2, factor);
+}
+
+function resetZoom() {
+  zoom = 1; panX = 0; panY = 0;
+  clampPan();
+  applyTransform();
+}
+
+viewport.addEventListener("wheel", e => {
+  if (!imageId) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+// Drag to pan (when zoomed in). A tiny drag threshold distinguishes a pan from
+// a click so point placement still works.
+let panning = false, movedDist = 0, panStart = null, suppressClick = false;
+
+workspace.addEventListener("pointerdown", e => {
+  if (!imageId) return;
+  if (e.button !== 0 && e.button !== 1) return;   // left or middle only
+  panStart = { x: e.clientX, y: e.clientY, panX, panY };
+  movedDist = 0;
+  panning = (e.button === 1);   // middle button always pans
+});
+
+window.addEventListener("pointermove", e => {
+  if (!panStart) return;
+  const dx = e.clientX - panStart.x, dy = e.clientY - panStart.y;
+  movedDist = Math.hypot(dx, dy);
+  if (!panning && movedDist > 4 && zoom > 1) {
+    panning = true;
+    workspace.classList.add("panning");
+  }
+  if (panning) {
+    panX = panStart.panX + dx;
+    panY = panStart.panY + dy;
+    clampPan();
+    applyTransform();
+  }
+});
+
+window.addEventListener("pointerup", () => {
+  if (panning && movedDist > 4) suppressClick = true;   // don't drop a marker
+  panning = false;
+  panStart = null;
+  workspace.classList.remove("panning");
+});
+
+workspace.addEventListener("click",       e => addMarker(e, 1));
+workspace.addEventListener("contextmenu", e => { e.preventDefault(); addMarker(e, 0); });
+
+function canvasCoords(e) {
+  // getBoundingClientRect reflects the current zoom transform, so normalising
+  // by rect.width/height maps the click to natural image coordinates directly.
+  const rect = baseImg.getBoundingClientRect();
+  return {
+    nx: (e.clientX - rect.left) / rect.width  * imgW,
+    ny: (e.clientY - rect.top)  / rect.height * imgH,
+  };
+}
+
+async function addMarker(e, label) {
+  if (suppressClick) { suppressClick = false; return; }
+  const { nx, ny } = canvasCoords(e);
+  if (nx < 0 || ny < 0 || nx > imgW || ny > imgH) return;
+  pushHistory();
+  markers.push({ nx, ny, label });
+  await afterMarkersChange();
+}
+
+function clearMarkers() {
+  if (markers.length === 0) return;
+  pushHistory();
+  markers = [];
+  afterMarkersChange();
+}
+
+// ── Undo / redo ──
+let undoStack = [], redoStack = [];
+
+function pushHistory() {
+  undoStack.push(markers.slice());
+  redoStack = [];
+  updateHistoryButtons();
+}
+
+function resetHistory() {
+  undoStack = [];
+  redoStack = [];
+  updateHistoryButtons();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(markers.slice());
+  markers = undoStack.pop();
+  afterMarkersChange();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(markers.slice());
+  markers = redoStack.pop();
+  afterMarkersChange();
+}
+
+function updateHistoryButtons() {
+  document.getElementById("undo-btn").disabled = undoStack.length === 0;
+  document.getElementById("redo-btn").disabled = redoStack.length === 0;
+}
+
+// Redraw + refresh the mask whenever the marker set changes.
+async function afterMarkersChange() {
+  redrawMarkers();
+  updatePointCount();
+  updateHistoryButtons();
+  // In text (SAM 3) mode the mask comes from the concept prompt, not clicks -
+  // don't let stray point edits override it.
+  if (segMode === 'text') return;
+  const hasPos = markers.some(m => m.label === 1);
+  document.getElementById("generate-btn").disabled = !hasPos;
+  if (hasPos) {
+    await runSegment();
+  } else {
+    lastMaskB64 = null;
+    clearMask();
+  }
+}
+
+// Keyboard shortcuts: ⌘Z / Ctrl+Z = undo, ⇧⌘Z / Ctrl+Y = redo.
+window.addEventListener("keydown", e => {
+  if (!imageId || document.getElementById("step-annotate").classList.contains("hidden")) return;
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) return;
+  const key = e.key.toLowerCase();
+  if (key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if ((key === "z" && e.shiftKey) || key === "y") { e.preventDefault(); redo(); }
+});
+
+function updatePointCount() {
+  const pos = markers.filter(m => m.label === 1).length;
+  const neg = markers.filter(m => m.label === 0).length;
+  document.getElementById("point-count").textContent =
+    `${pos} positive · ${neg} negative`;
+}
+
+function redrawMarkers() {
+  const { w, h } = displaySize();
+  markerCtx.clearRect(0, 0, w, h);
+  for (const m of markers) {
+    const cx = m.nx / imgW * w;
+    const cy = m.ny / imgH * h;
+    markerCtx.beginPath();
+    markerCtx.arc(cx, cy, 7, 0, Math.PI * 2);
+    markerCtx.fillStyle   = m.label === 1 ? "#22c55e" : "#ef4444";
+    markerCtx.strokeStyle = "#fff";
+    markerCtx.lineWidth   = 2;
+    markerCtx.fill();
+    markerCtx.stroke();
+
+    // Plus / minus symbol
+    markerCtx.fillStyle = "#fff";
+    markerCtx.font = "bold 11px sans-serif";
+    markerCtx.textAlign = "center";
+    markerCtx.textBaseline = "middle";
+    markerCtx.fillText(m.label === 1 ? "+" : "−", cx, cy);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SAM segmentation
+// ─────────────────────────────────────────────────────────────────────────────
+let segmentController = null;
+
+// 'text' → SAM 3 concept prompt (default) · 'point' → SAM 2 click prompts
+let segMode = 'text';
+
+function setSegMode(mode) {
+  segMode = mode;
+  const p = document.getElementById('segmode-point');
+  const t = document.getElementById('segmode-text');
+  const w = document.getElementById('segtext-wrap');
+  const ph = document.getElementById('point-hints');
+  if (p) p.classList.toggle('active', mode === 'point');
+  if (t) t.classList.toggle('active', mode === 'text');
+  if (w) w.style.display = mode === 'text' ? 'flex' : 'none';
+  if (ph) ph.style.display = mode === 'text' ? 'none' : 'flex';
+  if (mode === 'text') {
+    const inp = document.getElementById('segtext-input');
+    if (inp) inp.focus();
+  }
+}
+
+async function runTextSegment() {
+  const inp  = document.getElementById('segtext-input');
+  const text = ((inp && inp.value) || '').trim();
+  const gen  = document.getElementById('generate-btn');
+  if (!imageId) return;
+  if (!text) { lastMaskB64 = null; clearMask(); if (gen) gen.disabled = true; return; }
+
+  if (segmentController) segmentController.abort();
+  segmentController = new AbortController();
+
+  const btn = document.getElementById('segtext-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Segmenting…'; }
+  try {
+    const res  = await fetch('/segment', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ image_id: imageId, positive_points: [], negative_points: [], text }),
+      signal:  segmentController.signal,
+    });
+    const data = await res.json();
+    lastMaskB64 = data.mask_b64 || null;
+    if (lastMaskB64) {
+      drawMask(lastMaskB64);
+      if (gen) gen.disabled = false;
+    } else {
+      clearMask();
+      if (gen) gen.disabled = true;
+      alert('SAM 3 found no “' + text + '” in the image. Try a different word.');
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') console.error('Text segment error:', err);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Segment'; }
+  }
+}
+
+async function runSegment() {
+  if (!imageId || markers.filter(m => m.label === 1).length === 0) {
+    clearMask(); return;
+  }
+
+  // Abort previous in-flight request
+  if (segmentController) segmentController.abort();
+  segmentController = new AbortController();
+
+  const body = {
+    image_id:        imageId,
+    positive_points: markers.filter(m => m.label === 1).map(m => ({ x: m.nx, y: m.ny })),
+    negative_points: markers.filter(m => m.label === 0).map(m => ({ x: m.nx, y: m.ny })),
+  };
+
+  try {
+    const res  = await fetch("/segment", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+      signal:  segmentController.signal,
+    });
+    const data = await res.json();
+    lastMaskB64 = data.mask_b64;
+    drawMask(lastMaskB64);
+  } catch (err) {
+    if (err.name !== "AbortError") console.error("Segment error:", err);
+  }
+}
+
+function clearMask() {
+  const { w, h } = displaySize();
+  maskCtx.clearRect(0, 0, w, h);
+}
+
+function drawMask(b64) {
+  const maskImg = new Image();
+  maskImg.src   = "data:image/png;base64," + b64;
+  maskImg.onload = () => {
+    const { w, h } = displaySize();
+    const dw   = Math.round(w);
+    const dh   = Math.round(h);
+
+    // Step 1: scale SAM mask (natural size) → display size on a temp canvas
+    const tmp  = document.createElement("canvas");
+    tmp.width  = dw;  tmp.height = dh;
+    const tc   = tmp.getContext("2d");
+    tc.drawImage(maskImg, 0, 0, dw, dh);
+    const src  = tc.getImageData(0, 0, dw, dh).data;
+
+    // Step 2: build tinted overlay in the same temp canvas.
+    // Use the mask's SOFT coverage (0-255) as the overlay alpha instead of a
+    // hard >127 test, so the tinted edge is anti-aliased and diagonal/curved
+    // boundaries don't show a sawtooth. src[i] is the (bilinearly downscaled)
+    // per-pixel coverage; scale the base overlay alpha by it.
+    const out  = tc.createImageData(dw, dh);
+    const od   = out.data;
+    for (let i = 0; i < src.length; i += 4) {
+      const cov = src[i] / 255;   // soft foreground coverage 0..1
+      if (cov > 0.003) {          // skip fully-background pixels
+        od[i]     = 46;
+        od[i + 1] = 55;
+        od[i + 2] = 123;
+        od[i + 3] = Math.round(185 * cov);   // α ≈ 0.65·coverage → AA edge
+      }
+    }
+    tc.putImageData(out, 0, 0);
+
+    // Step 3: blit tmp onto the DPR-scaled mask canvas via drawImage
+    // putImageData ignores the canvas transform; drawImage respects it.
+    maskCtx.clearRect(0, 0, dw, dh);
+    maskCtx.drawImage(tmp, 0, 0, dw, dh);
+    redrawMarkers();
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reconstruct
+// ─────────────────────────────────────────────────────────────────────────────
+async function startReconstruct() {
+  if (!imageId || !lastMaskB64) {
+    alert("Please click at least one positive point first.");
+    return;
+  }
+
+  // Switch to progress view
+  document.getElementById("step-annotate").classList.add("hidden");
+  document.getElementById("progress-card").style.display = "block";
+  // Show the segmentation mask in the preview slot while we reconstruct.
+  const rmi = document.getElementById("recon-mask-img");
+  if (rmi) rmi.src = lastMaskB64 ? "data:image/png;base64," + lastMaskB64 : "";
+  // Best-effort: upgrade the mask into a greyscale depth map (MoGe) once ready.
+  if (rmi && lastMaskB64) {
+    fetch("/depth", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ image_id: imageId, mask_b64: lastMaskB64 }),
+    })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d && d.depth_b64) rmi.src = "data:image/png;base64," + d.depth_b64; })
+      .catch(() => {});
+  }
+  setProgress(5, "Sending request…");
+  startTimer();
+  ramReset();
+
+  const body = { image_id: imageId, mask_b64: lastMaskB64,
+                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2 };
+  const res  = await fetch("/reconstruct", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(body),
+  });
+  const { job_id } = await res.json();
+
+  listenProgress(job_id);
+  openConsole();
+}
+
+function setProgress(pct, msg) {
+  document.getElementById("progress-fill").style.width = Math.max(0, pct) + "%";
+  document.getElementById("progress-msg").textContent  = msg;
+}
+
+function startTimer() {
+  _timerStart = Date.now();
+  const eta = estimateSeconds(qualitySteps.s1, qualitySteps.s2);
+  document.getElementById("eta-time").textContent = `· Est. ~${fmtDuration(eta)}`;
+  const tick = () => {
+    const elapsed = (Date.now() - _timerStart) / 1000;
+    document.getElementById("elapsed-time").textContent = `Elapsed ${fmtDuration(elapsed)}`;
+  };
+  tick();
+  if (_timerId) clearInterval(_timerId);
+  _timerId = setInterval(tick, 1000);
+}
+
+function stopTimer() {
+  if (_timerId) { clearInterval(_timerId); _timerId = null; }
+  return (Date.now() - _timerStart) / 1000;
+}
+
+function listenProgress(jobId) {
+  // The reconstruction can run for minutes (especially in CPU mode). If the Mac
+  // sleeps, the display sleeps, or macOS App Nap throttles a backgrounded tab,
+  // Chrome suspends the SSE socket (net::ERR_NETWORK_IO_SUSPENDED) and fires
+  // onerror. The job keeps running server-side and /status/{job_id} re-sends the
+  // current state (progress + done) on every connect, so we just reconnect and
+  // resume instead of giving up.
+  let es       = null;
+  let done     = false;
+  let retries  = 0;
+  let lastPct  = 0;
+  const MAX_RETRIES = 60;   // ~60 × 2s ≈ 2 min of retrying to ride out a sleep
+
+  function connect() {
+    es = new EventSource(`/status/${jobId}`);
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.ping) return;
+      retries = 0;   // any real message ⇒ healthy connection
+      // Live memory graph updates (streamed alongside progress events).
+      if (data.sys_total != null) ramSetTotal(data.sys_total);
+      if (Array.isArray(data.mem_series) && data.mem_series.length) ramSeed(data.mem_series);
+      if (data.mem) ramPush(data.mem);
+      if (data.peak != null) ramSetPeak(data.peak);
+      if (data.progress == null && data.done == null) return;   // pure mem tick
+      if (data.progress != null) lastPct = data.progress;
+      setProgress(data.progress, data.message);
+      if (data.done) {
+        done = true;
+        es.close();
+        if (data.message === "complete") {
+          const elapsed = stopTimer();
+          saveEstTime(`${qualitySteps.s1}_${qualitySteps.s2}`, elapsed);
+          refreshPresetEstimates();
+          showResult(jobId, elapsed);
+        } else {
+          // Error
+          stopTimer();
+          setProgress(0, "Error: " + data.message.replace("error: ", ""));
+        }
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      if (done) return;   // normal close after completion
+      if (retries++ >= MAX_RETRIES) {
+        stopTimer();
+        setProgress(0, "Connection lost. Please try again.");
+        return;
+      }
+      // Transient drop (sleep / App Nap / network blip). Keep the progress bar
+      // where it was and reconnect - the server resends state on reconnect.
+      setProgress(lastPct, "Reconnecting…");
+      setTimeout(connect, 2000);
+    };
+  }
+
+  connect();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live RAM graph
+// ─────────────────────────────────────────────────────────────────────────────
+let ramSeries   = [];     // [{t, rss, sys}]
+let ramSysTotal = 0;      // total physical RAM (GB), for the y-axis ceiling hint
+let ramPeak     = 0;      // peak process RSS (GB)
+
+function ramReset() {
+  ramSeries = [];
+  ramPeak   = 0;
+  const card = document.getElementById("ram-card");
+  if (card) card.style.display = "block";
+  ramSetPeak(0);
+  document.getElementById("ram-current").textContent = "0.0 GB";
+  ramDraw();
+}
+
+function ramSetTotal(gb) {
+  ramSysTotal = +gb || 0;
+  const el = document.getElementById("ram-total");
+  if (el) el.textContent = ramSysTotal ? `${ramSysTotal.toFixed(1)} GB total` : "";
+}
+
+function ramSetPeak(gb) {
+  ramPeak = Math.max(ramPeak, +gb || 0);
+  const el = document.getElementById("ram-peak");
+  if (el) el.textContent = `${ramPeak.toFixed(1)} GB`;
+}
+
+function ramSeed(series) {
+  // Replace history wholesale (used when (re)connecting to an in-flight job).
+  if (series.length <= ramSeries.length) return;
+  ramSeries = series.slice();
+  for (const p of ramSeries) ramSetPeak(p.rss);
+  ramUpdateReadout();
+  ramDraw();
+}
+
+function ramPush(point) {
+  ramSeries.push(point);
+  if (ramSeries.length > 5000) ramSeries.shift();
+  ramSetPeak(point.rss);
+  ramUpdateReadout();
+  ramDraw();
+}
+
+function ramUpdateReadout() {
+  const last = ramSeries[ramSeries.length - 1];
+  if (last) document.getElementById("ram-current").textContent = `${last.rss.toFixed(1)} GB`;
+}
+
+function ramDraw() {
+  const canvas = document.getElementById("ram-canvas");
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth  || 600;
+  const cssH = canvas.clientHeight || 160;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width  = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 40, padR = 10, padT = 10, padB = 18;
+  const plotW = Math.max(1, cssW - padL - padR);
+  const plotH = Math.max(1, cssH - padT - padB);
+
+  // Axis ranges.
+  const n = ramSeries.length;
+  const tMax = n ? Math.max(1, ramSeries[n - 1].t) : 1;
+  const yMax = Math.max(1, ramPeak * 1.15);
+
+  const xAt = (t) => padL + (t / tMax) * plotW;
+  const yAt = (v) => padT + plotH - (v / yMax) * plotH;
+
+  // Gridlines + y labels (GB).
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.strokeStyle = "#2e3247";
+  ctx.fillStyle   = "#64748b";
+  ctx.lineWidth   = 1;
+  const gridLines = 4;
+  for (let i = 0; i <= gridLines; i++) {
+    const v = (yMax / gridLines) * i;
+    const y = yAt(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.textAlign = "right";
+    ctx.fillText(v.toFixed(0), padL - 6, y);
+  }
+
+  if (n >= 1) {
+    // Filled area under the RSS curve.
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    grad.addColorStop(0, "rgba(91,110,245,0.35)");
+    grad.addColorStop(1, "rgba(91,110,245,0.02)");
+    ctx.beginPath();
+    ctx.moveTo(xAt(ramSeries[0].t), yAt(0));
+    for (const p of ramSeries) ctx.lineTo(xAt(p.t), yAt(p.rss));
+    ctx.lineTo(xAt(ramSeries[n - 1].t), yAt(0));
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // RSS line.
+    ctx.beginPath();
+    ctx.moveTo(xAt(ramSeries[0].t), yAt(ramSeries[0].rss));
+    for (const p of ramSeries) ctx.lineTo(xAt(p.t), yAt(p.rss));
+    ctx.strokeStyle = "#7c3aed";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // x-axis time label (seconds).
+  ctx.fillStyle = "#64748b";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(`${tMax.toFixed(0)}s`, padL + plotW, cssH - 5);
+  ctx.textAlign = "left";
+  ctx.fillText("0s", padL, cssH - 5);
+}
+
+window.addEventListener("resize", ramDraw);
+
+function showResult(jobId, elapsed) {
+  const url = `/result/${jobId}`;
+  resultJobId = jobId;
+  document.getElementById("progress-card").style.display = "none";
+  document.getElementById("result-card").style.display   = "block";
+  // Keep the memory graph visible alongside the finished model; redraw so the
+  // canvas picks up its now-laid-out width.
+  const ramCard = document.getElementById("ram-card");
+  if (ramCard) ramCard.style.display = "block";
+  ramDraw();
+  const rt = document.getElementById("result-time");
+  if (rt) {
+    rt.innerHTML = (elapsed != null)
+      ? `Generated in <b>${fmtDuration(elapsed)}</b> · ${qualityLabel()} quality (${qualitySteps.s1} / ${qualitySteps.s2} steps)`
+      : "";
+  }
+  document.getElementById("viewer").setAttribute("src", url);
+
+  // Prepare the client-side tuning tool; it auto-generates the tuned GLB export.
+  if (window.HoleTune) window.HoleTune.load(url);
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Console
+// ────────────────────────────────────────────────────────────────────────────────
+let _logEs  = null;
+
+function openConsole() {
+  const card = document.getElementById("console-card");
+  card.style.display = "block";
+
+  if (_logEs) { _logEs.close(); }
+  _logEs = new EventSource("/logs");
+  _logEs.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    appendConsole(data.line);
+  };
+}
+
+function appendConsole(line) {
+  const el   = document.getElementById("console-output");
+  const span = document.createElement("span");
+  const low  = line.toLowerCase();
+  if (low.includes("error") || low.includes("traceback")) span.className = "err";
+  else if (low.includes("warning") || low.includes("warn"))  span.className = "warn";
+  span.textContent = line + "\n";
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;  // auto-scroll
+}
+
+function clearConsole() {
+  document.getElementById("console-output").innerHTML = "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reset
+// ─────────────────────────────────────────────────────────────────────────────
+function restartApp() {
+   // is reconstructing? if so, abort the job
+    if (_timerId) {
+       if (!confirm("A reconstruction is in progress. Are you sure you want to restart?")) {
+         stopTimer();
+         return;
+       }
+    }
+    // Restart the app
+    location.reload();
+}
+</script>
+
+<!-- ────────────────────────────────────────────────────────────────────────────
+     Client-side mesh tuning (Three.js): load the generated GLB, fill open mesh
+     boundary loops up to a slider-controlled size, preview the result live in the
+     existing <model-viewer>, and export the tuned GLB entirely in the browser.
+──────────────────────────────────────────────────────────────────────────── -->
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader }   from "three/addons/loaders/GLTFLoader.js";
+import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+import { OBJExporter }  from "three/addons/exporters/OBJExporter.js";
+import { STLExporter }  from "three/addons/exporters/STLExporter.js";
+import { PLYExporter }  from "three/addons/exporters/PLYExporter.js";
+import { USDZExporter } from "three/addons/exporters/USDZExporter.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
+
+const WELD_EPS = 1e-5;                 // position quantisation for vertex welding
+const loader   = new GLTFLoader();
+
+let srcMesh    = null;                 // first mesh found in the loaded GLB
+let srcMaterial= null;                 // its material (reused for export)
+let allLoops   = [];                   // cached boundary loops (welded topology)
+let welded     = null;                 // cached welded working set
+let curThreshold = 0;                  // hole-fill: fill loops with ≤ this many edges
+let curTrim    = 0;                     // edge-trim slider value (0 = off … 100 = max)
+let curSmooth  = 0;                     // sanding: Taubin smoothing iterations (0 = off)
+let curCutFillet = 0.0;                 // stencil-cut seal: border-radius fillet (0 = flat clean cap)
+let curSat     = 1;                     // color grade: saturation factor (1 = off)
+let curContrast= 1;                     // color grade: contrast factor   (1 = off)
+let curBright  = 1;                     // color grade: brightness factor (1 = off)
+let killed     = new Set();             // welded face indices removed by the stencil eraser
+let bboxDiag   = 1;                     // model bounding-box diagonal (edge-trim scale)
+let curBlobURL = null;                 // object URL currently shown / exportable
+let debounceId = null;
+
+const $ = (id) => document.getElementById(id);
+
+// ── Welded working set: unique vertices + faces in welded index space ──────────
+function buildWorking(geometry) {
+  const pos   = geometry.getAttribute("position");
+  const col   = geometry.getAttribute("color");
+  const uv    = geometry.getAttribute("uv");
+  const index = geometry.getIndex();
+  const triCount = index ? index.count / 3 : pos.count / 3;
+  const getIdx   = (i) => (index ? index.getX(i) : i);
+
+  const map    = new Map();            // quantised-key -> uid
+  const remap  = new Int32Array(pos.count).fill(-1);
+  const uPos = [], uCol = col ? [] : null, uUv = uv ? [] : null;
+  const key  = (x, y, z) =>
+    Math.round(x / WELD_EPS) + "_" + Math.round(y / WELD_EPS) + "_" + Math.round(z / WELD_EPS);
+
+  function weld(vi) {
+    if (remap[vi] >= 0) return remap[vi];
+    const x = pos.getX(vi), y = pos.getY(vi), z = pos.getZ(vi);
+    const k = key(x, y, z);
+    let uid = map.get(k);
+    if (uid === undefined) {
+      uid = uPos.length / 3;
+      map.set(k, uid);
+      uPos.push(x, y, z);
+      if (uCol) uCol.push(col.getX(vi), col.getY(vi), col.getZ(vi));
+      if (uUv)  uUv.push(uv.getX(vi), uv.getY(vi));
+    }
+    remap[vi] = uid;
+    return uid;
+  }
+
+  const faces = [];
+  for (let f = 0; f < triCount; f++) {
+    const a = weld(getIdx(3 * f)), b = weld(getIdx(3 * f + 1)), c = weld(getIdx(3 * f + 2));
+    if (a === b || b === c || a === c) continue;      // drop degenerates
+    faces.push([a, b, c]);
+  }
+  return { uPos, uCol, uUv, faces };
+}
+
+// ── Boundary loops from welded faces (edges used by exactly one face) ──────────
+function findBoundaryLoops(faces) {
+  const ek = (a, b) => (a < b ? a + "_" + b : b + "_" + a);
+  const count = new Map();
+  for (const [a, b, c] of faces) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const k = ek(u, v);
+      count.set(k, (count.get(k) || 0) + 1);
+    }
+  }
+  // Reversed boundary half-edges form the hole loops (v->u for a face edge u->v).
+  const adj = new Map();               // start -> [ends]
+  for (const [a, b, c] of faces) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      if (count.get(ek(u, v)) === 1) {
+        if (!adj.has(v)) adj.set(v, []);
+        adj.get(v).push(u);
+      }
+    }
+  }
+  const loops = [];
+  for (const start of Array.from(adj.keys())) {
+    while (adj.get(start) && adj.get(start).length > 0) {
+      // Walk boundary half-edges, tracking the current path. If we revisit a
+      // vertex before returning to `start`, split off that closed sub-loop and
+      // keep tracing - this decomposes self-touching / pinched rims (common on
+      // big cuts) into clean simple loops instead of one tangled chain.
+      const path = [];
+      const pos = new Map();               // vertex -> index in current path
+      let cur = start, guard = 0;
+      while (guard++ < 2e6) {
+        if (pos.has(cur)) {
+          const from = pos.get(cur);
+          const cyc = path.splice(from);   // cyc[0] === cur
+          for (const v of cyc) pos.delete(v);
+          if (cyc.length >= 3) loops.push(cyc);
+        }
+        pos.set(cur, path.length);
+        path.push(cur);
+        const arr = adj.get(cur);
+        const nxt = arr && arr.length ? arr.pop() : undefined;
+        if (nxt === undefined) break;      // dead end (open chain - shouldn't occur when closed)
+        cur = nxt;
+      }
+      if (path.length >= 3) loops.push(path);
+    }
+  }
+  return loops;
+}
+
+// ── Edge-trim threshold (world units) for a slider value in (0,100] ────────────
+//    Higher slider ⇒ shorter threshold ⇒ more aggressive trimming.  Faces whose
+//    longest edge exceeds this are dropped (removes the stretched "rubber-sheet"
+//    triangles single-view reconstructions produce at depth discontinuities).
+function trimEdgeThreshold(trim) {
+  return bboxDiag * (0.003 + 0.30 * (1 - trim / 100));
+}
+
+// ── Taubin smoothing: alternating λ / μ Laplacian passes.  Sands off jagged
+//    reconstruction bumps without the shrinkage a plain Laplacian would cause. ──
+function taubinSmooth(pos, faces, iters) {
+  const n = pos.length / 3;
+  const adj = Array.from({ length: n }, () => new Set());
+  for (const [a, b, c] of faces) {
+    adj[a].add(b); adj[a].add(c);
+    adj[b].add(a); adj[b].add(c);
+    adj[c].add(a); adj[c].add(b);
+  }
+  const nbr = adj.map((s) => Array.from(s));
+  let P = Float64Array.from(pos);
+  const lambda = 0.5, mu = -0.53;       // μ slightly larger to counter shrinkage
+  const pass = (src, w) => {
+    const dst = new Float64Array(src.length);
+    for (let i = 0; i < n; i++) {
+      const a = nbr[i], k = a.length;
+      if (!k) { dst[3*i] = src[3*i]; dst[3*i+1] = src[3*i+1]; dst[3*i+2] = src[3*i+2]; continue; }
+      let x = 0, y = 0, z = 0;
+      for (const j of a) { x += src[3*j]; y += src[3*j+1]; z += src[3*j+2]; }
+      dst[3*i]   = src[3*i]   + w * (x / k - src[3*i]);
+      dst[3*i+1] = src[3*i+1] + w * (y / k - src[3*i+1]);
+      dst[3*i+2] = src[3*i+2] + w * (z / k - src[3*i+2]);
+    }
+    return dst;
+  };
+  for (let it = 0; it < iters; it++) { P = pass(P, lambda); P = pass(P, mu); }
+  return P;
+}
+
+// ── Boundary-edge set (edges used by exactly one face) ────────────────────────
+function boundaryEdgeSet(faces) {
+  const ek = (a, b) => (a < b ? a + "_" + b : b + "_" + a);
+  const count = new Map();
+  for (const [a, b, c] of faces) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const k = ek(u, v);
+      count.set(k, (count.get(k) || 0) + 1);
+    }
+  }
+  const s = new Set();
+  for (const [k, c] of count) if (c === 1) s.add(k);
+  return s;
+}
+
+// ── Newell-method average normal of a boundary loop ───────────────────────────
+function loopNormal(loop, P) {
+  let nx = 0, ny = 0, nz = 0;
+  const n = loop.length;
+  for (let i = 0; i < n; i++) {
+    const a = loop[i], b = loop[(i + 1) % n];
+    const ax = P[3*a], ay = P[3*a+1], az = P[3*a+2];
+    const bx = P[3*b], by = P[3*b+1], bz = P[3*b+2];
+    nx += (ay - by) * (az + bz);
+    ny += (az - bz) * (ax + bx);
+    nz += (ax - bx) * (ay + by);
+  }
+  const L = Math.hypot(nx, ny, nz) || 1;
+  return [nx / L, ny / L, nz / L];
+}
+
+// ── Ear-clip triangulation of a simple 2D polygon ─────────────────────────
+//    Returns triangles as index triples into `pts`. Fills only the polygon
+//    interior (respects concavities), so a cut cap follows the true outline
+//    instead of a centroid fan's radial "umbrella" spokes. Empty result signals a
+//    degenerate / self-intersecting projection so the caller can fall back.
+function triangulatePolygon2D(pts) {
+  const N = pts.length;
+  if (N < 3) return [];
+  const cross = (ax, ay, bx, by, cx, cy) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  let area = 0;
+  for (let i = 0; i < N; i++) { const a = pts[i], b = pts[(i + 1) % N]; area += a[0] * b[1] - b[0] * a[1]; }
+  const idx = [];
+  for (let i = 0; i < N; i++) idx.push(i);
+  if (area < 0) idx.reverse();                         // process counter-clockwise
+  const inTri = (ax, ay, bx, by, cx, cy, px, py) => {
+    const d1 = cross(ax, ay, bx, by, px, py);
+    const d2 = cross(bx, by, cx, cy, px, py);
+    const d3 = cross(cx, cy, ax, ay, px, py);
+    return !(((d1 < 0) || (d2 < 0) || (d3 < 0)) && ((d1 > 0) || (d2 > 0) || (d3 > 0)));
+  };
+  const tris = [];
+  let guard = 0;
+  while (idx.length > 3 && guard++ < 100000) {
+    let clipped = false;
+    for (let i = 0; i < idx.length; i++) {
+      const i0 = idx[(i - 1 + idx.length) % idx.length];
+      const i1 = idx[i];
+      const i2 = idx[(i + 1) % idx.length];
+      const a = pts[i0], b = pts[i1], c = pts[i2];
+      if (cross(a[0], a[1], b[0], b[1], c[0], c[1]) <= 0) continue;   // reflex/degenerate
+      let ear = true;
+      for (let j = 0; j < idx.length; j++) {
+        const vj = idx[j];
+        if (vj === i0 || vj === i1 || vj === i2) continue;
+        const p = pts[vj];
+        if (inTri(a[0], a[1], b[0], b[1], c[0], c[1], p[0], p[1])) { ear = false; break; }
+      }
+      if (!ear) continue;
+      tris.push([i0, i1, i2]);
+      idx.splice(i, 1);
+      clipped = true;
+      break;
+    }
+    if (!clipped) return [];   // no valid ear ⇒ self-intersecting/non-planar projection.
+                               // Signal the caller to use its watertight centroid-fan cap
+                               // instead of force-clipping into a mangled (open-looking) patch.
+  }
+  tris.push([idx[0], idx[1], idx[2]]);
+  return tris;
+}
+
+// ── Seal a boundary loop with a watertight, optionally rounded cap ────────────
+//    Optional quarter-circle "border-radius" rings roll the rim over, then the
+//    innermost ring is closed with an ear-clipped triangulation (no central hub,
+//    so no radial umbrella spokes). Ring 0 reuses the loop's own shared vertices
+//    so the patch welds seamlessly. Caps bulge away from the model centre.
+function sealLoopRounded(loop, outPos, outCol, outUv, outFaces, filletFrac, mc) {
+  const n = loop.length;
+  if (n < 3) return;
+  let cx = 0, cy = 0, cz = 0, cr = 0, cg = 0, cb = 0, cu = 0, cv = 0;
+  for (const vi of loop) {
+    cx += outPos[3*vi]; cy += outPos[3*vi+1]; cz += outPos[3*vi+2];
+    if (outCol) { cr += outCol[3*vi]; cg += outCol[3*vi+1]; cb += outCol[3*vi+2]; }
+    if (outUv)  { cu += outUv[2*vi]; cv += outUv[2*vi+1]; }
+  }
+  cx /= n; cy /= n; cz /= n;
+  if (outCol) { cr /= n; cg /= n; cb /= n; }
+  if (outUv)  { cu /= n; cv /= n; }
+
+  let R = 0;
+  for (const vi of loop) {
+    const dx = outPos[3*vi] - cx, dy = outPos[3*vi+1] - cy, dz = outPos[3*vi+2] - cz;
+    R += Math.hypot(dx, dy, dz);
+  }
+  R /= n || 1;
+
+  let [nx, ny, nz] = loopNormal(loop, outPos);
+  if ((cx - mc[0]) * nx + (cy - mc[1]) * ny + (cz - mc[2]) * nz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+
+  const r = Math.max(0, Math.min(0.9, filletFrac)) * R;   // border radius (world units)
+  const RINGS = r > 1e-9 ? 3 : 0;
+
+  const pushV = (x, y, z) => {
+    const id = outPos.length / 3;
+    outPos.push(x, y, z);
+    if (outCol) outCol.push(cr, cg, cb);
+    if (outUv)  outUv.push(cu, cv);
+    return id;
+  };
+
+  let prev = loop.slice();                 // ring 0 = shared loop verts → airtight seam
+  for (let k = 1; k <= RINGS; k++) {
+    const t  = k / (RINGS + 1);
+    const th = t * Math.PI / 2;            // quarter-circle fillet profile
+    const rad = R - r + r * Math.cos(th);  // radial distance from cap axis
+    const h   = r * Math.sin(th);          // rise along the outward normal
+    const ring = [];
+    for (let i = 0; i < n; i++) {
+      const vi = loop[i];
+      let dx = outPos[3*vi] - cx, dy = outPos[3*vi+1] - cy, dz = outPos[3*vi+2] - cz;
+      const dl = Math.hypot(dx, dy, dz) || 1; dx /= dl; dy /= dl; dz /= dl;
+      ring.push(pushV(cx + dx*rad + nx*h, cy + dy*rad + ny*h, cz + dz*rad + nz*h));
+    }
+    for (let i = 0; i < n; i++) {
+      const a = prev[i], b = prev[(i + 1) % n], c = ring[(i + 1) % n], d = ring[i];
+      outFaces.push([a, b, c], [a, c, d]);
+    }
+    prev = ring;
+  }
+
+  // Close the innermost ring with a clean ear-clipped cap on the loop plane.
+  let ux, uy, uz;
+  if (Math.abs(nx) <= Math.abs(ny) && Math.abs(nx) <= Math.abs(nz)) { ux = 0; uy = -nz; uz = ny; }
+  else if (Math.abs(ny) <= Math.abs(nz)) { ux = -nz; uy = 0; uz = nx; }
+  else { ux = -ny; uy = nx; uz = 0; }
+  const ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+  const vx = ny*uz - nz*uy, vy = nz*ux - nx*uz, vz = nx*uy - ny*ux;
+  const pts = prev.map((vi) => {
+    const dx = outPos[3*vi] - cx, dy = outPos[3*vi+1] - cy, dz = outPos[3*vi+2] - cz;
+    return [dx*ux + dy*uy + dz*uz, dx*vx + dy*vy + dz*vz];
+  });
+  const tris = triangulatePolygon2D(pts);
+  if (tris.length) {
+    for (const [a, b, c] of tris) outFaces.push([prev[a], prev[b], prev[c]]);
+  } else {
+    // Self-intersecting projection → centroid fan keeps it watertight as a fallback.
+    const apex = pushV(cx + nx*r, cy + ny*r, cz + nz*r);
+    for (let i = 0; i < prev.length; i++) outFaces.push([apex, prev[i], prev[(i + 1) % prev.length]]);
+  }
+}
+
+// ── Rebuild geometry: drop erased + over-stretched faces, fan-fill holes,
+//    then optionally Taubin-smooth ("sand") the surface. ────────────────────────
+// Per-vertex color grade applied to the linear RGB vertex colors in place.
+// Identity when saturation / contrast / brightness are all 1. Because both the
+// live preview (COLOR_0 GLB export) and the texture bake (which reads the same
+// vertex colors) route through buildTunedGeometry, grading here keeps the
+// downloaded texture WYSIWYG with the on-screen preview. Maths run in linear
+// space to match the bake shader, which sRGB-encodes only at the final step.
+function gradeColorsInPlace(col) {
+  if (!col || (curSat === 1 && curContrast === 1 && curBright === 1)) return col;
+  const s = curSat, k = curContrast, b = curBright;
+  const cl = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  for (let i = 0; i < col.length; i += 3) {
+    let r = col[i] * b, g = col[i + 1] * b, bl = col[i + 2] * b;
+    const l = 0.2126 * r + 0.7152 * g + 0.0722 * bl;   // Rec.709 luma
+    r  = l + (r  - l) * s;  g = l + (g - l) * s;  bl = l + (bl - l) * s;   // saturation
+    r  = 0.5 + (r  - 0.5) * k;  g = 0.5 + (g - 0.5) * k;  bl = 0.5 + (bl - 0.5) * k; // contrast
+    col[i] = cl(r); col[i + 1] = cl(g); col[i + 2] = cl(bl);
+  }
+  return col;
+}
+
+function filtersActive() {
+  return curSat !== 1 || curContrast !== 1 || curBright !== 1;
+}
+
+function buildTunedGeometry(threshold, trim) {
+  const { uPos, uCol, uUv, faces } = welded;
+
+  // 0. Drop faces the stencil eraser removed.
+  const baseFaces = killed.size ? faces.filter((_, i) => !killed.has(i)) : faces;
+
+  // 1. Trim faces whose longest edge is over the threshold.
+  let workFaces = baseFaces, trimmed = 0;
+  if (trim > 0) {
+    const thr2 = trimEdgeThreshold(trim) ** 2;
+    const e2 = (a, b) => {
+      const dx = uPos[3 * a] - uPos[3 * b];
+      const dy = uPos[3 * a + 1] - uPos[3 * b + 1];
+      const dz = uPos[3 * a + 2] - uPos[3 * b + 2];
+      return dx * dx + dy * dy + dz * dz;
+    };
+    workFaces = [];
+    for (const f of baseFaces) {
+      const [a, b, c] = f;
+      if (Math.max(e2(a, b), e2(b, c), e2(c, a)) <= thr2) workFaces.push(f);
+      else trimmed++;
+    }
+  }
+
+  // 2. Boundary loops (recompute whenever the face set changed).
+  const loops = (trim > 0 || killed.size) ? findBoundaryLoops(workFaces) : allLoops;
+
+  // 3. Copy attributes, then seal cuts / fan-fill every loop with ≤ threshold edges.
+  const outPos   = uPos.slice();
+  const outCol   = uCol ? uCol.slice() : null;
+  const outUv    = uUv ? uUv.slice() : null;
+  const outFaces = workFaces.slice();
+
+  // Model centre orients each cap's fillet outward.
+  let mcx = 0, mcy = 0, mcz = 0;
+  const vCount = uPos.length / 3;
+  for (let i = 0; i < vCount; i++) { mcx += uPos[3*i]; mcy += uPos[3*i+1]; mcz += uPos[3*i+2]; }
+  const mc = [mcx / (vCount || 1), mcy / (vCount || 1), mcz / (vCount || 1)];
+
+  let filled = 0;
+  for (const loop of loops) {
+    // Erasing means "make it airtight": seal every open boundary with a clean
+    // ear-clipped cap (the cut rim and any pre-existing openings alike).
+    if (killed.size) {
+      sealLoopRounded(loop, outPos, outCol, outUv, outFaces, curCutFillet, mc);
+      filled++;
+      continue;
+    }
+    if (threshold <= 0 || loop.length > threshold) continue;
+    // Ear-clipped cap (no central hub) reusing the rim's own vertex colors, so
+    // the fill blends smoothly instead of showing radial fan spokes.
+    sealLoopRounded(loop, outPos, outCol, outUv, outFaces, curCutFillet, mc);
+    filled++;
+  }
+
+  // 4. Sand the surface with Taubin smoothing (volume-preserving low-pass).
+  const finalPos = curSmooth > 0 ? taubinSmooth(outPos, outFaces, curSmooth) : outPos;
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(finalPos), 3));
+  if (outCol) { gradeColorsInPlace(outCol); g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(outCol), 3)); }
+  if (outUv)  g.setAttribute("uv",    new THREE.BufferAttribute(new Float32Array(outUv), 2));
+  const idx = new Uint32Array(outFaces.length * 3);
+  for (let i = 0; i < outFaces.length; i++) {
+    idx[3 * i] = outFaces[i][0]; idx[3 * i + 1] = outFaces[i][1]; idx[3 * i + 2] = outFaces[i][2];
+  }
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  // Smooth vertex normals so the freshly-sealed cut caps shade smoothly instead
+  // of showing large flat facets (matches the baked-export path, which also runs
+  // computeVertexNormals). The dense scanned body is unaffected visually.
+  g.computeVertexNormals();
+  return { geometry: g, filled, total: loops.length, trimmed };
+}
+
+// ── Export a mesh to a binary GLB Blob via GLTFExporter (baked-texture path) ───
+function meshToGLB(mesh) {
+  return new Promise((resolve, reject) => {
+    new GLTFExporter().parse(
+      mesh,
+      (buf) => resolve(new Blob([buf], { type: "model/gltf-binary" })),
+      (err) => reject(err),
+      { binary: true }
+    );
+  });
+}
+
+// ── GLB optimization (meshoptimizer + glTF-Transform) ─────────────────────────
+//   three.js' GLTFExporter writes raw, uncompressed float32 geometry, so a dense
+//   scanned mesh (~1M triangles) balloons to ~100 MB and the tiny embedded
+//   texture is invisible against it - which is why the "texture size" and
+//   "simplify" sliders never seemed to move the file size. We fix that with the
+//   same pipeline gltfpack uses: reindex (weld) → vertex-cache reorder →
+//   quantize → EXT_meshopt_compression. That shrinks geometry 5–20× and lets the
+//   texture/simplify controls actually matter.
+//
+//   Loaded lazily from a CDN so the rest of the app works offline; if the import
+//   fails we fall back to the uncompressed GLB rather than blocking the export.
+const GLTFX_VER   = "4.1.0";
+const MESHOPT_VER = "0.20.0";
+let _gltfTools = null;
+async function loadGltfTools() {
+  if (_gltfTools) return _gltfTools;
+  const depPin = `@gltf-transform/core@${GLTFX_VER}`;
+  const [core, functions, extensions, meshopt] = await Promise.all([
+    import(`https://esm.sh/@gltf-transform/core@${GLTFX_VER}`),
+    import(`https://esm.sh/@gltf-transform/functions@${GLTFX_VER}?deps=${depPin}`),
+    import(`https://esm.sh/@gltf-transform/extensions@${GLTFX_VER}?deps=${depPin}`),
+    import(`https://esm.sh/meshoptimizer@${MESHOPT_VER}`),
+  ]);
+  _gltfTools = { core, functions, extensions, meshopt };
+  return _gltfTools;
+}
+
+// meshoptimizer simplifier - reliable on million-triangle meshes (three.js'
+// SimplifyModifier is O(n²) and throws on large scans). Operates on the index
+// buffer only, so per-vertex positions/colors are preserved automatically.
+async function meshoptSimplify(indexArray, positions, removeFrac) {
+  const { meshopt } = await loadGltfTools();
+  const { MeshoptSimplifier } = meshopt;
+  await MeshoptSimplifier.ready;
+  const idx = indexArray instanceof Uint32Array ? indexArray : new Uint32Array(indexArray);
+  const pos = positions instanceof Float32Array ? positions : new Float32Array(positions);
+  const targetCount = Math.max(3, Math.floor((idx.length / 3) * (1 - removeFrac)) * 3);
+  // Allow more geometric error as the user asks for more removal.
+  const targetError = Math.min(0.05, 0.005 + removeFrac * 0.05);
+  const [newIndex] = MeshoptSimplifier.simplify(idx, pos, 3, targetCount, targetError);
+  return newIndex;
+}
+
+// Compress a raw GLB ArrayBuffer with EXT_meshopt_compression. Returns a new
+// ArrayBuffer (or the original on failure).
+async function optimizeGlbBuffer(rawBuffer) {
+  try {
+    const { core, functions, extensions, meshopt } = await loadGltfTools();
+    const { WebIO } = core;
+    const { EXTMeshoptCompression, ALL_EXTENSIONS } = extensions;
+    const { weld, dedup, prune, reorder, quantize } = functions;
+    const { MeshoptEncoder, MeshoptDecoder } = meshopt;
+    await Promise.all([MeshoptEncoder.ready, MeshoptDecoder.ready]);
+
+    // Register ALL extensions (not just meshopt): quantize() adds
+    // KHR_mesh_quantization, and if that extension isn't registered it gets
+    // silently dropped on write - leaving quantized integer positions/UVs with
+    // nothing telling the viewer to normalize them, which corrupts the geometry
+    // and breaks texture sampling (colors vanish). The meshopt encoder/decoder
+    // must also be registered as IO dependencies or writeBinary throws.
+    const io = new WebIO()
+      .registerExtensions(ALL_EXTENSIONS)
+      .registerDependencies({ "meshopt.encoder": MeshoptEncoder, "meshopt.decoder": MeshoptDecoder });
+    const doc = await io.readBinary(new Uint8Array(rawBuffer));
+
+    // The baked mesh has a unique UV per triangle (atlas), so no vertices can be
+    // welded - weld() then leaves it NON-indexed, and EXT_meshopt_compression on
+    // a non-indexed primitive renders as an empty model in most viewers. Give
+    // every primitive a trivial sequential index up front so meshopt encodes a
+    // proper indexed mesh.
+    for (const mesh of doc.getRoot().listMeshes()) {
+      for (const prim of mesh.listPrimitives()) {
+        if (!prim.getIndices()) {
+          const n = prim.getAttribute("POSITION").getCount();
+          const seq = new Uint32Array(n);
+          for (let i = 0; i < n; i++) seq[i] = i;
+          prim.setIndices(doc.createAccessor().setType("SCALAR").setArray(seq));
+        }
+      }
+    }
+
+    await doc.transform(
+      weld(),                                   // merge any exact-duplicate verts
+      dedup(),                                  // merge identical accessors/materials
+      // keepIndices: don't strip the (sequential) index - meshopt needs it, and a
+      // non-indexed compressed primitive renders empty. keepAttributes: keep
+      // COLOR_0 / UVs / textures.
+      prune({ keepAttributes: true, keepIndices: true }),
+      reorder({ encoder: MeshoptEncoder, target: "size" }),
+      quantize(),                               // 16/8-bit attributes (needs KHR_mesh_quantization)
+    );
+
+    doc.createExtension(EXTMeshoptCompression)
+      .setRequired(true)
+      .setEncoderOptions({ method: EXTMeshoptCompression.EncoderMethod.QUANTIZE });
+
+    const out = await io.writeBinary(doc);
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+  } catch (e) {
+    console.warn("GLB meshopt optimization unavailable, exporting uncompressed:", e);
+    return rawBuffer;
+  }
+}
+
+// ── Client-side vertex-color → texture bake ──────────────────────────────────
+//    Some PBR viewers (macOS Preview / Quick Look) ignore COLOR_0 and show the
+//    mesh untextured. This bakes the per-vertex colors into a real
+//    baseColorTexture so those viewers show color too. It runs entirely on the
+//    CPU (canvas 2D) - no off-screen WebGL, so it can never silently fail and
+//    emit a black texture. Each triangle owns one flat atlas cell colored by the
+//    sRGB average of its three vertex colors; every triangle's UVs point at that
+//    cell's centre, so there are no seams and nothing to dilate.
+//    Returns { geometry (non-indexed, atlas UVs), map (CanvasTexture) }.
+async function bakeVertexColorTexture(srcGeom, maxTex = 4096, format = "png") {
+  const geom = srcGeom.index ? srcGeom.toNonIndexed() : srcGeom.clone();
+  const pos = geom.getAttribute("position");
+  const col = geom.getAttribute("color");
+  if (!col) throw "mesh has no vertex colors to bake";
+  const T = pos.count / 3;                                 // triangle count
+
+  // One square cell per triangle in a grid atlas; the atlas edge tracks the
+  // requested texture size (min 2 px/triangle for very dense meshes).
+  const cols = Math.ceil(Math.sqrt(T));
+  const rows = Math.ceil(T / cols);
+  const cell = Math.max(2, Math.floor(maxTex / Math.max(cols, rows)));
+  const texW = cols * cell, texH = rows * cell;
+
+  // Linear COLOR_0 → sRGB byte (baseColorTexture is sampled as sRGB, so this
+  // decodes back to the same linear color the vertex-color path renders).
+  const l2s = (c) =>
+    c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(Math.max(c, 0), 1 / 2.4) - 0.055;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = texW; canvas.height = texH;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(texW, texH);
+  const px = img.data;
+
+  for (let t = 0; t < T; t++) {
+    const a = 3 * t, b = a + 1, c2 = a + 2;
+    const r = Math.round(l2s((col.getX(a) + col.getX(b) + col.getX(c2)) / 3) * 255);
+    const g = Math.round(l2s((col.getY(a) + col.getY(b) + col.getY(c2)) / 3) * 255);
+    const bl = Math.round(l2s((col.getZ(a) + col.getZ(b) + col.getZ(c2)) / 3) * 255);
+    const cx = (t % cols) * cell, cy = ((t / cols) | 0) * cell;
+    for (let y = 0; y < cell; y++) {
+      let o = ((cy + y) * texW + cx) * 4;
+      for (let x = 0; x < cell; x++) {
+        px[o] = r; px[o + 1] = g; px[o + 2] = bl; px[o + 3] = 255;
+        o += 4;
+      }
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // Every vertex of a triangle samples its cell centre - flat color, so exact
+  // position is irrelevant and flipY orientation cannot mis-sample.
+  const du = 1 / cols, dv = 1 / rows;
+  const uv = new Float32Array(T * 6);
+  for (let t = 0; t < T; t++) {
+    const ucx = (t % cols + 0.5) * du, ucy = ((t / cols | 0) + 0.5) * dv, o = t * 6;
+    uv[o] = ucx; uv[o + 1] = ucy;
+    uv[o + 2] = ucx; uv[o + 3] = ucy;
+    uv[o + 4] = ucx; uv[o + 5] = ucy;
+  }
+  geom.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+
+  const map = new THREE.CanvasTexture(canvas);
+  map.flipY = false;
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.minFilter = THREE.LinearFilter;
+  map.magFilter = THREE.LinearFilter;
+  map.generateMipmaps = false;
+  // Ask GLTFExporter to embed the atlas as JPEG (smaller) or PNG (lossless).
+  map.userData = { mimeType: format === "jpeg" ? "image/jpeg" : "image/png" };
+  map.needsUpdate = true;
+
+  return { geometry: geom, map, texW, texH };
+}
+
+// ── Stencil eraser ────────────────────────────────────────────────────────────
+//    Drag box / sphere / cylinder / capsule stencils into a live viewport, then
+//    move / rotate / scale them (three.js-editor style TransformControls gizmo).
+//    Every triangle whose centroid falls inside ANY stencil is erased.  The
+//    result is stored in `killed` (welded face indices) so the tuned/baked
+//    download picks it up with no other changes.
+const Eraser = {
+  renderer: null, scene: null, camera: null, controls: null, tcontrols: null,
+  mesh: null, geo: null, host: null, ready: false, raf: 0,
+  stencils: [], selected: null, snapshot: null,
+  centroids: null, faceCount: 0, bsphere: null, needRecompute: false,
+  ray: new THREE.Raycaster(), ndc: new THREE.Vector2(),
+
+  // Unit primitives; size is driven by object.scale, so one local-space test
+  // each works under arbitrary translate / rotate / (non-uniform) scale.
+  DEFS: {
+    box:      { geo: () => new THREE.BoxGeometry(1, 1, 1),
+                test: (x, y, z) => Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5 && Math.abs(z) <= 0.5 },
+    roundedbox: { geo: () => new RoundedBoxGeometry(1, 1, 1, 4, 0.18),
+                test: (x, y, z) => { const rr = 0.18, e = 0.5 - rr,
+                                     dx = Math.max(Math.abs(x) - e, 0),
+                                     dy = Math.max(Math.abs(y) - e, 0),
+                                     dz = Math.max(Math.abs(z) - e, 0);
+                                     return Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5 && Math.abs(z) <= 0.5 &&
+                                            dx * dx + dy * dy + dz * dz <= rr * rr; } },
+    sphere:   { geo: () => new THREE.SphereGeometry(0.5, 20, 14),
+                test: (x, y, z) => x * x + y * y + z * z <= 0.25 },
+    cylinder: { geo: () => new THREE.CylinderGeometry(0.5, 0.5, 1, 24),
+                test: (x, y, z) => (x * x + z * z) <= 0.25 && Math.abs(y) <= 0.5 },
+    capsule:  { geo: () => new THREE.CapsuleGeometry(0.35, 0.3, 6, 14),
+                test: (x, y, z) => { const a = 0.15, r = 0.35, dy = Math.max(-a, Math.min(a, y)), e = y - dy;
+                                     return x * x + e * e + z * z <= r * r; } },
+    cone:     { geo: () => new THREE.ConeGeometry(0.5, 1, 24),
+                test: (x, y, z) => { if (y < -0.5 || y > 0.5) return false;
+                                     const r = 0.5 * (0.5 - y); return x * x + z * z <= r * r; } },
+    // Right-triangle prism (ramp): solid below the y = -x diagonal, extruded in z.
+    wedge:    { geo: () => { const s = new THREE.Shape();
+                             s.moveTo(-0.5, -0.5); s.lineTo(-0.5, 0.5); s.lineTo(0.5, -0.5); s.closePath();
+                             const g = new THREE.ExtrudeGeometry(s, { depth: 1, bevelEnabled: false });
+                             g.translate(0, 0, -0.5); return g; },
+                test: (x, y, z) => Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5 && Math.abs(z) <= 0.5 && y <= -x },
+    // Ring in the xy-plane (axis = z): erase a circular band / bore a groove.
+    torus:    { geo: () => new THREE.TorusGeometry(0.35, 0.15, 12, 28),
+                test: (x, y, z) => { const q = Math.sqrt(x * x + y * y) - 0.35; return q * q + z * z <= 0.0225; } },
+    // Wide, thin planar cutter - scale it flat and sweep it to slice off bases,
+    // flatten a bottom, or cut the model along a plane.
+    slab:     { geo: () => new THREE.BoxGeometry(2, 0.12, 2),
+                test: (x, y, z) => Math.abs(x) <= 1 && Math.abs(y) <= 0.06 && Math.abs(z) <= 1 },
+    // Half-space: erases EVERYTHING below the plane (local y ≤ 0), unbounded in
+    // x / z. Orient it and everything on one side is removed - a clean flat cut.
+    plane:    { geo: () => { const g = new THREE.BoxGeometry(3, 0.02, 3);
+                             g.translate(0, 0.01, 0); return g; },   // sits on the cut plane
+                test: (x, y, z) => y <= 0 },
+  },
+
+  msg(t) { const s = $("eraser-status"); if (s) s.textContent = t; },
+
+  init() {
+    if (this.ready) return;
+    this.host = $("eraser-host");
+    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.host.appendChild(this.renderer.domElement);
+    this.renderer.domElement.style.display = "block";
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x111111);
+    this.camera = new THREE.PerspectiveCamera(45, 1, 0.001, 1000);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(1, 1, 1);
+    this.scene.add(dir);
+
+    this.tcontrols = new TransformControls(this.camera, this.renderer.domElement);
+    this.tcontrols.addEventListener("dragging-changed", (e) => { this.controls.enabled = !e.value; });
+    this.tcontrols.addEventListener("objectChange", () => { this.needRecompute = true; });
+    this.scene.add(this.tcontrols);            // three 0.160: TransformControls is an Object3D
+
+    const dom = this.renderer.domElement;
+    dom.addEventListener("pointerdown", (e) => this.onPick(e));
+    dom.addEventListener("dragover", (e) => { e.preventDefault(); });
+    dom.addEventListener("drop", (e) => this.onDrop(e));
+
+    $("er-move").addEventListener("click", () => this.setMode("translate"));
+    $("er-rotate").addEventListener("click", () => this.setMode("rotate"));
+    $("er-scale").addEventListener("click", () => this.setMode("scale"));
+    $("er-remove").addEventListener("click", () => this.removeSelected());
+    $("er-clear").addEventListener("click", () => this.clearAll());
+    $("er-done").addEventListener("click", () => this.close(true));
+    $("er-cancel").addEventListener("click", () => this.close(false));
+
+    window.addEventListener("keydown", (e) => {
+      if ($("eraser-stage").style.display === "none") return;
+      if (e.key === "w") this.setMode("translate");
+      else if (e.key === "e") this.setMode("rotate");
+      else if (e.key === "r") this.setMode("scale");
+      else if (e.key === "Delete" || e.key === "Backspace") this.removeSelected();
+    });
+
+    this.ready = true;
+  },
+
+  open() {
+    if (!welded) return;
+    this.init();
+    this.snapshot = new Set(killed);
+    killed = new Set();                        // stencils fully define erasure here
+    this.stencils = []; this.selected = null;
+    $("viewer").style.display = "none";
+    $("eraser-stage").style.display = "block";
+    openTools();
+    document.body.classList.add("editing-3d");   // shrink main so the stage clears the sidebar
+    setStencilEditing(true);
+    this.resize();
+    this.computeCentroids();
+    this.buildMesh(true);
+    this.setMode("translate");
+    this.msg("Drag a shape into the scene · select it, then Move / Rotate / Scale · everything inside is erased.");
+    const loop = () => {
+      this.raf = requestAnimationFrame(loop);
+      if (this.needRecompute) { this.needRecompute = false; this.recompute(); }
+      this.controls.update();
+      this.renderer.render(this.scene, this.camera);
+    };
+    cancelAnimationFrame(this.raf);
+    loop();
+    window.addEventListener("resize", this._onResize = () => this.resize());
+  },
+
+  close(applyChanges) {
+    cancelAnimationFrame(this.raf); this.raf = 0;
+    window.removeEventListener("resize", this._onResize);
+    if (applyChanges) this.recompute();        // make sure `killed` is final
+    else killed = new Set(this.snapshot);
+    this.tcontrols.detach();
+    for (const m of this.stencils) { this.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.stencils = []; this.selected = null;
+    $("eraser-stage").style.display = "none";
+    $("viewer").style.display = "";
+    document.body.classList.remove("editing-3d");
+    setStencilEditing(false);
+    if (applyChanges) apply();
+  },
+
+  resize() {
+    const w = this.host.clientWidth || 600, h = this.host.clientHeight || 520;
+    this.renderer.setSize(w, h);            // updateStyle=true → CSS-size the canvas so it can't overflow the host
+    this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
+  },
+
+  computeCentroids() {
+    const { uPos, faces } = welded;
+    const nF = faces.length; this.faceCount = nF;
+    const C = new Float32Array(nF * 3);
+    for (let i = 0; i < nF; i++) {
+      const f = faces[i], a = f[0], b = f[1], c = f[2];
+      C[3*i]   = (uPos[3*a]   + uPos[3*b]   + uPos[3*c])   / 3;
+      C[3*i+1] = (uPos[3*a+1] + uPos[3*b+1] + uPos[3*c+1]) / 3;
+      C[3*i+2] = (uPos[3*a+2] + uPos[3*b+2] + uPos[3*c+2]) / 3;
+    }
+    this.centroids = C;
+  },
+
+  buildMesh(frame) {
+    if (this.mesh) { this.scene.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh.material.dispose(); }
+    const { uPos, uCol } = welded;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(Float32Array.from(uPos), 3));
+    if (uCol) g.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(uCol), 3));
+    this.geo = g;
+    this.rebuildIndex();
+    g.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: !!uCol, metalness: 0, roughness: 1, side: THREE.DoubleSide,
+    });
+    this.mesh = new THREE.Mesh(g, mat);
+    this.scene.add(this.mesh);
+
+    if (frame) {
+      g.computeBoundingSphere();
+      const bs = g.boundingSphere; this.bsphere = bs;
+      this.controls.target.copy(bs.center);
+      const d = bs.radius * 2.6;
+      this.camera.near = bs.radius * 0.01; this.camera.far = bs.radius * 100;
+      this.camera.updateProjectionMatrix();
+      this.camera.position.set(bs.center.x, bs.center.y, bs.center.z + d);
+      this.controls.update();
+    }
+  },
+
+  rebuildIndex() {
+    const { faces } = welded, keep = [];
+    for (let i = 0; i < faces.length; i++) if (!killed.has(i)) keep.push(faces[i]);
+    const idx = new Uint32Array(keep.length * 3);
+    for (let i = 0; i < keep.length; i++) { idx[3*i] = keep[i][0]; idx[3*i+1] = keep[i][1]; idx[3*i+2] = keep[i][2]; }
+    this.geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    this.geo.index.needsUpdate = true;
+  },
+
+  recompute() {
+    const C = this.centroids, nF = this.faceCount;
+    const inv = this.stencils.map((m) => { m.updateMatrixWorld(); return m.matrixWorld.clone().invert(); });
+    const tests = this.stencils.map((m) => m.userData.test);
+    const v = new THREE.Vector3();
+    killed = new Set();
+    for (let i = 0; i < nF; i++) {
+      const cx = C[3*i], cy = C[3*i+1], cz = C[3*i+2];
+      for (let s = 0; s < inv.length; s++) {
+        v.set(cx, cy, cz).applyMatrix4(inv[s]);
+        if (tests[s](v.x, v.y, v.z)) { killed.add(i); break; }
+      }
+    }
+    this.rebuildIndex();
+    this.msg(`${this.stencils.length} stencil(s) · ${killed.size} triangles erased · Done to apply.`);
+  },
+
+  addStencil(type, pos) {
+    const def = this.DEFS[type]; if (!def) return;
+    const geo = def.geo();
+    const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color: 0xff4d6d, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide }));
+    m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: 0xff4d6d })));
+    m.userData.test = def.test;
+    m.scale.setScalar(this.bsphere ? this.bsphere.radius * 0.35 : 1);
+    if (pos) m.position.copy(pos);
+    else if (this.bsphere) m.position.copy(this.bsphere.center);
+    this.scene.add(m);
+    this.stencils.push(m);
+    this.selectStencil(m);
+    this.needRecompute = true;
+  },
+
+  // Drop over the editor canvas → place the stencil at the point under the
+  // cursor on the mesh (falls back to the orbit target when the ray misses).
+  onDrop(e) {
+    e.preventDefault(); e.stopPropagation();
+    const type = e.dataTransfer.getData("text/shape"); if (!type) return;
+    this.addStencil(type, this.pickPoint(e));
+  },
+
+  pickPoint(e) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(this.ndc, this.camera);
+    if (this.mesh) { const hit = this.ray.intersectObject(this.mesh, false); if (hit.length) return hit[0].point.clone(); }
+    return this.controls.target.clone();
+  },
+
+  onPick(e) {
+    if (this.tcontrols.dragging || this.tcontrols.axis) return;   // gizmo handled it
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(this.ndc, this.camera);
+    const hits = this.ray.intersectObjects(this.stencils, false);
+    if (hits.length) this.selectStencil(hits[0].object);
+    else this.deselect();
+  },
+
+  selectStencil(m) { this.selected = m; this.tcontrols.attach(m); },
+  deselect() { this.selected = null; this.tcontrols.detach(); },
+
+  removeSelected() {
+    if (!this.selected) return;
+    const i = this.stencils.indexOf(this.selected);
+    if (i >= 0) this.stencils.splice(i, 1);
+    this.tcontrols.detach();
+    this.scene.remove(this.selected);
+    this.selected.geometry.dispose(); this.selected.material.dispose();
+    this.selected = null;
+    this.needRecompute = true;
+  },
+
+  clearAll() {
+    this.tcontrols.detach();
+    for (const m of this.stencils) { this.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.stencils = []; this.selected = null;
+    this.needRecompute = true;
+  },
+
+  setMode(mode) {
+    this.tcontrols.setMode(mode);
+    for (const [id, mm] of [["er-move", "translate"], ["er-rotate", "rotate"], ["er-scale", "scale"]]) {
+      const b = $(id); if (b) b.classList.toggle("active", mm === mode);
+    }
+  },
+};
+// Dragging a stencil chip discovers the 3D editor: dropping it opens the editor
+// (if needed) and drops the shape in. Dropping over the live editor canvas is
+// handled by Eraser.onDrop (placed under the cursor); dropping anywhere else in
+// the document opens the editor and adds the shape at the model centre.
+function onStencilDrop(e) {
+  if (![...(e.dataTransfer?.types || [])].includes("text/shape")) return;
+  const stage = $("eraser-stage");
+  if (getComputedStyle(stage).display !== "none") return;  // editor open → its canvas handled the drop
+  e.preventDefault();
+  const type = e.dataTransfer.getData("text/shape");
+  if (!type || !welded) return;                            // nothing to edit yet
+  Eraser.open();
+  if (getComputedStyle(stage).display === "none") return;  // open bailed out
+  Eraser.addStencil(type, null);
+}
+(function wireStencilDrop() {
+  document.querySelectorAll("#eraser-palette [data-shape]").forEach((el) => {
+    el.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/shape", el.dataset.shape));
+  });
+  // Accept the drag anywhere so releasing over the drawer or the viewer both work.
+  document.addEventListener("dragover", (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes("text/shape")) e.preventDefault();
+  });
+  document.addEventListener("drop", onStencilDrop);
+})();
+
+// ── Tools overlay sidebar ──────────────────────────────────────────────────
+// Toggle the stencil section's Done / Cancel affordances while editing.
+function setStencilEditing(on) {
+  const done = $("er-done"), cancel = $("er-cancel");
+  if (done)    done.style.display    = on ? "" : "none";
+  if (cancel)  cancel.style.display  = on ? "" : "none";
+}
+function openTools() {
+  closeExport();
+  $("tools-sidebar").classList.add("open");
+  $("tools-sidebar").setAttribute("aria-hidden", "false");
+}
+function closeTools() {
+  // If the 3D stencil editor is active, cancel it so the model view returns.
+  const editing = $("er-cancel") && $("er-cancel").style.display !== "none";
+  if (editing) Eraser.close(false);
+  $("tools-sidebar").classList.remove("open");
+  $("tools-sidebar").setAttribute("aria-hidden", "true");
+}
+function toggleTools() {
+  $("tools-sidebar").classList.contains("open") ? closeTools() : openTools();
+}
+window.toggleTools = toggleTools;
+window.closeTools = closeTools;
+window.openTools = openTools;
+
+// ── Apply the current settings: rebuild, preview, and arm the tuned download ──
+async function apply() {
+  const status = $("holefill-status");
+  if (!welded) return;
+
+  if (curThreshold <= 0 && curTrim <= 0 && curSmooth <= 0 && killed.size === 0 && !filtersActive()) {
+    // Nothing tuned → show the pristine server GLB, no re-encode needed.
+    if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
+    $("viewer").setAttribute("src", window.HoleTune._srcURL);
+    const btn = $("download-open-btn");
+    if (btn) btn.style.display = "";
+    status.textContent = `${allLoops.length} open bound`
+      + (allLoops.length === 1 ? "y" : "ies") + " detected · move a slider to tune";
+    return;
+  }
+
+  status.textContent = "Processing…";
+  // Yield so the "Processing…" text paints before the (sync) rebuild.
+  await new Promise((r) => setTimeout(r, 0));
+
+  const { geometry, filled, total, trimmed } = buildTunedGeometry(curThreshold, curTrim);
+  const mat = srcMaterial ? srcMaterial.clone() : new THREE.MeshStandardMaterial();
+  if (geometry.getAttribute("color")) mat.vertexColors = true;
+  // glTF defaults to metallic 1.0, which renders as black in PBR viewers with no
+  // environment map, and any tinted baseColor multiplies the colors down. Force
+  // a neutral dielectric so the exported GLB reads correctly everywhere.
+  if (!mat.map) mat.color.set(0xffffff);
+  mat.metalness = 0;
+  mat.roughness = 0.8;
+  mat.side = THREE.DoubleSide;          // keep fresh patches visible regardless of winding
+  mat.needsUpdate = true;
+  const mesh = new THREE.Mesh(geometry, mat);
+
+  let blob;
+  try {
+    blob = await meshToGLB(mesh);
+  } catch (e) {
+    status.textContent = "Export failed: " + e;
+    return;
+  }
+  if (curBlobURL) URL.revokeObjectURL(curBlobURL);
+  curBlobURL = URL.createObjectURL(blob);
+  $("viewer").setAttribute("src", curBlobURL);
+
+  const btn = $("download-open-btn");
+  if (btn) btn.style.display = "";
+  const netFaces = geometry.index.count / 3 - welded.faces.length;
+  const parts = [];
+  if (curTrim > 0)      parts.push(`trimmed ${trimmed} faces`);
+  if (curThreshold > 0) parts.push(`filled ${filled}/${total} boundaries`);
+  parts.push(`${netFaces >= 0 ? "+" : ""}${netFaces} triangles`);
+  status.textContent = parts.join(" · ");
+}
+
+function scheduleApply() {
+  if (debounceId) clearTimeout(debounceId);
+  debounceId = setTimeout(apply, 180);
+}
+
+// ── Public bridge for the non-module UI code ───────────────────────────────────
+window.HoleTune = {
+  _srcURL: null,
+
+  async load(url) {
+    this.reset();
+    this._srcURL = url;
+    const slider = $("holefill-slider");
+    const status = $("holefill-status");
+    status.textContent = "Analysing mesh…";
+    let gltf;
+    try {
+      gltf = await loader.loadAsync(url);
+    } catch (e) {
+      status.textContent = "Could not load mesh for tuning: " + e;
+      return;
+    }
+    srcMesh = null;
+    gltf.scene.traverse((o) => { if (!srcMesh && o.isMesh) { srcMesh = o; } });
+    if (!srcMesh) { status.textContent = "No mesh found for tuning."; return; }
+
+    srcMaterial = srcMesh.material;
+    welded   = buildWorking(srcMesh.geometry);
+    allLoops = findBoundaryLoops(welded.faces);
+
+    // Bounding-box diagonal drives the edge-trim threshold.
+    const geo = srcMesh.geometry;
+    geo.computeBoundingBox();
+    bboxDiag = geo.boundingBox ? geo.boundingBox.getSize(new THREE.Vector3()).length() : 1;
+    if (!(bboxDiag > 0)) bboxDiag = 1;
+
+    const trimS = $("edgetrim-slider");
+    // Default the fill slider to its max ("all holes") so every opening - including
+    // the large top cut - is sealed watertight out of the box.
+    const fillMax = slider ? +slider.max : 20000;
+    if (slider) { slider.disabled = false; slider.value = fillMax; }
+    if (trimS)  { trimS.disabled  = false; trimS.value  = 0; }
+    const smS = $("smooth-slider");
+    if (smS) { smS.disabled = false; smS.value = 0; }
+    const cfS = $("cutfillet-slider");
+    if (cfS) { cfS.disabled = false; cfS.value = 0; }
+    const satS = $("saturation-slider"); if (satS) { satS.disabled = false; satS.value = 100; }
+    const conS = $("contrast-slider");   if (conS) { conS.disabled = false; conS.value = 100; }
+    const briS = $("brightness-slider"); if (briS) { briS.disabled = false; briS.value = 100; }
+    const sg = $("stencil-group"); if (sg) sg.classList.remove("disabled");
+    curThreshold = Infinity;            // fill every boundary loop by default
+    curTrim = 0;
+    curSmooth = 0;
+    curCutFillet = 0.0;
+    curSat = 1; curContrast = 1; curBright = 1;
+    killed = new Set();
+    const hv = $("holefill-val"); if (hv) hv.textContent = "all holes";
+    const ev = $("edgetrim-val"); if (ev) ev.textContent = "off";
+    const sv = $("smooth-val");   if (sv) sv.textContent = "off";
+    const cfv = $("cutfillet-val"); if (cfv) cfv.textContent = "flat";
+    const satv = $("saturation-val"); if (satv) satv.textContent = "off";
+    const conv = $("contrast-val");   if (conv) conv.textContent = "off";
+    const briv = $("brightness-val"); if (briv) briv.textContent = "off";
+    apply();                            // sets status + keeps pristine model shown
+  },
+
+  setThreshold(v) {
+    const sl = $("holefill-slider");
+    const max = sl ? +sl.max : 20000;
+    const val = +v;
+    curThreshold = val <= 0 ? 0 : (val >= max ? Infinity : val);
+    $("holefill-val").textContent =
+      curThreshold <= 0 ? "off"
+      : (curThreshold === Infinity ? "all holes" : `≤ ${val} edges`);
+    scheduleApply();
+  },
+
+  setEdgeTrim(v) {
+    curTrim = +v;
+    $("edgetrim-val").textContent = curTrim <= 0
+      ? "off"
+      : `> ${(trimEdgeThreshold(curTrim) / bboxDiag * 100).toFixed(1)}% size`;
+    scheduleApply();
+  },
+
+  setSmooth(v) {
+    curSmooth = +v;
+    $("smooth-val").textContent = curSmooth <= 0 ? "off" : `${curSmooth} pass${curSmooth === 1 ? "" : "es"}`;
+    scheduleApply();
+  },
+
+  setCutFillet(v) {
+    curCutFillet = Math.max(0, Math.min(90, +v)) / 100;
+    const el = $("cutfillet-val");
+    if (el) el.textContent = curCutFillet <= 0 ? "flat" : `radius ${Math.round(curCutFillet * 100)}%`;
+    scheduleApply();
+  },
+
+  setSaturation(v) {
+    curSat = Math.max(0, +v) / 100;
+    const el = $("saturation-val");
+    if (el) el.textContent = curSat === 1 ? "off" : `${Math.round(curSat * 100)}%`;
+    scheduleApply();
+  },
+
+  setContrast(v) {
+    curContrast = Math.max(0, +v) / 100;
+    const el = $("contrast-val");
+    if (el) el.textContent = curContrast === 1 ? "off" : `${Math.round(curContrast * 100)}%`;
+    scheduleApply();
+  },
+
+  setBrightness(v) {
+    curBright = Math.max(0, +v) / 100;
+    const el = $("brightness-val");
+    if (el) el.textContent = curBright === 1 ? "off" : `${Math.round(curBright * 100)}%`;
+    scheduleApply();
+  },
+
+  // Re-show the tuned mesh.
+  reapply() { if (welded) apply(); },
+
+  // Bake the current tuned vertex colors into a texture, then download the GLB.
+  // Baking is the default step before download: it produces a baseColorTexture
+  // (with normals) so macOS Preview / Quick Look render it in full color.
+  async downloadTuned() {
+    if (!welded) return;
+    const status = $("holefill-status");
+    status.textContent = "Baking texture… (this can take a few seconds)";
+    await new Promise((r) => setTimeout(r, 0));
+    let baked, blob;
+    try {
+      const { geometry } = buildTunedGeometry(curThreshold, curTrim);
+      baked = await bakeVertexColorTexture(geometry);
+      baked.geometry.deleteAttribute("color");            // texture now drives color
+      baked.geometry.computeVertexNormals();              // Quick Look renders normal-less meshes grey
+      const mat = new THREE.MeshStandardMaterial({
+        map: baked.map, color: 0xffffff, metalness: 0, roughness: 0.8, side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(baked.geometry, mat);
+      blob = await meshToGLB(mesh);
+    } catch (e) {
+      status.textContent = "Bake failed: " + e;
+      return;
+    }
+    if (curBlobURL) URL.revokeObjectURL(curBlobURL);
+    curBlobURL = URL.createObjectURL(blob);
+    $("viewer").setAttribute("src", curBlobURL);
+    const a = document.createElement("a");
+    a.href = curBlobURL;
+    a.download = "reconstruction_textured.glb";
+    document.body.appendChild(a); a.click(); a.remove();
+    status.textContent = `Baked ${baked.texW}×${baked.texH} texture · downloaded · renders in Preview/Quick Look`;
+  },
+
+  reset() {
+    if (curBlobURL) { URL.revokeObjectURL(curBlobURL); curBlobURL = null; }
+    srcMesh = null; srcMaterial = null; welded = null; allLoops = [];
+    curThreshold = 0; curTrim = 0; curSmooth = 0; bboxDiag = 1;
+    curSat = 1; curContrast = 1; curBright = 1;
+    killed = new Set();
+    const slider = $("holefill-slider");
+    if (slider) { slider.value = 0; slider.disabled = true; }
+    const trimS = $("edgetrim-slider");
+    if (trimS) { trimS.value = 0; trimS.disabled = true; }
+    const smS = $("smooth-slider");
+    if (smS) { smS.value = 0; smS.disabled = true; }
+    const cfS = $("cutfillet-slider");
+    if (cfS) { cfS.value = 0; cfS.disabled = true; }
+    const satS = $("saturation-slider"); if (satS) { satS.value = 100; satS.disabled = true; }
+    const conS = $("contrast-slider");   if (conS) { conS.value = 100; conS.disabled = true; }
+    const briS = $("brightness-slider"); if (briS) { briS.value = 100; briS.disabled = true; }
+    curCutFillet = 0.0;
+    const sg = $("stencil-group"); if (sg) sg.classList.add("disabled");
+    const val = $("holefill-val");    if (val) val.textContent = "off";
+    const tval = $("edgetrim-val");   if (tval) tval.textContent = "off";
+    const sval = $("smooth-val");     if (sval) sval.textContent = "off";
+    const cfval = $("cutfillet-val"); if (cfval) cfval.textContent = "flat";
+    const satv = $("saturation-val"); if (satv) satv.textContent = "off";
+    const conv = $("contrast-val");   if (conv) conv.textContent = "off";
+    const briv = $("brightness-val"); if (briv) briv.textContent = "off";
+    const st  = $("holefill-status"); if (st)  st.textContent = "";
+    const btn = $("download-open-btn"); if (btn) btn.style.display = "none";
+    closeExport();
+    setStencilEditing(false);
+  },
+};
+
+// ── Export sidebar (multi-format download + optimization) ─────────────────────
+//    Formats routed to their three.js exporter. `textured` formats carry the
+//    baked vertex-color atlas; geometry-only formats skip it.
+// `bake`: render per-vertex color into a UV texture atlas (baseColorTexture).
+// Required for GLB/glTF/USDZ because macOS Quick Look / Preview IGNORES COLOR_0
+// vertex colors and only paints from a texture - a vertex-color-only GLB shows
+// up gray there. The baked texture renders with color in Quick Look AND
+// model-viewer AND Blender. Mesh formats (PLY/OBJ) keep raw vertex colors.
+const EXPORT_FORMATS = [
+  { id: "glb",  name: "glTF Binary",      ext: "glb",  bake: true  },
+  { id: "gltf", name: "glTF (embedded)",  ext: "gltf", bake: true  },
+  { id: "usdz", name: "USDZ (AR)",        ext: "usdz", bake: true  },
+  { id: "ply",  name: "Stanford PLY",     ext: "ply",  bake: false },
+  { id: "obj",  name: "Wavefront OBJ",    ext: "obj",  bake: false },
+  { id: "stl",  name: "STL",              ext: "stl",  bake: false },
+];
+
+function fmtBytes(n) {
+  if (!isFinite(n) || n <= 0) return "-";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+// Atlas pixel dimensions for a triangle count + max texture edge. Mirrors the
+// exact formula in bakeVertexColorTexture so estimates track reality.
+function atlasDims(T, maxTex) {
+  const n = Math.max(1, T);
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const cell = Math.max(2, Math.floor(maxTex / Math.max(cols, rows)));
+  return { texW: cols * cell, texH: rows * cell };
+}
+
+// Base (pre-optimization) vertex / face counts of the current tuned mesh.
+function baseCounts() {
+  if (!welded) return { v0: 0, f0: 0 };
+  const { geometry } = buildTunedGeometry(curThreshold, curTrim);
+  const v0 = geometry.getAttribute("position").count;
+  const f0 = (geometry.index ? geometry.index.count : v0) / 3;
+  return { v0, f0 };
+}
+
+// Estimated embedded-texture bytes for the current size/format on T triangles.
+function estTextureBytes(T) {
+  const maxTex = +$("opt-texsize").value;
+  const { texW, texH } = atlasDims(T, maxTex);
+  const px = texW * texH;
+  // The atlas is ~half-filled color gradients over black padding; JPEG q0.9
+  // and PNG DEFLATE compress that to roughly these bytes-per-pixel.
+  const bpp = $("opt-texfmt").value === "jpeg" ? 0.42 : 1.35;
+  return Math.round(px * bpp);
+}
+
+// USDZ has no reliable vertex-color support, so it always bakes a texture.
+// GLB/glTF honour the "Bake texture" checkbox: off → compact per-vertex-color
+// export like the SAM server GLB; on → baked baseColorTexture for Quick Look.
+function bakeEnabled(id) {
+  if (id === "usdz") return true;
+  const cb = $("opt-bake");
+  return cb ? cb.checked : true;
+}
+
+// Per-format byte estimate. Baked formats bake a non-indexed atlas (3·T verts:
+// position+normal+UV = 32 B) plus a texture. When "Bake texture" is off, GLB/glTF
+// export a compact indexed vertex-color mesh like the SAM server GLB
+// (pos12+normal12+uint8 color4 = 28 B/vert + uint32 tri index). GLB geometry
+// carries a ~0.22 meshopt factor only when compression is enabled.
+function estBytes(fmt, T, nvIndexed, tex) {
+  const nvBaked = 3 * T;
+  const compress = !!($("opt-compress") && $("opt-compress").checked);
+  const vcGeo = nvIndexed * 28 + T * 12;                           // indexed vertex-color geometry
+  switch (fmt.id) {
+    case "glb":
+      return bakeEnabled("glb")
+        ? 12 + 2200 + nvBaked * 32 * (compress ? 0.22 : 1) + tex    // baked atlas + texture
+        : 12 + 1400 + vcGeo * (compress ? 0.22 : 1);                // compact vertex color
+    case "gltf":
+      return bakeEnabled("gltf")
+        ? 3200 + (nvBaked * 32 + tex) * 1.34
+        : 2400 + vcGeo * 1.34;
+    case "usdz": return 8192 + nvBaked * 40 + tex;                 // usda float arrays + baked texture
+    case "ply":  return 320 + nvIndexed * 27 + T * 13;             // pos+normal+color verts + faces
+    case "obj":  return 40 + nvIndexed * 50 + T * 20;              // v / vn / f text lines
+    case "stl":  return 84 + T * 50;                               // exact binary STL
+    default:     return 0;
+  }
+}
+
+function onExportOpt() {
+  const d = +$("opt-decimate").value;
+  const dv = $("opt-decimate-val");
+  if (dv) dv.textContent = d === 0 ? "off" : `−${d}%`;
+  const keep = 1 - d / 100;
+  const { v0, f0 } = baseCounts();
+  const T = Math.max(1, Math.round(f0 * keep));
+  const nvIndexed = d > 0 ? 3 * T : v0;   // decimation de-indexes the mesh
+  const counts = $("opt-counts");
+  if (counts) counts.textContent =
+    `≈ ${Math.round(v0 * keep).toLocaleString()} verts · ${T.toLocaleString()} faces`;
+  const tex = estTextureBytes(T);
+  for (const fmt of EXPORT_FORMATS) {
+    const el = $("size-" + fmt.id);
+    if (el) el.textContent = "~" + fmtBytes(estBytes(fmt, T, nvIndexed, fmt.bake ? tex : 0));
+  }
+}
+
+function renderFormatList() {
+  const host = $("format-list");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const fmt of EXPORT_FORMATS) {
+    const card = document.createElement("div");
+    card.className = "fmt-card";
+    card.id = "fmt-" + fmt.id;
+    card.onclick = () => runExport(fmt.id);
+    card.innerHTML =
+      `<div class="fmt-meta"><span class="fmt-name">${fmt.name}</span>` +
+      `<span class="fmt-ext">.${fmt.ext}</span></div>` +
+      `<span class="fmt-size" id="size-${fmt.id}">-</span>`;
+    host.appendChild(card);
+  }
+}
+
+function renderPartsCard() {
+  const host = $("parts-list");
+  if (!host) return;
+  host.innerHTML = "";
+  const card = document.createElement("div");
+  card.className = "fmt-card";
+  card.id = "fmt-parts";
+  card.onclick = () => runSegmentParts();
+  card.innerHTML =
+    `<div class="fmt-meta"><span class="fmt-name">Segment parts</span>` +
+    `<span class="fmt-ext">.glb</span></div>` +
+    `<span class="fmt-size" id="size-parts">multi-object</span>`;
+  host.appendChild(card);
+}
+
+// Server-side post-processing: split the reconstructed mesh into functional
+// parts (named GLB objects) and download the result. Independent of the
+// client-side format exports above; leaves the previewed model untouched.
+async function runSegmentParts() {
+  if (!resultJobId) return;
+  const card = $("fmt-parts"), sizeEl = $("size-parts"), status = $("export-status");
+  const nColors = ($("opt-parts-density") && $("opt-parts-density").value) || "6";
+  if (card) card.classList.add("busy");
+  if (status) status.textContent = "";
+  setExportProgress(15, "Segmenting parts by color…");
+  try {
+    const res = await fetch(
+      `/segment_parts/${resultJobId}?n_colors=${nColors}`,
+      { method: "POST" });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(msg || `HTTP ${res.status}`);
+    }
+    const info = await res.json();
+    setExportProgress(80, "Downloading…");
+    const glb = await fetch(`/result_parts/${resultJobId}`);
+    if (!glb.ok) throw new Error(`HTTP ${glb.status}`);
+    const blob = await glb.blob();
+    setExportProgress(100, "Done");
+    saveBlob(blob, "reconstruction_parts.glb");
+    if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
+    if (status) status.textContent = `Saved ${info.parts} part${info.parts === 1 ? "" : "s"} · ${fmtBytes(blob.size)}`;
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = "Part segmentation failed: " + (e.message || e);
+  } finally {
+    if (card) card.classList.remove("busy");
+    setTimeout(() => setExportProgress(null), 900);
+  }
+}
+
+function openExport() {
+  if (!welded) return;
+  closeTools();
+  $("export-sidebar").classList.add("open");
+  $("export-sidebar").setAttribute("aria-hidden", "false");
+  renderFormatList();
+  renderPartsCard();
+  onExportOpt();
+}
+function closeExport() {
+  const el = $("export-sidebar");
+  if (!el) return;
+  el.classList.remove("open");
+  el.setAttribute("aria-hidden", "true");
+}
+
+// ── Models status sidebar ──────────────────────────────────────────────────
+let _modelsPollTimer = null;
+const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3d: "fa-cube", moge: "fa-layer-group" };
+const MODEL_LABEL = { loaded: "Loaded", downloaded: "Downloaded", not_downloaded: "Missing" };
+const _modelNames = {};
+const _modelGated = {};
+
+function openModels() {
+  closeTools();
+  closeExport();
+  $("models-sidebar").classList.add("open");
+  $("models-sidebar").setAttribute("aria-hidden", "false");
+  loadModelsStatus();
+}
+function closeModels() {
+  const el = $("models-sidebar");
+  if (!el) return;
+  el.classList.remove("open");
+  el.setAttribute("aria-hidden", "true");
+  stopModelsPolling();
+}
+function toggleModels() {
+  $("models-sidebar").classList.contains("open") ? closeModels() : openModels();
+}
+
+function stopModelsPolling() {
+  if (_modelsPollTimer) { clearInterval(_modelsPollTimer); _modelsPollTimer = null; }
+}
+function ensureModelsPolling(active) {
+  const open = $("models-sidebar").classList.contains("open");
+  if (active && open && !_modelsPollTimer) {
+    _modelsPollTimer = setInterval(() => loadModelsStatus(true), 1500);
+  } else if ((!active || !open) && _modelsPollTimer) {
+    stopModelsPolling();
+  }
+}
+
+// Escape helper so server-provided messages can't inject markup.
+function _esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+// Linkify bare https URLs inside an already-escaped string.
+function _linkify(s) {
+  return s.replace(/(https:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+
+async function loadModelsStatus(silent) {
+  const host = $("models-status");
+  if (!host) return;
+  if (!silent) { host.classList.add("loading"); host.textContent = "Loading…"; }
+  try {
+    const res = await fetch("/models");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const models = (data && data.models) || [];
+    host.classList.remove("loading");
+
+    let anyRunning = false;
+    host.innerHTML = models.map(m => {
+      const icon = MODEL_ICONS[m.id] || "fa-microchip";
+      _modelNames[m.id] = m.name;
+      _modelGated[m.id] = !!m.gated;
+      const dl = m.download || {};
+      const running = dl.state === "running";
+      if (running) anyRunning = true;
+      const sub = m.status === "not_downloaded"
+        ? "Not downloaded"
+        : `On disk · ${_esc(m.size || "-")}`;
+
+      // Gated models (SAM 3D) show an inline Hugging Face token field until the
+      // weights are on disk. The token is entered here and used once at download;
+      // it is never saved.
+      let hfBlock = "";
+      if (m.gated && m.status === "not_downloaded" && !running) {
+        const repo = m.repo || "facebook/sam-3d-objects";
+        hfBlock = `<div class="hf-auth">
+          <p class="tool-hint" style="margin:0 0 6px">Gated Meta model. <a href="https://huggingface.co/${_esc(repo)}" target="_blank" rel="noopener">Request access</a>, create a <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">token</a>, then paste it and click Download. The token is used only for this download and is never saved.</p>
+          <input type="password" id="hf-token-input" style="width:100%;box-sizing:border-box" placeholder="hf_… access token" autocomplete="off" spellcheck="false" />
+          <div id="hf-status" class="hf-status"></div>
+        </div>`;
+      }
+
+      // Action row: spinner while downloading, error + retry, or a Download button.
+      let action = "";
+      if (running) {
+        action = `<div class="model-action"><span class="mini-spin"></span>
+          <span class="model-dl-msg">${_esc(dl.message || "Downloading…")}</span></div>`;
+      } else if (m.status === "not_downloaded") {
+        const errMsg = dl.state === "error"
+          ? `<div class="model-dl-msg error">${_linkify(_esc(dl.message || "Download failed."))}</div>` : "";
+        action = `<div class="model-action">
+            <button class="btn-primary" onclick="downloadModel('${m.id}')">
+              <i class="fa-solid fa-download"></i> Download
+            </button>
+          </div>${errMsg}`;
+      } else {
+        // Downloaded or loaded: offer removal, plus a "done" note right after a fetch.
+        const done = dl.state === "done"
+          ? `<div class="model-dl-msg" style="color:#34d399"><i class="fa-solid fa-circle-check"></i> ${_esc(dl.message || "Download complete.")}</div>` : "";
+        action = `${done}<div class="model-action">
+            <button class="btn-secondary" onclick="purgeModel('${m.id}')">
+              <i class="fa-solid fa-trash"></i> Remove
+            </button>
+          </div>`;
+      }
+
+      return `
+        <div class="model-card">
+          <div class="model-top">
+            <div class="model-ic"><i class="fa-solid ${icon}"></i></div>
+            <div class="model-meta">
+              <div class="model-name">${_esc(m.name)}</div>
+              <div class="model-role">${_esc(m.role)}</div>
+              <div class="model-sub">${sub}</div>
+            </div>
+            <span class="model-badge ${m.status}">${MODEL_LABEL[m.status] || m.status}</span>
+          </div>
+          ${hfBlock}
+          ${action}
+        </div>`;
+    }).join("");
+    if (!models.length) host.textContent = "No model information available.";
+    ensureModelsPolling(anyRunning);
+  } catch (err) {
+    host.classList.remove("loading");
+    host.innerHTML = `<p class="tool-hint" style="color:#f87171">Couldn't load model status: ${_esc(err.message)}</p>`;
+  }
+}
+
+async function downloadModel(id) {
+  const gated = !!_modelGated[id];
+  const opts = { method: "POST" };
+  const el = $("hf-status");
+  if (gated) {
+    const input = $("hf-token-input");
+    const token = (input && input.value || "").trim();
+    if (!token) {
+      if (el) { el.className = "hf-status err"; el.textContent = "Enter your Hugging Face token first."; }
+      return;
+    }
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify({ token });
+    if (el) { el.className = "hf-status"; el.textContent = "Checking token…"; }
+  }
+  try {
+    const res = await fetch(`/models/${id}/download`, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    await loadModelsStatus(true);
+    ensureModelsPolling(true);
+  } catch (err) {
+    if (gated && el) { el.className = "hf-status err"; el.textContent = err.message; }
+    else alert("Couldn't start download: " + err.message);
+  }
+}
+
+async function purgeModel(id) {
+  const name = _modelNames[id] || "this model";
+  if (!confirm(`Remove the downloaded weights for ${name}?\n\nThis frees disk space and unloads it from memory. You'll need to download them again to use it.`)) return;
+  try {
+    const res = await fetch(`/models/${id}/purge`, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    await loadModelsStatus(true);
+  } catch (err) {
+    alert("Couldn't remove model: " + err.message);
+  }
+}
+
+window.openModels = openModels;
+window.closeModels = closeModels;
+window.toggleModels = toggleModels;
+window.loadModelsStatus = loadModelsStatus;
+window.downloadModel = downloadModel;
+window.purgeModel = purgeModel;
+
+// Decimate a geometry while carrying vertex colors to the surviving verts.
+// Uses meshoptimizer's simplifier (fast + robust on million-triangle scans);
+// it only rewrites the index buffer, so positions and per-vertex colors are
+// preserved with no LUT round-trip. Falls back to the original geometry if the
+// meshopt module can't be loaded.
+async function decimateColored(geometry, removeFrac) {
+  if (removeFrac <= 0) return geometry;
+  const g = geometry.index ? geometry : geometry.clone();
+  if (!g.index) {
+    const n = g.getAttribute("position").count;
+    const seq = new Uint32Array(n);
+    for (let i = 0; i < n; i++) seq[i] = i;
+    g.setIndex(new THREE.BufferAttribute(seq, 1));
+  }
+  try {
+    const positions = g.getAttribute("position").array;
+    const newIndex = await meshoptSimplify(g.index.array, positions, removeFrac);
+    const out = g.clone();
+    out.setIndex(new THREE.BufferAttribute(newIndex, 1));
+    out.computeVertexNormals();
+    return out;
+  } catch (e) {
+    console.warn("meshopt simplify failed, keeping full-res mesh:", e);
+    return geometry;
+  }
+}
+
+// Build the export-ready mesh for the selected optimization + format kind.
+// `bake` = render vertex color into a texture atlas (USDZ only). Otherwise the
+// mesh keeps its COLOR_0 vertex colors, exactly like the server's reference GLB.
+async function buildExportMesh(bake, onProgress = () => {}) {
+  onProgress(15, "Building mesh…");
+  let { geometry } = buildTunedGeometry(curThreshold, curTrim);
+  const d = +$("opt-decimate").value;
+  if (d > 0) {
+    onProgress(25, "Simplifying mesh…");
+    await tick();
+    geometry = await decimateColored(geometry, d / 100);
+  }
+
+  if (bake && geometry.getAttribute("color")) {
+    onProgress(55, "Baking texture…");
+    await tick();
+    const maxTex = +$("opt-texsize").value;
+    const fmt = $("opt-texfmt").value;
+    const { geometry: baked, map } = await bakeVertexColorTexture(geometry, maxTex, fmt);
+    baked.computeVertexNormals();
+    // Texture is the sole color source once baked - drop COLOR_0 so viewers
+    // don't multiply baseColorTexture × vertex color and desaturate it.
+    if (baked.getAttribute("color")) baked.deleteAttribute("color");
+    const mat = new THREE.MeshStandardMaterial({
+      map, metalness: 0, roughness: 0.85, side: THREE.DoubleSide,
+    });
+    onProgress(80, "Encoding…");
+    return new THREE.Mesh(baked, mat);
+  }
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: !!geometry.getAttribute("color"),
+    metalness: 0, roughness: 0.85, side: THREE.DoubleSide,
+  });
+  if (!geometry.getAttribute("color")) mat.color.set(0xffffff);
+  else {
+    // Compact the color like the SAM server GLB: store COLOR_0 as normalized
+    // uint8 (4 B/vert) instead of float32 (12 B). Imperceptible, ~⅓ the size.
+    const c = geometry.getAttribute("color");
+    if (c.array instanceof Float32Array) {
+      const n = c.count, u = new Uint8Array(n * 3);
+      for (let i = 0; i < n * 3; i++) u[i] = Math.max(0, Math.min(255, Math.round(c.array[i] * 255)));
+      geometry.setAttribute("color", new THREE.BufferAttribute(u, 3, true));
+    }
+  }
+  // Vertex-color export needs no UVs - drop them so they aren't written.
+  if (geometry.getAttribute("uv")) geometry.deleteAttribute("uv");
+  onProgress(80, "Encoding…");
+  return new THREE.Mesh(geometry, mat);
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+// Determinate progress bar shown while a download is being prepared.
+const tick = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+function setExportProgress(pct, label) {
+  const wrap = $("export-progress"), fill = $("export-progress-fill"), lab = $("export-progress-label");
+  if (!wrap) return;
+  if (pct == null) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  if (fill) fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (lab && label) lab.textContent = label;
+}
+
+async function runExport(id) {
+  if (!welded) return;
+  const fmt = EXPORT_FORMATS.find((f) => f.id === id);
+  if (!fmt) return;
+  const card = $("fmt-" + id), sizeEl = $("size-" + id), status = $("export-status");
+  if (card) card.classList.add("busy");
+  if (status) status.textContent = "";
+  setExportProgress(5, `Preparing ${fmt.name}…`);
+  await tick();
+  try {
+    const mesh = await buildExportMesh(fmt.bake && bakeEnabled(fmt.id), setExportProgress);
+    setExportProgress(88, "Writing file…");
+    await tick();
+    let blob;
+    switch (id) {
+      case "glb": {
+        const raw = await meshToGLB(mesh);
+        if ($("opt-compress") && $("opt-compress").checked) {
+          setExportProgress(94, "Compressing (meshopt)…");
+          await tick();
+          const optBuf = await optimizeGlbBuffer(await raw.arrayBuffer());
+          blob = new Blob([optBuf], { type: "model/gltf-binary" });
+        } else {
+          blob = raw;
+        }
+        break;
+      }
+      case "gltf": {
+        const json = await new Promise((res, rej) =>
+          new GLTFExporter().parse(mesh, res, rej, { binary: false }));
+        blob = new Blob([JSON.stringify(json)], { type: "model/gltf+json" });
+        break;
+      }
+      case "usdz": {
+        const exp = new USDZExporter();
+        const u8 = await (exp.parseAsync ? exp.parseAsync(mesh) : exp.parse(mesh));
+        blob = new Blob([u8], { type: "model/vnd.usdz+zip" });
+        break;
+      }
+      case "ply": {
+        const data = await new Promise((res) =>
+          new PLYExporter().parse(mesh, res, { binary: true }));
+        blob = new Blob([data], { type: "application/octet-stream" });
+        break;
+      }
+      case "obj": {
+        const text = new OBJExporter().parse(mesh);
+        blob = new Blob([text], { type: "text/plain" });
+        break;
+      }
+      case "stl": {
+        const data = new STLExporter().parse(mesh, { binary: true });
+        blob = new Blob([data.buffer || data], { type: "application/octet-stream" });
+        break;
+      }
+    }
+    setExportProgress(100, "Done");
+    saveBlob(blob, `reconstruction.${fmt.ext}`);
+    if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
+    if (status) status.textContent = `Saved ${fmt.name} · ${fmtBytes(blob.size)}`;
+    // Free the baked texture / geometry.
+    if (mesh.material.map) mesh.material.map.dispose();
+    mesh.material.dispose();
+    mesh.geometry.dispose();
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = "Export failed: " + (e.message || e);
+  } finally {
+    if (card) card.classList.remove("busy");
+    setTimeout(() => setExportProgress(null), 900);
+  }
+}
+
+// Global handlers referenced by the sliders' oninput attributes.
+window.onHoleFill = (v) => window.HoleTune.setThreshold(v);
+window.onEdgeTrim = (v) => window.HoleTune.setEdgeTrim(v);
+window.onSmooth   = (v) => window.HoleTune.setSmooth(v);
+window.onCutFillet = (v) => window.HoleTune.setCutFillet(v);
+window.onSaturation = (v) => window.HoleTune.setSaturation(v);
+window.onContrast   = (v) => window.HoleTune.setContrast(v);
+window.onBrightness = (v) => window.HoleTune.setBrightness(v);
+window.downloadTuned = () => window.HoleTune.downloadTuned();
+window.openExport   = () => openExport();
+window.closeExport  = () => closeExport();
+window.onExportOpt  = () => onExportOpt();
+window.runExport    = (id) => runExport(id);
+</script>
+</body>
+</html>
