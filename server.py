@@ -1367,8 +1367,11 @@ def _preload_sam():
 
 if __name__ == "__main__":
     import uvicorn
+    # Pass the app object directly (not the "server:app" import string) so this
+    # works when frozen into a PyInstaller executable, where the "server" module
+    # can't be re-imported by Uvicorn.
     uvicorn.run(
-        "server:app",
+        app,
         host="0.0.0.0",
         port=8005,
         workers=1,       # must be 1 – ML models are not fork-safe
