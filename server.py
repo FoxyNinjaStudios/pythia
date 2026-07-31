@@ -1113,6 +1113,25 @@ _depth_lock = threading.Lock()
 _sam3d_loaded_once = False
 
 
+def _preimport_hydra_targets() -> None:
+    """Pre-import modules that are instantiated by Hydra via string ``_target_``.
+
+    Hydra resolves targets like ``sam3d_objects.pipeline.depth_models.moge.MoGe``
+    with a ``getattr``-then-``import_module`` walk. In a PyInstaller onefile that
+    walk can fail if the submodule has not yet been imported (it isn't an
+    attribute of its parent package). Importing the modules here registers them
+    on their parents so Hydra can always locate them. Best-effort and idempotent.
+    """
+    try:
+        import sam3d_objects.pipeline.depth_models.moge  # noqa: F401
+    except Exception as exc:  # pragma: no cover - only matters in frozen builds
+        logger.debug("depth_models.moge pre-import skipped: %s", exc)
+    try:
+        import moge.model.v1  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        logger.debug("moge.model.v1 pre-import skipped: %s", exc)
+
+
 def _get_depth_pipeline():
     """Lazily build (and cache) a lightweight pipeline used only for MoGe depth.
 
@@ -1126,6 +1145,13 @@ def _get_depth_pipeline():
             from sam3d_objects.pipeline.inference_pipeline_low_memory import (
                 InferencePipelineLowMemory,
             )
+            # In a frozen (PyInstaller) build Hydra resolves the depth model from
+            # its dotted string target. Force-import the concrete modules first so
+            # they are registered as attributes of their parent packages —
+            # otherwise Hydra's getattr-then-import_module lookup can fail inside
+            # the onefile bundle when the depth preview runs before anything else
+            # has imported them. (No-op in a normal source checkout.)
+            _preimport_hydra_targets()
             _depth_pipeline = InferencePipelineLowMemory(
                 config_path="checkpoints/hf/pipeline.yaml",
                 device="cpu",
@@ -1260,6 +1286,7 @@ def _run_reconstruction_sync(
         job.update("Loading pipeline…", 5)
 
         from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
+        _preimport_hydra_targets()
         pipeline = InferencePipelineLowMemory(
             config_path="checkpoints/hf/pipeline.yaml",
             device="cpu",
