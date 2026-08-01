@@ -8,7 +8,7 @@ ENV/
 *.egg-info/
 .ipynb_checkpoints/
 dist/
-
+build/
 
 # OS
 .DS_Store
@@ -16,6 +16,7 @@ Thumbs.db
 
 checkpoints/
 .cache/
+cache/
 outputs/
 
 *.pth
