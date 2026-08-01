@@ -361,6 +361,7 @@ _hf_token = None         # HF token kept in memory only, never written to disk
 # ``dl_bytes`` is the approximate total transfer size, shown in the progress label.
 _MODEL_META = {
     "sam2":  {"repo": None,                      "gated": False, "dl_bytes": 898_000_000},
+    "sam3":  {"repo": "facebook/sam3",           "gated": True,  "dl_bytes": 3_400_000_000},
     "sam3d": {"repo": "facebook/sam-3d-objects", "gated": True,  "dl_bytes": 13_106_000_000},
     "moge":  {"repo": "Ruicheng/moge-vitl",      "gated": False, "dl_bytes": 1_340_000_000},
 }
@@ -483,6 +484,18 @@ def _download_worker(model_id: str) -> None:
                 snapshot_download(repo_id=meta["repo"])
             finally:
                 stop.set()
+        elif model_id == "sam3":
+            from huggingface_hub import snapshot_download
+            token = _hf_token
+            if not token:
+                raise PermissionError("Add a Hugging Face token for the gated model first.")
+            repo_dir = paths.HF_HUB_DIR / ("models--" + meta["repo"].replace("/", "--"))
+            stop = _start_progress_sampler(
+                "sam3", repo_dir, meta.get("dl_bytes", 0), "Downloading SAM 3 weights")
+            try:
+                snapshot_download(repo_id=meta["repo"], token=token)
+            finally:
+                stop.set()
         elif model_id == "sam3d":
             from huggingface_hub import snapshot_download
             token = _hf_token
@@ -522,7 +535,7 @@ def _download_worker(model_id: str) -> None:
     finally:
         # The token is single-use: drop it from memory once the gated download
         # has run (whether it succeeded or failed) so it is never retained.
-        if model_id == "sam3d":
+        if model_id in ("sam3d", "sam3"):
             _hf_token = None
             _hf_user = None
 
@@ -571,6 +584,15 @@ def _purge_model(model_id: str) -> int:
                     f.unlink()
                 except Exception as exc:
                     logger.warning("Could not delete %s: %s", f, exc)
+    elif model_id == "sam3":
+        meta = _MODEL_META.get(model_id, {})
+        if meta.get("repo"):
+            freed += _purge_hf_repo(meta["repo"])
+        try:
+            import sam_wrapper
+            sam_wrapper.unload_text_model()         # drop the in-memory SAM 3 model
+        except Exception as exc:
+            logger.warning("SAM 3 unload failed: %s", exc)
     elif model_id == "moge":
         meta = _MODEL_META.get(model_id, {})
         if meta.get("repo"):
@@ -604,21 +626,40 @@ def _moge_cache() -> tuple[bool, int]:
     return False, 0
 
 
+def _sam3_cache() -> tuple[bool, int]:
+    """Detect whether the SAM 3 (facebook/sam3) weights are in the HF cache."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        for repo in scan_cache_dir().repos:
+            if repo.repo_id == "facebook/sam3" and repo.size_on_disk > 0:
+                return True, int(repo.size_on_disk)
+    except Exception:
+        pass
+    return False, 0
+
+
 def _models_status() -> list:
     """Report per-model download / load state for the three pipeline models."""
-    # 1) SAM 2.1 Hiera-L (interactive segmentation)
+    # 1) SAM 2.1 Hiera-L (interactive point-prompt segmentation)
     try:
         import sam_wrapper
         sam2_path = Path(sam_wrapper.SAM2_CHECKPOINT_PATH)
-        # Point-prompt segmentation keeps SAM 2 resident (_predictor); the text
-        # mode loads SAM 3 (_sam3_model). Either means the segmenter is in memory.
-        sam2_loaded = (getattr(sam_wrapper, "_predictor", None) is not None
-                       or getattr(sam_wrapper, "_sam3_model", None) is not None)
+        # Point-prompt segmentation keeps SAM 2 resident (_predictor). The text
+        # mode uses a separate model (SAM 3, reported below), so SAM 2 is only
+        # "loaded" when its own predictor is in memory.
+        sam2_loaded = getattr(sam_wrapper, "_predictor", None) is not None
+        sam3_loaded = getattr(sam_wrapper, "_sam3_model", None) is not None
     except Exception:
         sam2_path = Path(paths.SAM2_CHECKPOINT_PATH)
         sam2_loaded = False
+        sam3_loaded = False
     sam2_down = sam2_path.exists() and sam2_path.stat().st_size > 0
     sam2_size = sam2_path.stat().st_size if sam2_down else 0
+
+    # 1b) SAM 3 (text / concept segmentation). Gated HF repo (facebook/sam3),
+    # cached under the shared HF hub dir; loaded on demand (and on upload) for
+    # the default text-prompt mode.
+    sam3_down, sam3_size = _sam3_cache()
 
     # 2) SAM 3D Objects reconstruction stack (weights under checkpoints/hf/).
     # Only the weights the inference pipeline actually loads are checked — the
@@ -667,6 +708,8 @@ def _models_status() -> list:
     return [
         entry("sam2", "SAM 2.1 Hiera-L", "Interactive segmentation",
               sam2_down, sam2_loaded, sam2_size),
+        entry("sam3", "SAM 3", "Text / concept segmentation",
+              sam3_down, sam3_loaded, sam3_size),
         entry("sam3d", "SAM 3D Objects", "3-D reconstruction",
               sam3d_down, sam3d_loaded, sam3d_size),
         entry("moge", "MoGe ViT-L", "Depth / pointmap prior",

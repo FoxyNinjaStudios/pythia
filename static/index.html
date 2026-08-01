@@ -3357,7 +3357,7 @@ function closeExport() {
 
 // ── Models status sidebar ──────────────────────────────────────────────────
 let _modelsPollTimer = null;
-const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3d: "fa-cube", moge: "fa-layer-group" };
+const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3: "fa-comment-dots", sam3d: "fa-cube", moge: "fa-layer-group" };
 const MODEL_LABEL = { loaded: "Loaded", downloaded: "Downloaded", not_downloaded: "Missing" };
 const _modelNames = {};
 const _modelGated = {};
@@ -3414,6 +3414,17 @@ async function loadModelsStatus(silent) {
     const models = (data && data.models) || [];
     host.classList.remove("loading");
 
+    // The 2-D segmentation model loads into memory on demand (and on upload).
+    // Reuse the same progress bar to show that load on its Models-tab card:
+    // /seg_status reports the active seg model ("point" → sam2, "text" → sam3).
+    let seg = null;
+    try {
+      const sres = await fetch("/seg_status");
+      if (sres.ok) seg = await sres.json();
+    } catch (_) { /* ignore */ }
+    const segIdFor = { point: "sam2", text: "sam3" };
+    const segLoadingId = (seg && seg.state === "loading") ? segIdFor[seg.model] : null;
+
     let anyRunning = false;
     host.innerHTML = models.map(m => {
       const icon = MODEL_ICONS[m.id] || "fa-microchip";
@@ -3451,6 +3462,13 @@ async function loadModelsStatus(silent) {
         action = `<div class="model-dl">
           <div class="model-dl-track">${fill}</div>
           <div class="model-dl-msg"><span>${_esc(dl.message || "Downloading…")}</span>${pctLabel}</div>
+        </div>`;
+      } else if (m.id === segLoadingId) {
+        // Segmentation model is being loaded into memory: same bar, indeterminate.
+        anyRunning = true;
+        action = `<div class="model-dl">
+          <div class="model-dl-track"><div class="model-dl-fill indeterminate"></div></div>
+          <div class="model-dl-msg"><span>${_esc((seg && seg.message) || "Loading into memory…")}</span></div>
         </div>`;
       } else if (m.status === "not_downloaded") {
         const errMsg = dl.state === "error"
