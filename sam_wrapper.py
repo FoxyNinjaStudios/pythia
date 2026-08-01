@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import os
 import base64
+import threading
 import urllib.request
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -38,7 +39,12 @@ def _sam_device() -> str:
 # Weight management
 # ---------------------------------------------------------------------------
 
-SAM2_CHECKPOINT_PATH = Path("checkpoints/sam2.1_hiera_large.pt")
+# SAM 2 weights live under the shared app root (PYTHIA_HOME, default
+# ~/Downloads/pythia) so a packaged build stores them alongside every other
+# checkpoint. Also route the Hugging Face cache there for the SAM 3 text model.
+import paths
+paths.configure_hf_cache()
+SAM2_CHECKPOINT_PATH = paths.SAM2_CHECKPOINT_PATH
 _SAM2_DOWNLOAD_URL = (
     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
 )
@@ -64,6 +70,31 @@ def ensure_sam_weights() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# 2-D segmentation model load status  (drives the Step-2 loading bar)
+# ---------------------------------------------------------------------------
+# Only one 2-D model is ever resident (SAM 2 points OR SAM 3 text); this record
+# lets the UI show a "loading into memory" progress bar while a model is being
+# brought in on demand. ``progress`` is None for an indeterminate bar (weight
+# loading has no cheap byte-level callback), 1.0 once ready.
+
+_seg_load_status = {"state": "idle", "model": None, "message": "", "progress": None}
+_seg_load_lock = threading.Lock()
+
+
+def _set_seg_load(model, state, message, progress=None) -> None:
+    with _seg_load_lock:
+        _seg_load_status.update(
+            model=model, state=state, message=message, progress=progress
+        )
+
+
+def get_seg_load_status() -> dict:
+    """Current 2-D segmentation model load state (thread-safe snapshot)."""
+    with _seg_load_lock:
+        return dict(_seg_load_status)
+
+
+# ---------------------------------------------------------------------------
 # Lazy singleton predictor
 # ---------------------------------------------------------------------------
 
@@ -76,12 +107,21 @@ def _get_predictor():
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        ckpt = ensure_sam_weights()
-        device = _sam_device()
-        print(f"[SAM2] Loading SAM2.1 Hiera-L on {device}…")
-        model = build_sam2(_SAM2_CONFIG, ckpt_path=str(ckpt), device=device)
-        _predictor = SAM2ImagePredictor(model)
-        print("[SAM2] Ready.")
+        # One 2-D model in memory at a time: drop the SAM 3 text model before
+        # bringing the SAM 2 point model in (they are never used simultaneously).
+        unload_text_model()
+        _set_seg_load("point", "loading", "Loading SAM 2.1 point model…")
+        try:
+            ckpt = ensure_sam_weights()
+            device = _sam_device()
+            print(f"[SAM2] Loading SAM2.1 Hiera-L on {device}…")
+            model = build_sam2(_SAM2_CONFIG, ckpt_path=str(ckpt), device=device)
+            _predictor = SAM2ImagePredictor(model)
+            print("[SAM2] Ready.")
+            _set_seg_load("point", "ready", "SAM 2.1 point model ready", progress=1.0)
+        except Exception as exc:
+            _set_seg_load("point", "error", f"Failed to load point model: {exc}")
+            raise
     return _predictor
 
 
@@ -129,17 +169,23 @@ def unload_point_model() -> None:
     weights are freed from unified memory.
     """
     global _predictor, _amg
+    was_loaded = _predictor is not None
     _predictor = None
     _amg = None
     _free_torch_memory()
+    if was_loaded and get_seg_load_status().get("model") == "point":
+        _set_seg_load(None, "idle", "")
 
 
 def unload_text_model() -> None:
     """Fully unload the SAM 3 text/concept model (model + processor)."""
     global _sam3_model, _sam3_processor
+    was_loaded = _sam3_model is not None
     _sam3_model = None
     _sam3_processor = None
     _free_torch_memory()
+    if was_loaded and get_seg_load_status().get("model") == "text":
+        _set_seg_load(None, "idle", "")
 
 
 def unload_segmentation_models() -> None:
@@ -291,17 +337,49 @@ _sam3_model = None
 _sam3_processor = None
 
 
+def _sam3_cached() -> bool:
+    """True if the (gated) SAM 3 repo already has a snapshot in the HF cache."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        return any(r.repo_id == _SAM3_MODEL_ID for r in scan_cache_dir().repos)
+    except Exception:
+        return False
+
+
 def _get_sam3():
     """Lazily load the SAM 3 model + processor (singleton)."""
     global _sam3_model, _sam3_processor
     if _sam3_model is None:
         from transformers import Sam3Model, Sam3Processor
 
-        device = _sam_device()
-        print(f"[SAM3] Loading {_SAM3_MODEL_ID} on {device}… (first run downloads gated weights)")
-        _sam3_processor = Sam3Processor.from_pretrained(_SAM3_MODEL_ID)
-        _sam3_model = Sam3Model.from_pretrained(_SAM3_MODEL_ID).to(device).eval()
-        print("[SAM3] Ready.")
+        # One 2-D model in memory at a time: drop the SAM 2 point model before
+        # bringing the SAM 3 text model in (they are never used simultaneously).
+        unload_point_model()
+        _set_seg_load("text", "loading", "Loading SAM 3 text model…")
+        try:
+            device = _sam_device()
+            # facebook/sam3 is a gated repo. When the weights are already cached we
+            # load them with local_files_only=True so transformers does NOT reach out
+            # to the Hub for optional side files (e.g. chat_template.json) — that call
+            # 401s for a gated repo without a token even though the model itself is
+            # present locally. If a token is available we pass it and allow network.
+            token = (os.environ.get("HF_TOKEN")
+                     or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                     or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+            local_only = _sam3_cached() and not token
+            kw = {"local_files_only": local_only}
+            if token:
+                kw["token"] = token
+
+            print(f"[SAM3] Loading {_SAM3_MODEL_ID} on {device}… "
+                  f"({'offline (cached)' if local_only else 'first run downloads gated weights'})")
+            _sam3_processor = Sam3Processor.from_pretrained(_SAM3_MODEL_ID, **kw)
+            _sam3_model = Sam3Model.from_pretrained(_SAM3_MODEL_ID, **kw).to(device).eval()
+            print("[SAM3] Ready.")
+            _set_seg_load("text", "ready", "SAM 3 text model ready", progress=1.0)
+        except Exception as exc:
+            _set_seg_load("text", "error", f"Failed to load text model: {exc}")
+            raise
     return _sam3_model, _sam3_processor
 
 

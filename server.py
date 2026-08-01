@@ -77,10 +77,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ── directory setup ────────────────────────────────────────────────────────────
-UPLOAD_DIR = Path("tmp/uploads")
-RESULT_DIR = Path("tmp/results")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-RESULT_DIR.mkdir(parents=True, exist_ok=True)
+# All checkpoints, caches and I/O live under a single app root (PYTHIA_HOME,
+# default ~/Downloads/pythia) so a packaged build run from any directory still
+# finds and stores its data in one predictable place. Point the Hugging Face
+# hub cache there too, *before* any huggingface_hub / transformers import.
+import paths
+paths.configure_hf_cache()
+paths.ensure_dirs()
+
+UPLOAD_DIR = paths.UPLOAD_DIR
+RESULT_DIR = paths.RESULT_DIR
 
 logger = logging.getLogger("sam3d.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -405,44 +411,107 @@ def _friendly_download_error(model_id: str, exc: Exception) -> str:
     return f"Download failed: {text}"
 
 
+def _path_size(path: Path) -> int:
+    """Total bytes at ``path`` — the file size, or the sum of a directory tree."""
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        if path.is_dir():
+            total = 0
+            for p in path.rglob("*"):
+                try:
+                    if p.is_file():
+                        total += p.stat().st_size
+                except OSError:
+                    pass
+            return total
+    except OSError:
+        pass
+    return 0
+
+
+def _start_progress_sampler(model_id: str, watch_path, total_bytes: int,
+                            label: str) -> threading.Event:
+    """Stream real download progress by polling the destination's growing size.
+
+    Returns a ``threading.Event``; call ``.set()`` on it to stop the sampler
+    (do this once the download finishes). Progress is reported as the fraction of
+    ``total_bytes`` written since the sampler started, so pre-existing partial
+    files don't skew the bar. Works for both single-file (SAM 2) and Hugging Face
+    snapshot (dir tree) downloads without needing a library-specific callback.
+    """
+    watch_path = Path(watch_path)
+    baseline = _path_size(watch_path)
+    stop = threading.Event()
+
+    def _run() -> None:
+        while not stop.is_set():
+            got = max(0, _path_size(watch_path) - baseline)
+            if total_bytes > 0:
+                frac = min(0.999, got / total_bytes)
+                msg = f"{label}… {_human_size(got)} / {_human_size(total_bytes)}"
+            else:
+                frac = None
+                msg = f"{label}… {_human_size(got)}"
+            _set_dl(model_id, state="running", message=msg, progress=frac)
+            stop.wait(0.5)
+
+    threading.Thread(target=_run, name=f"dlprog-{model_id}", daemon=True).start()
+    return stop
+
+
 def _download_worker(model_id: str) -> None:
     global _hf_token, _hf_user
     try:
         meta = _MODEL_META.get(model_id, {})
         size_str = _human_size(meta.get("dl_bytes", 0))
         if model_id == "sam2":
-            _set_dl("sam2", message=f"Downloading SAM 2.1 Hiera-L ({size_str})…")
-            from sam_wrapper import ensure_sam_weights
-            ensure_sam_weights()
+            stop = _start_progress_sampler(
+                "sam2", paths.SAM2_CHECKPOINT_PATH,
+                meta.get("dl_bytes", 0), "Downloading SAM 2.1 Hiera-L")
+            try:
+                from sam_wrapper import ensure_sam_weights
+                ensure_sam_weights()
+            finally:
+                stop.set()
         elif model_id == "moge":
-            _set_dl("moge", message=f"Downloading MoGe ViT-L ({size_str})…")
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=meta["repo"])
+            repo_dir = paths.HF_HUB_DIR / ("models--" + meta["repo"].replace("/", "--"))
+            stop = _start_progress_sampler(
+                "moge", repo_dir, meta.get("dl_bytes", 0), "Downloading MoGe ViT-L")
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(repo_id=meta["repo"])
+            finally:
+                stop.set()
         elif model_id == "sam3d":
-            _set_dl("sam3d", message=f"Downloading SAM 3D Objects weights ({size_str})…")
             from huggingface_hub import snapshot_download
             token = _hf_token
             if not token:
                 raise PermissionError("Add a Hugging Face token for the gated model first.")
-            dest = Path("checkpoints/hf")
-            snapshot_download(
-                repo_id=meta["repo"],
-                local_dir=str(dest),
-                allow_patterns=["*.ckpt", "*.pt", "*.safetensors", "*.yaml", "*.json"],
-                token=token,
-            )
-            # The repo nests its weights under a ``checkpoints/`` subfolder, but
-            # the app loads them flat from checkpoints/hf/. Move any nested files
-            # up so the pipeline (and the status check) find them.
-            nested = dest / "checkpoints"
-            if nested.is_dir():
-                for f in nested.iterdir():
-                    if f.is_file():
-                        target = dest / f.name
-                        if target.exists():
-                            target.unlink()
-                        shutil.move(str(f), str(target))
-                shutil.rmtree(nested, ignore_errors=True)
+            dest = paths.HF_WEIGHTS_DIR
+            stop = _start_progress_sampler(
+                "sam3d", dest, meta.get("dl_bytes", 0), "Downloading SAM 3D Objects weights")
+            try:
+                snapshot_download(
+                    repo_id=meta["repo"],
+                    local_dir=str(dest),
+                    allow_patterns=["*.ckpt", "*.pt", "*.safetensors", "*.yaml", "*.json"],
+                    token=token,
+                )
+                # The repo nests its weights under a ``checkpoints/`` subfolder, but
+                # the app loads them flat from checkpoints/hf/. Move any nested files
+                # up so the pipeline (and the status check) find them.
+                nested = dest / "checkpoints"
+                if nested.is_dir():
+                    for f in nested.iterdir():
+                        if f.is_file():
+                            target = dest / f.name
+                            if target.exists():
+                                target.unlink()
+                            shutil.move(str(f), str(target))
+                    shutil.rmtree(nested, ignore_errors=True)
+            finally:
+                stop.set()
         else:
             raise ValueError(f"Unknown model '{model_id}'")
         _set_dl(model_id, state="done", message="Download complete.", progress=1.0)
@@ -481,7 +550,7 @@ def _purge_model(model_id: str) -> int:
 
     Returns the number of bytes reclaimed. Runs in a thread executor.
     """
-    global _sam3d_loaded_once, _depth_pipeline
+    global _depth_pipeline
     freed = 0
     if model_id == "sam2":
         try:
@@ -494,7 +563,7 @@ def _purge_model(model_id: str) -> int:
         except Exception as exc:
             logger.warning("SAM 2 purge failed: %s", exc)
     elif model_id == "sam3d":
-        hf = Path("checkpoints/hf")
+        hf = paths.HF_WEIGHTS_DIR
         if hf.exists():
             for f in list(hf.glob("*.ckpt")) + list(hf.glob("*.pt")) + list(hf.glob("*.safetensors")):
                 try:
@@ -502,7 +571,6 @@ def _purge_model(model_id: str) -> int:
                     f.unlink()
                 except Exception as exc:
                     logger.warning("Could not delete %s: %s", f, exc)
-        _sam3d_loaded_once = False
     elif model_id == "moge":
         meta = _MODEL_META.get(model_id, {})
         if meta.get("repo"):
@@ -547,7 +615,7 @@ def _models_status() -> list:
         sam2_loaded = (getattr(sam_wrapper, "_predictor", None) is not None
                        or getattr(sam_wrapper, "_sam3_model", None) is not None)
     except Exception:
-        sam2_path = Path("checkpoints/sam2.1_hiera_large.pt")
+        sam2_path = Path(paths.SAM2_CHECKPOINT_PATH)
         sam2_loaded = False
     sam2_down = sam2_path.exists() and sam2_path.stat().st_size > 0
     sam2_size = sam2_path.stat().st_size if sam2_down else 0
@@ -557,7 +625,7 @@ def _models_status() -> list:
     # encoders (ss_encoder.*, slat_encoder.ckpt) are training-only and one of
     # them ships as a 0-byte placeholder, so requiring them would wrongly report
     # the model as missing even though reconstruction works.
-    hf = Path("checkpoints/hf")
+    hf = paths.HF_WEIGHTS_DIR
     sam3d_files = [
         hf / "ss_generator.ckpt",
         hf / "ss_decoder.ckpt",
@@ -567,16 +635,16 @@ def _models_status() -> list:
     ]
     sam3d_down, sam3d_size = _files_size(sam3d_files)
     # The low-memory pipeline is (re)built per job and streams weights stage by
-    # stage. It is resident while a reconstruction runs, and we also flag it as
-    # loaded once a reconstruction has run this session.
+    # stage, then released in the job's ``finally``. It is only resident in RAM
+    # while a reconstruction is actually running.
     sam3d_running = any(not j.done for j in jobs.values())
-    sam3d_loaded = sam3d_running or _sam3d_loaded_once
+    sam3d_loaded = sam3d_running
 
-    # 3) MoGe ViT-L (monocular depth / pointmap prior). The depth preview builds
-    # the depth pipeline lazily; the weights are unloaded after each use, so we
-    # report loaded whenever the depth path has been initialised this session.
+    # 3) MoGe ViT-L (monocular depth / pointmap prior). The depth weights are
+    # loaded on demand and unloaded right after each depth call, so they are
+    # only resident in RAM during the (brief) depth computation itself.
     moge_down, moge_size = _moge_cache()
-    moge_loaded = _depth_pipeline is not None
+    moge_loaded = _depth_weights_loaded
 
     def entry(mid, name, role, downloaded, loaded, size):
         status = "loaded" if (downloaded and loaded) else (
@@ -609,6 +677,17 @@ def _models_status() -> list:
 @app.get("/models")
 async def models_status():
     return {"models": _models_status(), "hf": _hf_auth()}
+
+
+@app.get("/seg_status")
+async def seg_status():
+    """Load state of the active 2-D segmentation model (drives the Step-2 bar)."""
+    try:
+        from sam_wrapper import get_seg_load_status
+        return get_seg_load_status()
+    except Exception as exc:
+        return {"state": "idle", "model": None, "message": "", "progress": None,
+                "error": str(exc)}
 
 
 class DownloadRequest(BaseModel):
@@ -1107,10 +1186,9 @@ def smooth_mask(
 
 _depth_pipeline = None
 _depth_lock = threading.Lock()
-
-# Set True once a reconstruction has run this session (the SAM 3D pipeline is
-# streamed in per job and released, so this records that it has been loaded).
-_sam3d_loaded_once = False
+# True only while the MoGe weights are actually resident in RAM (they are loaded
+# on demand and unloaded again right after each depth call).
+_depth_weights_loaded = False
 
 
 def _preimport_hydra_targets() -> None:
@@ -1153,10 +1231,10 @@ def _get_depth_pipeline():
             # has imported them. (No-op in a normal source checkout.)
             _preimport_hydra_targets()
             _depth_pipeline = InferencePipelineLowMemory(
-                config_path="checkpoints/hf/pipeline.yaml",
+                config_path=str(paths.PIPELINE_CONFIG_PATH),
                 device="cpu",
                 dtype="float16",
-                cache_dir=".cache",
+                cache_dir=str(paths.PIPELINE_CACHE_DIR),
             )
         return _depth_pipeline
 
@@ -1181,15 +1259,26 @@ def _depth_to_png(image_rgb: np.ndarray, mask: np.ndarray) -> Optional[str]:
         # MoGe expects an RGBA image (mask carried in the alpha channel).
         rgba = pipe.merge_image_and_mask(image_rgb, m.astype(np.uint8) * 255)
 
+        # One heavy model in memory at a time: drop the 2-D segmentation models
+        # before MoGe runs (segmentation is finished once we have a mask here).
+        try:
+            from sam_wrapper import unload_segmentation_models
+            unload_segmentation_models()
+        except Exception:
+            pass
+
         # Serialise MoGe access: it is not safe to run the same model from two
         # threads, and the reconstruction pipeline uses its own instance.
+        global _depth_weights_loaded
         with _depth_lock:
-            point_map = pipe.compute_pointmap(rgba)
+            _depth_weights_loaded = True
             try:
+                point_map = pipe.compute_pointmap(rgba)
                 z = point_map["pointmap"][2].detach().cpu().numpy().astype(np.float32)
             finally:
                 # Free the MoGe weights before the heavy reconstruction stages.
                 pipe._unload_depth_model()
+                _depth_weights_loaded = False
 
         # Resize the mask to the pointmap grid if MoGe changed resolution.
         if z.shape != m.shape:
@@ -1288,13 +1377,11 @@ def _run_reconstruction_sync(
         from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
         _preimport_hydra_targets()
         pipeline = InferencePipelineLowMemory(
-            config_path="checkpoints/hf/pipeline.yaml",
+            config_path=str(paths.PIPELINE_CONFIG_PATH),
             device="cpu",
             dtype="float16",
-            cache_dir=".cache",
+            cache_dir=str(paths.PIPELINE_CACHE_DIR),
         )
-        global _sam3d_loaded_once
-        _sam3d_loaded_once = True
 
         job.update("Running 3-D reconstruction…", 12)
 
@@ -1317,13 +1404,13 @@ def _run_reconstruction_sync(
             use_stage2_distillation=distill,
         )
 
-        # The pipeline returns a per-vertex-coloured GLB (to_glb colours each
-        # vertex from the Gaussian appearance field, which is soft because the
-        # model conditions on a 518 px view). Re-project the ORIGINAL
-        # full-resolution photo onto the camera-facing front for sharper, more
-        # vibrant colour; hidden / back / side faces keep the reconstructed
-        # colour. This is a per-vertex recolour (no UV atlas) so it's fast and
-        # renders in model-viewer / Blender / three.js.
+        # The pipeline returns a per-vertex-coloured GLB: to_glb colours each
+        # vertex from the model's Gaussian appearance field. These colours are
+        # coherent across the whole surface (front, sides and hidden faces all
+        # look plausible), so we keep them as-is. A previous full-resolution
+        # photo re-projection made the front sharper but left an incoherent
+        # photo/model blend on grazing / occluded faces (blotches), so the photo
+        # overlay is intentionally disabled here.
         result_mesh = output["glb"]
 
         # Sand off the 64^3 voxel staircase on oblique silhouettes. The 2D mask is
@@ -1335,12 +1422,6 @@ def _run_reconstruction_sync(
             result_mesh = taubin_smooth(result_mesh, iterations=10)
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
-
-        job.update("Applying photo colour…", 90)
-        try:
-            result_mesh = _apply_photo_vertex_color(result_mesh, image, mask)
-        except Exception as exc:
-            logger.warning(f"[JOB {job_id}] photo recolour skipped: {exc}")
 
         result_path = str(RESULT_DIR / f"{job_id}.glb")
         job.update("Exporting GLB…", 95)

@@ -493,6 +493,47 @@ model-viewer {
 }
 @keyframes mini-spin { to { transform: rotate(360deg); } }
 
+/* Real-time download progress bar (replaces the spinner while downloading). */
+.model-dl { margin-top: 4px; }
+.model-dl-track {
+  height: 8px; border-radius: 6px; background: var(--bg);
+  border: 1px solid var(--border); overflow: hidden; position: relative;
+}
+.model-dl-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 6px; transition: width .3s ease;
+}
+.model-dl-fill.indeterminate {
+  width: 40% !important;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: dlIndeterminate 1.2s ease-in-out infinite;
+}
+@keyframes dlIndeterminate {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+.model-dl .model-dl-msg { margin-top: 6px; display: flex; justify-content: space-between; gap: 10px; }
+.model-dl-pct { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+/* Step-2 segmentation model loading bar (loading weights into RAM). */
+.seg-load { margin: 4px 0 10px; }
+.seg-load-track {
+  height: 6px; border-radius: 6px; background: var(--bg);
+  border: 1px solid var(--border); overflow: hidden; position: relative;
+}
+.seg-load-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 6px; transition: width .3s ease;
+}
+.seg-load-fill.indeterminate {
+  width: 40% !important;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: dlIndeterminate 1.2s ease-in-out infinite;
+}
+.seg-load-msg { margin-top: 6px; font-size: .72rem; color: var(--muted); }
+
 /* ── Hugging Face auth block ── */
 .hf-auth { margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
 .hf-auth .hf-row { display: flex; gap: 8px; margin-top: 8px; }
@@ -725,6 +766,13 @@ body.editing-3d main { max-width: calc(100vw - 400px); }
                    onkeydown="if(event.key==='Enter'){event.preventDefault();runTextSegment();}"/>
             <button type="button" class="btn-secondary" id="segtext-btn" onclick="runTextSegment()">Segment</button>
           </div>
+        </div>
+
+        <!-- 2-D segmentation model loading indicator (only one model is held in
+             memory at a time, so it is (re)loaded on demand). -->
+        <div id="seg-load" class="seg-load" style="display:none">
+          <div class="seg-load-track"><div class="seg-load-fill indeterminate"></div></div>
+          <div class="seg-load-msg">Loading model…</div>
         </div>
 
         <div class="quality-row">
@@ -1165,6 +1213,8 @@ async function uploadFile(file) {
     document.getElementById("step-upload").classList.add("hidden");
     document.getElementById("step-annotate").classList.remove("hidden");
     requestAnimationFrame(() => syncCanvasSize());
+    // The server starts loading the SAM 3 text model on upload; show the bar.
+    ensureSegLoadPolling();
   };
 }
 
@@ -1296,6 +1346,9 @@ function canvasCoords(e) {
 
 async function addMarker(e, label) {
   if (suppressClick) { suppressClick = false; return; }
+  // In text (SAM 3) mode the mask comes from the concept prompt, not clicks -
+  // ignore image clicks entirely so no stray point markers are added.
+  if (segMode === 'text') return;
   const { nx, ny } = canvasCoords(e);
   if (nx < 0 || ny < 0 || nx > imgW || ny > imgH) return;
   pushHistory();
@@ -1436,6 +1489,7 @@ async function runTextSegment() {
   if (segmentController) segmentController.abort();
   segmentController = new AbortController();
 
+  ensureSegLoadPolling();
   const btn = document.getElementById('segtext-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Segmenting…'; }
   try {
@@ -1471,6 +1525,7 @@ async function runSegment() {
   if (segmentController) segmentController.abort();
   segmentController = new AbortController();
 
+  ensureSegLoadPolling();
   const body = {
     image_id:        imageId,
     positive_points: markers.filter(m => m.label === 1).map(m => ({ x: m.nx, y: m.ny })),
@@ -1495,6 +1550,49 @@ async function runSegment() {
 function clearMask() {
   const { w, h } = displaySize();
   maskCtx.clearRect(0, 0, w, h);
+}
+
+// ── Step-2 model loading bar ──────────────────────────────────────────────────
+// Only one 2-D segmentation model is held in memory at a time, so switching mode
+// or segmenting can trigger a load. Poll /seg_status and show a loading bar until
+// the active model is ready.
+let _segLoadTimer = null;
+async function _pollSegLoad() {
+  try {
+    const res = await fetch("/seg_status");
+    if (!res.ok) return;
+    const s = await res.json();
+    renderSegLoad(s);
+    if (!s || s.state !== "loading") stopSegLoadPolling();
+  } catch (_) { /* ignore transient errors */ }
+}
+function ensureSegLoadPolling() {
+  if (!_segLoadTimer) _segLoadTimer = setInterval(_pollSegLoad, 500);
+  _pollSegLoad();
+}
+function stopSegLoadPolling() {
+  if (_segLoadTimer) { clearInterval(_segLoadTimer); _segLoadTimer = null; }
+}
+function renderSegLoad(s) {
+  const box = document.getElementById("seg-load");
+  if (!box) return;
+  if (s && s.state === "loading") {
+    box.style.display = "block";
+    const fill = box.querySelector(".seg-load-fill");
+    const msg  = box.querySelector(".seg-load-msg");
+    const hasPct = typeof s.progress === "number" && isFinite(s.progress);
+    if (fill) {
+      if (hasPct) {
+        fill.classList.remove("indeterminate");
+        fill.style.width = Math.max(0, Math.min(100, Math.round(s.progress * 100))) + "%";
+      } else {
+        fill.classList.add("indeterminate");
+      }
+    }
+    if (msg) msg.textContent = s.message || "Loading model…";
+  } else {
+    box.style.display = "none";
+  }
 }
 
 function drawMask(b64) {
@@ -3288,7 +3386,7 @@ function stopModelsPolling() {
 function ensureModelsPolling(active) {
   const open = $("models-sidebar").classList.contains("open");
   if (active && open && !_modelsPollTimer) {
-    _modelsPollTimer = setInterval(() => loadModelsStatus(true), 1500);
+    _modelsPollTimer = setInterval(() => loadModelsStatus(true), 900);
   } else if ((!active || !open) && _modelsPollTimer) {
     stopModelsPolling();
   }
@@ -3341,11 +3439,19 @@ async function loadModelsStatus(silent) {
         </div>`;
       }
 
-      // Action row: spinner while downloading, error + retry, or a Download button.
+      // Action row: live progress bar while downloading, error + retry, or a Download button.
       let action = "";
       if (running) {
-        action = `<div class="model-action"><span class="mini-spin"></span>
-          <span class="model-dl-msg">${_esc(dl.message || "Downloading…")}</span></div>`;
+        const hasPct = typeof dl.progress === "number" && isFinite(dl.progress);
+        const pct = hasPct ? Math.max(0, Math.min(100, Math.round(dl.progress * 100))) : null;
+        const fill = hasPct
+          ? `<div class="model-dl-fill" style="width:${pct}%"></div>`
+          : `<div class="model-dl-fill indeterminate"></div>`;
+        const pctLabel = hasPct ? `<span class="model-dl-pct">${pct}%</span>` : "";
+        action = `<div class="model-dl">
+          <div class="model-dl-track">${fill}</div>
+          <div class="model-dl-msg"><span>${_esc(dl.message || "Downloading…")}</span>${pctLabel}</div>
+        </div>`;
       } else if (m.status === "not_downloaded") {
         const errMsg = dl.state === "error"
           ? `<div class="model-dl-msg error">${_linkify(_esc(dl.message || "Download failed."))}</div>` : "";
