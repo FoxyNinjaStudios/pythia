@@ -576,6 +576,7 @@ IP available under a separate commercial license.
   | Component | Role | License |
   |---|---|---|
   | SAM 2 | Point-prompt segmentation | Apache 2.0 |
+  | SAM 3 | Text / concept segmentation | Meta SAM License |
   | DINOv2 | Image features | Apache 2.0 |
   | MoGe | Depth estimation | MIT |
   | SAM 3D Objects | Reconstruction model + weights | Meta SAM License |
