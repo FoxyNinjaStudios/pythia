@@ -332,7 +332,16 @@ async def lifespan(app_instance):
     global _main_loop
     _main_loop = asyncio.get_running_loop()
     logger.info("SAM-3D server starting…")
-    asyncio.get_event_loop().run_in_executor(None, _preload_sam)
+    loop = asyncio.get_event_loop()
+    # Warm the models in background threads so the server starts serving
+    # immediately while they load:
+    #  • SAM 2 point checkpoint present on disk (secondary point mode).
+    #  • SAM 3 text/concept model into memory. Text mode is the default, and the
+    #    model is large (~3 GB, weight load + Metal transfer takes several
+    #    seconds), so loading it at boot avoids a cold start on the first
+    #    upload / segment. Cached-only: it never triggers a gated download here.
+    loop.run_in_executor(None, _preload_sam)
+    loop.run_in_executor(None, _load_text_seg_model)
     try:
         yield
     finally:
