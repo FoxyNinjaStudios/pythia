@@ -1556,17 +1556,38 @@ function clearMask() {
 // Only one 2-D segmentation model is held in memory at a time, so switching mode
 // or segmenting can trigger a load. Poll /seg_status and show a loading bar until
 // the active model is ready.
+//
+// A load is kicked off on a worker thread (e.g. on upload), so when we start
+// polling the status may still be "idle" for a moment before the thread flips it
+// to "loading". We must NOT stop on that first idle read or we'd miss the whole
+// load. Keep polling through a short grace window until we've actually observed a
+// load; once we have, stop as soon as it leaves the "loading" state.
 let _segLoadTimer = null;
+let _segLoadSawLoading = false;
+let _segLoadIdlePolls = 0;
+const _SEG_LOAD_GRACE_POLLS = 20;   // ~10 s at 500 ms/poll to wait for a load to begin
 async function _pollSegLoad() {
   try {
     const res = await fetch("/seg_status");
     if (!res.ok) return;
     const s = await res.json();
     renderSegLoad(s);
-    if (!s || s.state !== "loading") stopSegLoadPolling();
-  } catch (_) { /* ignore transient errors */ }
+    if (s && s.state === "loading") {
+      _segLoadSawLoading = true;
+      _segLoadIdlePolls = 0;
+    } else {
+      // Stop once the load we were watching has finished, or after the grace
+      // window if no load ever started.
+      _segLoadIdlePolls++;
+      if (_segLoadSawLoading || _segLoadIdlePolls > _SEG_LOAD_GRACE_POLLS) {
+        stopSegLoadPolling();
+      }
+    }
+  } catch (_) { /* ignore transient errors (server may be busy loading) */ }
 }
 function ensureSegLoadPolling() {
+  _segLoadSawLoading = false;
+  _segLoadIdlePolls = 0;
   if (!_segLoadTimer) _segLoadTimer = setInterval(_pollSegLoad, 500);
   _pollSegLoad();
 }

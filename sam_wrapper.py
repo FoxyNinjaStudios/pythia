@@ -335,6 +335,9 @@ import os
 _SAM3_MODEL_ID = os.environ.get("SAM3_MODEL_ID", "facebook/sam3")
 _sam3_model = None
 _sam3_processor = None
+# Serialises SAM 3 loading so an on-upload preload and an explicit text segment
+# arriving close together can't both start a (multi-GB) load at the same time.
+_sam3_load_lock = threading.Lock()
 
 
 def _sam3_cached() -> bool:
@@ -349,7 +352,13 @@ def _sam3_cached() -> bool:
 def _get_sam3():
     """Lazily load the SAM 3 model + processor (singleton)."""
     global _sam3_model, _sam3_processor
-    if _sam3_model is None:
+    if _sam3_model is not None:
+        return _sam3_model, _sam3_processor
+    with _sam3_load_lock:
+        # Re-check inside the lock: another thread may have finished loading while
+        # we were waiting for it.
+        if _sam3_model is not None:
+            return _sam3_model, _sam3_processor
         from transformers import Sam3Model, Sam3Processor
 
         # One 2-D model in memory at a time: drop the SAM 2 point model before
@@ -383,13 +392,43 @@ def _get_sam3():
     return _sam3_model, _sam3_processor
 
 
+def note_text_preload_starting() -> bool:
+    """Decide whether an on-upload SAM 3 preload should run, and flag the bar.
+
+    Returns True only when the weights are downloaded but not yet resident — i.e.
+    there is something to load and it can be loaded offline (no blocking gated
+    download). In that case the segmentation-load bar is switched to ``loading``
+    *synchronously* here so the UI shows it immediately, before the worker thread
+    (which then holds the GIL while building the model) can starve the event loop.
+
+    Returns False when the model is already in memory or not downloaded, so the
+    caller can skip dispatching a pointless / blocking load.
+    """
+    if _sam3_model is not None:
+        return False
+    if not _sam3_cached():
+        return False
+    _set_seg_load("text", "loading", "Loading SAM 3 text model…")
+    return True
+
+
 def preload_text_model() -> None:
-    """Eagerly load the SAM 3 text/concept model at startup.
+    """Eagerly load the SAM 3 text/concept model — but only if it is downloaded.
 
     Text segmentation is the default UI mode, so loading its weights up front
-    makes the first text prompt instant instead of paying the model download /
-    load cost on the first click.
+    makes the first text prompt instant. This is fired on image upload, so it
+    must NOT block: for an un-cached gated repo, ``from_pretrained`` would try a
+    multi-GB download (which also needs a token) on a worker thread, holding the
+    GIL and starving the event loop so the whole server stalls. Downloading is
+    done explicitly from the Models tab (real progress + token handling), so we
+    only preload when the weights are already on disk.
     """
+    if not _sam3_cached():
+        # Nothing resident and nothing to load without a network download — leave
+        # the segmentation-load bar idle. The Models tab shows the Download step.
+        if _sam3_model is None and get_seg_load_status().get("model") != "point":
+            _set_seg_load(None, "idle", "")
+        return
     _get_sam3()
 
 

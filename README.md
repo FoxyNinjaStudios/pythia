@@ -94,8 +94,10 @@ one pool, so a 24 GB Mac holds both comfortably without a separate VRAM ceiling.
 
 ### Reconstruction
 
-- **Interactive segmentation.** SAM point-prompt masking in the browser UI
-  (positive / negative clicks), no manual mask files needed.
+- **Interactive segmentation.** Two prompt modes in the browser UI: **text /
+  concept** masking with **SAM 3** (describe the object, e.g. "chair") and
+  **point-prompt** masking with **SAM 2** (positive / negative clicks). No manual
+  mask files needed.
 - **Single-image 3D reconstruction.** Geometry and appearance from one photo.
 - **Apple-Silicon native.** SAM segmentation and MoGe depth run on the MPS
   backend; the 3-D reconstruction stages run on the CPU. No CUDA required.
@@ -111,19 +113,22 @@ one pool, so a 24 GB Mac holds both comfortably without a separate VRAM ceiling.
 
 ### Model management (web UI)
 
-A **Models** panel (top-right of the web app) shows the three models the app
-uses and lets you fetch them without touching the command line:
+A **Models** panel (top-right of the web app) shows the models the app uses and
+lets you fetch them without touching the command line:
 
 - **Live status.** Each model reports **Loaded** (in memory), **Downloaded** (on
-  disk), or **Missing**, with its on-disk size.
+  disk), or **Missing**, with its on-disk size. The active 2-D segmentation
+  model also shows a live "loading into memory" bar (it is loaded on demand, and
+  the text model is preloaded as soon as you upload an image).
 - **One-click downloads.** Missing models download in the background with a live
   progress indicator; the panel polls until each finishes.
 - **Hugging Face access built in.** Paste a Hugging Face access token in the
-  panel to authenticate; it is validated and saved for gated downloads.
-- **Gated-model handling.** **SAM 3D Objects** is gated behind Meta approval; if
-  access has not been granted the panel shows an actionable message linking
-  straight to the request-access page (approval itself still happens on Hugging
-  Face). SAM 2 and MoGe are public and download without a token.
+  panel to authenticate; it is validated and used for gated downloads.
+- **Gated-model handling.** **SAM 3** (text segmentation) and **SAM 3D Objects**
+  are gated behind Meta approval; if access has not been granted the panel shows
+  an actionable message linking straight to the request-access page (approval
+  itself still happens on Hugging Face). SAM 2 and MoGe are public and download
+  without a token.
 
 ### In-browser mesh tuning (web UI)
 
@@ -175,23 +180,33 @@ and update the 3D preview live:
 ### 1. Desktop app (interactive web UI)
 
 The app is a FastAPI server that serves an interactive single-page UI
-(`static/index.html`). Start it and open the browser UI:
+(`static/index.html`). Start it and it opens the browser UI automatically:
 
 ```bash
 conda activate sam-3d
-python server.py
-# then open http://localhost:8005
+python server.py                 # serves on http://localhost:8005 and opens it
+python server.py --port 9000     # use a different port
+python server.py --silent        # do not auto-open a browser
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--port` | TCP port to listen on (default: `8005`). |
+| `--silent` | Do not open the client in a browser after startup. |
+
+The server opens the client once the port is actually accepting connections, and
+shuts down cleanly on `Ctrl-C` / `SIGTERM` (with a watchdog fallback) so it never
+leaves an orphaned process holding the port.
 
 Workflow: upload an image, segment the object, pick a quality preset,
 reconstruct, then orbit the result, tune it (mesh cleanup, color grading,
 stencil trimming), and download in any of six formats (**GLB**, **glTF**,
 **USDZ**, **PLY**, **OBJ**, **STL**).
 
-The **Models** panel (top-right) reports the download / load status of the three
+The **Models** panel (top-right) reports the download / load status of the
 models and can fetch any that are missing - including pasting a Hugging Face
-token and downloading the gated SAM 3D weights - so first-time setup needs no
-command-line steps (see [Model management](#model-management-web-ui)).
+token and downloading the gated SAM 3 / SAM 3D weights - so first-time setup
+needs no command-line steps (see [Model management](#model-management-web-ui)).
 
 Optional Gaussian-splat export is on by default; disable it with
 `SAM3D_SPLAT=0`.
@@ -374,7 +389,7 @@ options.
 ```
 main.py             # CLI entry point
 server.py           # FastAPI web app (segmentation, reconstruct, export)
-sam_wrapper.py      # SAM 2 point-prompt segmentation wrapper
+sam_wrapper.py      # SAM 3 text/concept + SAM 2 point-prompt segmentation wrapper
 static/index.html   # Web UI: segmentation, 3D viewer, mesh tuning, color grading, stencil editing, multi-format export (client-side baking / meshopt compression), model download / status panel
 splat_export.py     # Optional Gaussian-splat (.ply) export module
 texture_baking.py   # UV texture-atlas baking (portable, no CUDA)
@@ -437,8 +452,8 @@ following were built here:
 1. **Portable appearance.** Real 3D Gaussian-Splatting `.ply` export and a
    PyTorch3D-based UV texture baker, replacing the original CUDA/nvdiffrast
    texturing path.
-2. **FastAPI web application.** Interactive point-prompt SAM segmentation, live
-   progress streaming, and an in-browser 3D viewer.
+2. **FastAPI web application.** Interactive text/concept (SAM 3) and point-prompt
+   (SAM 2) segmentation, live progress streaming, and an in-browser 3D viewer.
 3. **Depth-stage validity mask.** Masks invalid MoGe depth before it conditions
    the geometry stage.
 4. **Geometry cleanup.** Default hole filling and floater removal for watertight

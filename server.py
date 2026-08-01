@@ -307,13 +307,39 @@ class DepthRequest(BaseModel):
 
 from contextlib import asynccontextmanager
 
+def _shutdown_cleanup() -> None:
+    """Release models / caches on server shutdown so nothing lingers on exit."""
+    global _depth_pipeline
+    try:
+        from sam_wrapper import unload_segmentation_models
+        unload_segmentation_models()
+    except Exception:
+        pass
+    try:
+        _depth_pipeline = None
+    except Exception:
+        pass
+    try:
+        import gc
+        gc.collect()
+        torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app_instance):
     global _main_loop
     _main_loop = asyncio.get_running_loop()
     logger.info("SAM-3D server starting…")
     asyncio.get_event_loop().run_in_executor(None, _preload_sam)
-    yield
+    try:
+        yield
+    finally:
+        # Runs during uvicorn's graceful shutdown (Ctrl-C / SIGTERM) before the
+        # event loop closes, so in-memory models are dropped cleanly on exit.
+        logger.info("SAM-3D server shutting down…")
+        _shutdown_cleanup()
 
 # Resolve the static directory both in development and when frozen into a
 # PyInstaller executable (which unpacks bundled data under sys._MEIPASS).
@@ -809,10 +835,15 @@ async def upload_image(file: UploadFile = File(...)):
     img.save(UPLOAD_DIR / f"{image_id}.png")
 
     # Text/concept segmentation is the default UI mode, so start loading the SAM 3
-    # text model now that an image is in play. Runs in a worker thread so the
-    # upload response is not blocked; the model is ready by the first segment.
+    # text model now that an image is in play. Only dispatch when the weights are
+    # downloaded but not yet resident: an un-cached gated repo would try a
+    # multi-GB download on the worker thread (needs a token, holds the GIL) and
+    # stall the server. The seg-load bar is flagged synchronously so the UI shows
+    # it immediately instead of racing the worker thread.
     try:
-        asyncio.get_event_loop().run_in_executor(None, _load_text_seg_model)
+        from sam_wrapper import note_text_preload_starting
+        if note_text_preload_starting():
+            asyncio.get_event_loop().run_in_executor(None, _load_text_seg_model)
     except Exception:
         pass
 
@@ -1518,13 +1549,88 @@ def _preload_sam():
 
 if __name__ == "__main__":
     import uvicorn
+    import argparse
+    import signal
+    import socket
+    import threading
+    import time
+    import webbrowser
+
+    parser = argparse.ArgumentParser(description="SAM-3D reconstruction server")
+    parser.add_argument("--port", type=int, default=8005,
+                        help="TCP port to listen on (default: 8005)")
+    parser.add_argument("--silent", action="store_true",
+                        help="Do not open the client in a browser after startup")
+    args = parser.parse_args()
+    port = args.port
+
+    # Open the client once the server is actually accepting connections (unless
+    # --silent). Runs on a daemon thread that waits for the port to bind, so it
+    # never blocks startup or shutdown.
+    if not args.silent:
+        def _open_browser_when_ready() -> None:
+            url = f"http://127.0.0.1:{port}/"
+            for _ in range(150):            # up to ~30 s for the port to come up
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                return                       # never bound; don't pop a dead tab
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+        threading.Thread(target=_open_browser_when_ready,
+                         name="open-browser", daemon=True).start()
+
     # Pass the app object directly (not the "server:app" import string) so this
     # works when frozen into a PyInstaller executable, where the "server" module
     # can't be re-imported by Uvicorn.
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host="0.0.0.0",
-        port=8005,
+        port=port,
         workers=1,       # must be 1 – ML models are not fork-safe
         reload=False,
+        # Don't let long-lived SSE streams (/status, /logs) hold shutdown open:
+        # force-close remaining connections after a few seconds.
+        timeout_graceful_shutdown=5,
     )
+    server = uvicorn.Server(config)
+
+    # Manage signals ourselves so the process ALWAYS dies on exit and never
+    # lingers with port 8005 bound. Uvicorn's own handler asks the event loop to
+    # shut down gracefully — but a GIL-heavy model load on a worker thread can
+    # wedge that loop so the graceful stop never completes and the process
+    # becomes an orphan. So: first signal → ask uvicorn to stop AND arm a
+    # watchdog that hard-exits if the graceful stop stalls; second signal →
+    # hard-exit immediately.
+    server.install_signal_handlers = lambda: None
+    _sig_count = {"n": 0}
+
+    def _on_signal(signum, frame):
+        _sig_count["n"] += 1
+        if _sig_count["n"] >= 2:
+            os._exit(0)                     # impatient second Ctrl-C: exit now
+        server.should_exit = True           # let uvicorn unwind gracefully
+        # Fallback: guarantee termination even if the loop can't finish unwinding.
+        wd = threading.Timer(8.0, lambda: os._exit(0))
+        wd.daemon = True
+        wd.start()
+
+    for _s in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if _s is not None:
+            try:
+                signal.signal(_s, _on_signal)
+            except (ValueError, OSError):
+                pass                        # not on the main thread / unsupported
+
+    try:
+        server.run()
+    finally:
+        # Normal return path (or any unhandled exit): make sure a stuck worker
+        # thread can't keep the interpreter — and the bound port — alive.
+        os._exit(0)
