@@ -383,7 +383,17 @@ def _get_sam3():
             print(f"[SAM3] Loading {_SAM3_MODEL_ID} on {device}… "
                   f"({'offline (cached)' if local_only else 'first run downloads gated weights'})")
             _sam3_processor = Sam3Processor.from_pretrained(_SAM3_MODEL_ID, **kw)
-            _sam3_model = Sam3Model.from_pretrained(_SAM3_MODEL_ID, **kw).to(device).eval()
+            # low_cpu_mem_usage loads weights straight onto a meta-initialised
+            # skeleton instead of first allocating + randomly initialising every
+            # parameter tensor in Python. That random-init is the long GIL-held
+            # stretch that otherwise starves the asyncio event loop (the server
+            # appears to hang) on this ~3 GB model's first load, so skipping it
+            # both speeds the load and keeps the server responsive during it.
+            _sam3_model = (
+                Sam3Model.from_pretrained(_SAM3_MODEL_ID, low_cpu_mem_usage=True, **kw)
+                .to(device)
+                .eval()
+            )
             print("[SAM3] Ready.")
             _set_seg_load("text", "ready", "SAM 3 text model ready", progress=1.0)
         except Exception as exc:
