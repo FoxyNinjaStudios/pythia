@@ -176,12 +176,17 @@ logging.getLogger().addHandler(_buf_handler)
 # Job state
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _JobCancelled(Exception):
+    """Raised inside the reconstruction worker when the job was cancelled."""
+
+
 class JobState:
     def __init__(self, job_id: str):
         self.job_id      = job_id
         self.progress    = 0
         self.message     = "Queued"
         self.done        = False
+        self.cancelled   = False
         self.error: Optional[str] = None
         self.result_path: Optional[str] = None
         # Source image / mask paths, so post-processing steps (e.g. functional
@@ -233,6 +238,14 @@ class JobState:
         self.done  = True
         self.error = error
         self._broadcast({"progress": -1, "message": f"error: {error}", "done": True})
+
+    def cancel(self):
+        """Flag the job as cancelled so the worker aborts at the next stage
+        boundary, and close the SSE stream for any listening client."""
+        self.cancelled = True
+        self.done      = True
+        self._broadcast({"progress": -1, "message": "cancelled", "done": True,
+                         "cancelled": True})
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -952,6 +965,27 @@ async def reconstruct(req: ReconstructRequest):
     return {"job_id": job_id}
 
 
+@app.post("/reset")
+async def reset():
+    """Stop all in-flight work and free every in-memory model.
+
+    Invoked by the client's "Try another image" button so a fresh session
+    starts clean: running reconstruction jobs are flagged cancelled (the worker
+    aborts at its next stage boundary and skips the export), and all
+    segmentation / depth models are dropped so unified memory is returned to the
+    OS instead of lingering into the next image.
+    """
+    cancelled = 0
+    for job in list(jobs.values()):
+        if not job.done:
+            job.cancel()
+            cancelled += 1
+    # Runs the same teardown as graceful shutdown (SAM 2 + SAM 3 + depth models,
+    # gc, Metal cache) without stopping the server.
+    _shutdown_cleanup()
+    return {"cancelled": cancelled}
+
+
 # ── Status SSE ─────────────────────────────────────────────────────────────────
 
 @app.get("/status/{job_id}")
@@ -1455,6 +1489,9 @@ def _run_reconstruction_sync(
         image = np.array(PILImage.open(img_path).convert("RGB"))
         mask  = np.array(PILImage.open(mask_path).convert("L"))
 
+        if job.cancelled:
+            raise _JobCancelled()
+
         job.update("Loading pipeline…", 5)
 
         from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
@@ -1465,6 +1502,9 @@ def _run_reconstruction_sync(
             dtype="float16",
             cache_dir=str(paths.PIPELINE_CACHE_DIR),
         )
+
+        if job.cancelled:
+            raise _JobCancelled()
 
         job.update("Running 3-D reconstruction…", 12)
 
@@ -1506,6 +1546,9 @@ def _run_reconstruction_sync(
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
 
+        if job.cancelled:
+            raise _JobCancelled()
+
         result_path = str(RESULT_DIR / f"{job_id}.glb")
         job.update("Exporting GLB…", 95)
         # Keep the on-disk mesh vertex-coloured (no material): trimesh drops the
@@ -1518,6 +1561,9 @@ def _run_reconstruction_sync(
         job.complete(result_path)
         logger.info(f"[JOB {job_id}] Done → {result_path}")
 
+    except _JobCancelled:
+        job.cancel()
+        logger.info(f"[JOB {job_id}] Cancelled by client reset")
     except Exception as exc:
         job.fail(str(exc))
         logger.error(f"[JOB {job_id}] Failed:\n{traceback.format_exc()}")
