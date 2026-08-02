@@ -9,6 +9,7 @@ ENV/
 .ipynb_checkpoints/
 dist/
 build/
+tmp/
 
 # OS
 .DS_Store
