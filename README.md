@@ -1,9 +1,8 @@
 # PYTHIA: SAM 3D Objects for Apple Silicon
 
-Turn a single photo into a 3D object on a Mac. This is a native Apple-Silicon
-port of Meta AI's **SAM 3D Objects**. Segmentation (SAM) and depth (MoGe) run on
-the GPU via Metal Performance Shaders (MPS); the 3-D generative reconstruction
-stages run on the CPU, with no CUDA required.
+<img src="images/icon1024.png" width=300>
+
+Turn a single photo into a 3D object on a Mac. This is a native Apple-Silicon port of Meta AI's **SAM 3D Objects**. Segmentation (SAM) and depth (MoGe) run on the GPU via Metal Performance Shaders (MPS); the 3D generative reconstruction stages run on the CPU, with no CUDA required.
 
 It ships two ways:
 
