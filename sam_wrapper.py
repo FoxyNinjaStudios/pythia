@@ -17,6 +17,13 @@ import urllib.request
 from pathlib import Path
 from typing import List, Dict, Optional
 
+# HuggingFace tokenizers spins up a fork-based parallel worker whose semaphore is
+# not always cleaned up, producing a benign "leaked semaphore objects" warning at
+# shutdown. We tokenise one short prompt at a time, so the parallelism buys us
+# nothing — disable it to keep shutdown clean. Must be set before transformers /
+# tokenizers is imported.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import numpy as np
 import torch
 from PIL import Image as PILImage
@@ -104,6 +111,12 @@ _predictor = None
 def _get_predictor():
     global _predictor
     if _predictor is None:
+        # See _get_sam3: lower the GIL switch interval so the asyncio event loop
+        # (main thread) keeps getting scheduled while this background thread runs
+        # the GIL-heavy sam2 import + checkpoint load, then restore it.
+        import sys
+        _prev_switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -122,6 +135,8 @@ def _get_predictor():
         except Exception as exc:
             _set_seg_load("point", "error", f"Failed to load point model: {exc}")
             raise
+        finally:
+            sys.setswitchinterval(_prev_switch)
     return _predictor
 
 
@@ -359,6 +374,19 @@ def _get_sam3():
         # we were waiting for it.
         if _sam3_model is not None:
             return _sam3_model, _sam3_processor
+
+        # This load runs on a background (executor) thread while the asyncio event
+        # loop serves the UI on the main thread. The transformers import and the
+        # per-tensor weight/​device work are long stretches of pure-Python /​ GIL-
+        # holding code, and the interpreter only hands the GIL to the event-loop
+        # thread every ``switchinterval`` seconds (default 5 ms). Frozen under
+        # PyInstaller the import is even heavier, so the UI feels frozen. Drop the
+        # switch interval for the duration of the load so the event loop is
+        # scheduled ~10× more often and stays responsive; restore it afterwards so
+        # steady-state throughput is unaffected.
+        import sys
+        _prev_switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)
         from transformers import Sam3Model, Sam3Processor
 
         # One 2-D model in memory at a time: drop the SAM 2 point model before
@@ -399,6 +427,8 @@ def _get_sam3():
         except Exception as exc:
             _set_seg_load("text", "error", f"Failed to load text model: {exc}")
             raise
+        finally:
+            sys.setswitchinterval(_prev_switch)
     return _sam3_model, _sam3_processor
 
 
