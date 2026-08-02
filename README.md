@@ -21,12 +21,12 @@ grading, stencil trimming, decimation, and GLB compression.
 
 Full pipeline on an M1 Mac - under a minute for simple models:
 
-<img src="demo.gif" width="100%">
+<img src="images/demo.gif" width="100%">
 
 **Original image**
 
 <p align="left">
-  <img src="demoimage.jpg" width="100%"/>
+  <img src="images/demoimage.jpg" width="100%"/>
 </p>
 
 <table>
@@ -35,14 +35,14 @@ Full pipeline on an M1 Mac - under a minute for simple models:
 <th>Depth mask</th>
 </tr>
 <tr>
-<td><img src="demo-1.png" width="300"/></td>
-<td><img src="demo-2.png" width="300"/></td>
+<td><img src="images/demo-1.png" width="300"/></td>
+<td><img src="images/demo-2.png" width="300"/></td>
 </tr>
 </table>
 
 **Reconstructed model**
 
-<img src="modeltt.gif" width="100%">
+<img src="images/modeltt.gif" width="100%">
 
 Using **SAM 3D** by Meta AI:
 - [Paper (arXiv)](https://arxiv.org/abs/2511.16624)
