@@ -412,6 +412,10 @@ _MODEL_META = {
     "sam3":  {"repo": "facebook/sam3",           "gated": True,  "dl_bytes": 3_400_000_000},
     "sam3d": {"repo": "facebook/sam-3d-objects", "gated": True,  "dl_bytes": 13_106_000_000},
     "moge":  {"repo": "Ruicheng/moge-vitl",      "gated": False, "dl_bytes": 1_340_000_000},
+    # DINOv2 ViT-L/14 (with registers) – image feature backbone used inside the
+    # reconstruction generators. Not an HF repo: it is fetched from torch.hub
+    # (facebookresearch/dinov2 code + the reg4 pretrained weights).
+    "dino":  {"repo": None,                      "gated": False, "dl_bytes": 1_217_607_321},
 }
 
 
@@ -529,7 +533,29 @@ def _download_worker(model_id: str) -> None:
                 "moge", repo_dir, meta.get("dl_bytes", 0), "Downloading MoGe ViT-L")
             try:
                 from huggingface_hub import snapshot_download
-                snapshot_download(repo_id=meta["repo"])
+                with paths.hf_online():
+                    snapshot_download(repo_id=meta["repo"])
+            finally:
+                stop.set()
+        elif model_id == "dino":
+            import torch, gc
+            weights, _repo = _dino_paths()
+            # Watch the whole checkpoints dir: torch.hub streams the download into
+            # a temp file there before renaming to the final name, so the growing
+            # bytes only show at the directory level.
+            stop = _start_progress_sampler(
+                "dino", weights.parent, meta.get("dl_bytes", 0), "Downloading DINOv2 ViT-L/14")
+            try:
+                # Fetches the dinov2 repo code + reg4 pretrained weights into the
+                # torch.hub cache (exactly where reconstruction loads them from),
+                # then drops the constructed model — we only wanted the files on
+                # disk. trust_repo avoids the interactive GitHub trust prompt.
+                model = torch.hub.load(
+                    "facebookresearch/dinov2", "dinov2_vitl14_reg",
+                    pretrained=True, trust_repo=True, verbose=False,
+                )
+                del model
+                gc.collect()
             finally:
                 stop.set()
         elif model_id == "sam3":
@@ -541,7 +567,8 @@ def _download_worker(model_id: str) -> None:
             stop = _start_progress_sampler(
                 "sam3", repo_dir, meta.get("dl_bytes", 0), "Downloading SAM 3 weights")
             try:
-                snapshot_download(repo_id=meta["repo"], token=token)
+                with paths.hf_online():
+                    snapshot_download(repo_id=meta["repo"], token=token)
             finally:
                 stop.set()
         elif model_id == "sam3d":
@@ -553,12 +580,13 @@ def _download_worker(model_id: str) -> None:
             stop = _start_progress_sampler(
                 "sam3d", dest, meta.get("dl_bytes", 0), "Downloading SAM 3D Objects weights")
             try:
-                snapshot_download(
-                    repo_id=meta["repo"],
-                    local_dir=str(dest),
-                    allow_patterns=["*.ckpt", "*.pt", "*.safetensors", "*.yaml", "*.json"],
-                    token=token,
-                )
+                with paths.hf_online():
+                    snapshot_download(
+                        repo_id=meta["repo"],
+                        local_dir=str(dest),
+                        allow_patterns=["*.ckpt", "*.pt", "*.safetensors", "*.yaml", "*.json"],
+                        token=token,
+                    )
                 # The repo nests its weights under a ``checkpoints/`` subfolder, but
                 # the app loads them flat from checkpoints/hf/. Move any nested files
                 # up so the pipeline (and the status check) find them.
@@ -646,6 +674,24 @@ def _purge_model(model_id: str) -> int:
         if meta.get("repo"):
             freed += _purge_hf_repo(meta["repo"])
         _depth_pipeline = None                      # drop the in-memory depth pipeline
+    elif model_id == "dino":
+        # Remove the torch.hub-cached weights (the large part) and the repo code
+        # dir so the next reconstruction re-fetches a clean copy if needed.
+        try:
+            weights, repo = _dino_paths()
+            if weights.exists():
+                freed += weights.stat().st_size
+                weights.unlink()
+            if repo.is_dir():
+                for f in repo.rglob("*"):
+                    if f.is_file():
+                        try:
+                            freed += f.stat().st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(repo, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("DINOv2 purge failed: %s", exc)
     return freed
 
 
@@ -681,6 +727,30 @@ def _sam3_cache() -> tuple[bool, int]:
         for repo in scan_cache_dir().repos:
             if repo.repo_id == "facebook/sam3" and repo.size_on_disk > 0:
                 return True, int(repo.size_on_disk)
+    except Exception:
+        pass
+    return False, 0
+
+
+# DINOv2 ViT-L/14 (reg) lives in the torch.hub cache, not the HF cache. These are
+# the exact paths torch.hub writes: the repo code dir and the pretrained weights.
+_DINO_WEIGHTS_NAME = "dinov2_vitl14_reg4_pretrain.pth"
+_DINO_REPO_DIRNAME = "facebookresearch_dinov2_main"
+
+
+def _dino_paths() -> tuple[Path, Path]:
+    """Return (weights_file, repo_dir) for the DINOv2 backbone in the torch.hub cache."""
+    import torch
+    hub = Path(torch.hub.get_dir())
+    return hub / "checkpoints" / _DINO_WEIGHTS_NAME, hub / _DINO_REPO_DIRNAME
+
+
+def _dino_cache() -> tuple[bool, int]:
+    """Detect whether the DINOv2 ViT-L/14 (reg) weights are in the torch.hub cache."""
+    try:
+        weights, _repo = _dino_paths()
+        if weights.exists() and weights.stat().st_size > 0:
+            return True, int(weights.stat().st_size)
     except Exception:
         pass
     return False, 0
@@ -735,6 +805,12 @@ def _models_status() -> list:
     moge_down, moge_size = _moge_cache()
     moge_loaded = _depth_weights_loaded
 
+    # 4) DINOv2 ViT-L/14 (reg) image feature backbone. Cached in the torch.hub
+    # dir; built and released as part of the reconstruction generators, so it is
+    # only resident while a reconstruction is running.
+    dino_down, dino_size = _dino_cache()
+    dino_loaded = sam3d_running
+
     def entry(mid, name, role, downloaded, loaded, size):
         status = "loaded" if (downloaded and loaded) else (
             "downloaded" if downloaded else "not_downloaded"
@@ -762,6 +838,8 @@ def _models_status() -> list:
               sam3d_down, sam3d_loaded, sam3d_size),
         entry("moge", "MoGe ViT-L", "Depth / pointmap prior",
               moge_down, moge_loaded, moge_size),
+        entry("dino", "DINOv2 ViT-L/14", "Image feature backbone",
+              dino_down, dino_loaded, dino_size),
     ]
 
 

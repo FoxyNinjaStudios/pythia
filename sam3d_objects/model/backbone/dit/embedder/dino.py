@@ -31,7 +31,21 @@ class Dino(torch.nn.Module):
             logger.info(f"Loading DINO model: {dino_model} from {repo_or_dir} (source: {source})")
             if backbone_kwargs:
                 logger.info(f"DINO backbone kwargs: {backbone_kwargs}")
-            
+
+            # Prefer the local torch.hub cache: once the dinov2 repo has been
+            # fetched once, always load it with source='local' so we never hit
+            # GitHub again (a network load also makes a GitHub API call to
+            # validate the ref, which is slow and pointless when the repo is
+            # already on disk). Fall back to the configured (github) source only
+            # when the cache is missing.
+            import os
+            cache_dir = torch.hub.get_dir()
+            local_repo = os.path.join(cache_dir, "facebookresearch_dinov2_main")
+            if source != "local" and os.path.isdir(local_repo):
+                logger.info(f"Loading DINO from local torch.hub cache: {local_repo}")
+                repo_or_dir = local_repo
+                source = "local"
+
             # Try loading from source, with fallback to local cache if network fails
             try:
                 self.backbone = torch.hub.load(
@@ -48,9 +62,6 @@ class Dino(torch.nn.Module):
                     logger.warning(f"Network error loading DINO from GitHub: {e}")
                     logger.info("Falling back to local cache...")
                     # Try loading from local cache
-                    import os
-                    cache_dir = torch.hub.get_dir()
-                    local_repo = os.path.join(cache_dir, "facebookresearch_dinov2_main")
                     if os.path.exists(local_repo):
                         self.backbone = torch.hub.load(
                             repo_or_dir=local_repo,

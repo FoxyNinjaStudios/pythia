@@ -55,16 +55,70 @@ RESULT_DIR = OUTPUTS_DIR / "results"
 
 
 def configure_hf_cache() -> None:
-    """Point the Hugging Face hub cache under ``PYTHIA_HOME``.
+    """Point the Hugging Face hub cache under ``PYTHIA_HOME`` and cache aggressively.
 
-    Uses ``setdefault`` so an explicit ``HF_HOME`` set by the user still wins.
-    Must run before ``huggingface_hub`` / ``transformers`` are imported so their
-    module-level cache constants pick up the location.
+    Uses ``setdefault`` so an explicit value set by the user still wins. Must run
+    before ``huggingface_hub`` / ``transformers`` are imported so their
+    module-level cache/offline constants pick up these values.
+
+    Once a model's weights are on disk we never want to touch the network again —
+    no ETag HEAD checks, no re-validation, no re-downloads. So the app defaults to
+    Hugging Face *offline* mode: every model load is served straight from the
+    local cache. The only time we need the network is an explicit download from
+    the Models tab, which wraps its ``snapshot_download`` in :func:`hf_online`.
     """
     HF_HUB_DIR.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
     os.environ.setdefault("HF_HUB_CACHE", str(HF_HUB_DIR))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_HUB_DIR))
+    # Serve cached weights without ever revalidating them against the Hub.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # No telemetry pings on import/load.
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def hf_online():
+    """Temporarily allow Hugging Face Hub network access inside this block.
+
+    The app runs in offline mode by default (see :func:`configure_hf_cache`) so
+    cached weights are never revalidated. Explicit downloads must opt back into
+    the network for their duration. ``huggingface_hub`` snapshots the offline
+    flag into a module constant at import time, so we patch that constant too —
+    flipping the env var alone would not take effect for an already-imported
+    module.
+    """
+    prev_env = {k: os.environ.get(k) for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+    patched = []
+    for mod_name in ("huggingface_hub.constants", "transformers.utils.hub"):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "HF_HUB_OFFLINE"):
+                patched.append((mod, "HF_HUB_OFFLINE", mod.HF_HUB_OFFLINE))
+                mod.HF_HUB_OFFLINE = False
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        for mod, attr, old in patched:
+            try:
+                setattr(mod, attr, old)
+            except Exception:
+                pass
+        for k, v in prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
 
 
 def ensure_dirs() -> None:
