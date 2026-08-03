@@ -70,7 +70,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["sam3d_objects"]
+packages = ["src/sam3d_objects"]
 
 [tool.uv.extra-build-dependencies]
 pytorch3d = ["torch", "setuptools"]

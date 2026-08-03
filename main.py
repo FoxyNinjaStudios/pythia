@@ -9,6 +9,12 @@ import time
 import argparse
 import resource
 
+# ── source layout ─────────────────────────────────────────────────────────────
+# Only main.py and server.py live at the repo root; every other module lives
+# under ./src. Put src on sys.path so the (deferred) imports of sam_wrapper,
+# mesh_utils, sam3d_objects, … resolve.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
 # Set environment before any imports
 os.environ.setdefault('LIDRA_SKIP_INIT', '1')
 
