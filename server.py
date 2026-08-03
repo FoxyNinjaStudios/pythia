@@ -36,14 +36,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# ── source layout ─────────────────────────────────────────────────────────────
-# Only main.py and server.py live at the repo root; every other module (paths,
-# sam_wrapper, mesh_utils, the sam3d_objects package, …) lives under ./src. Put
-# src on sys.path so the absolute imports below — and the deferred ones at
-# runtime — resolve. In a PyInstaller build the modules are bundled flat, so the
-# missing src/ dir is simply a no-op here.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
-
 # ── environment must be set before any ML imports ─────────────────────────────
 os.environ.setdefault("OMP_NUM_THREADS",     "14")
 os.environ.setdefault("MKL_NUM_THREADS",     "14")

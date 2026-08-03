@@ -61,11 +61,7 @@ OBJECTS = {
     "shutter_1980":   ("images/shutterstock_1980085646", 0),
 }
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (parent of src/)
-_SELF = os.path.abspath(__file__)                                   # this script's path under src/
-# main.py lives at the repo root; make it importable from this src/ module.
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
+REPO = os.path.dirname(os.path.abspath(__file__))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +243,7 @@ def main():
                 continue
             print(f"[BENCH] ({n}/{total}) run  {cfg}__{obj} …")
             cmd = [
-                sys.executable, _SELF,
+                sys.executable, os.path.join(REPO, "benchmark_wo013.py"),
                 "--worker", "--config", cfg, "--object", obj,
                 "--object-index", str(args.object_index),
                 "--results-dir", args.results_dir,
