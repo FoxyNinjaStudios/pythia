@@ -1555,6 +1555,8 @@ async function runTextSegment() {
   segmentController = new AbortController();
 
   ensureSegLoadPolling();
+  showSegBusy();
+  const _req = ++_segReqSeq;
   const btn = document.getElementById('segtext-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Segmenting…'; }
   try {
@@ -1577,6 +1579,7 @@ async function runTextSegment() {
   } catch (err) {
     if (err.name !== 'AbortError') console.error('Text segment error:', err);
   } finally {
+    if (_req === _segReqSeq) hideSegBusy();
     if (btn) { btn.disabled = false; btn.textContent = 'Segment'; }
   }
 }
@@ -1591,6 +1594,8 @@ async function runSegment() {
   segmentController = new AbortController();
 
   ensureSegLoadPolling();
+  showSegBusy();
+  const _req = ++_segReqSeq;
   const body = {
     image_id:        imageId,
     positive_points: markers.filter(m => m.label === 1).map(m => ({ x: m.nx, y: m.ny })),
@@ -1609,6 +1614,8 @@ async function runSegment() {
     drawMask(lastMaskB64);
   } catch (err) {
     if (err.name !== "AbortError") console.error("Segment error:", err);
+  } finally {
+    if (_req === _segReqSeq) hideSegBusy();
   }
 }
 
@@ -1629,6 +1636,8 @@ function clearMask() {
 // load; once we have, stop as soon as it leaves the "loading" state.
 let _segLoadTimer = null;
 let _segLoadSawLoading = false;
+let _segBusy = false;   // true while a /segment request is actually in flight
+let _segReqSeq = 0;     // increments per request so stale aborts don't clear a newer bar
 let _segLoadIdlePolls = 0;
 const _SEG_LOAD_GRACE_POLLS = 20;   // ~10 s at 500 ms/poll to wait for a load to begin
 async function _pollSegLoad() {
@@ -1660,6 +1669,26 @@ function ensureSegLoadPolling() {
 function stopSegLoadPolling() {
   if (_segLoadTimer) { clearInterval(_segLoadTimer); _segLoadTimer = null; }
 }
+// Show/hide the indeterminate "Segmenting…" activity bar for the in-flight
+// /segment request. Reuses the seg-load box; a real model load (handled by the
+// poll) takes visual priority over this.
+function showSegBusy() {
+  _segBusy = true;
+  const box = document.getElementById("seg-load");
+  if (!box) return;
+  box.style.display = "block";
+  box.classList.remove("seg-load-ready");
+  const fill = box.querySelector(".seg-load-fill");
+  const msg  = box.querySelector(".seg-load-msg");
+  if (fill) { fill.classList.add("indeterminate"); fill.style.width = ""; }
+  if (msg)  msg.textContent = "Segmenting…";
+}
+function hideSegBusy() {
+  _segBusy = false;
+  // Let the poll settle the final state (Ready label after a load, or hidden).
+  // If no poll is running, re-fetch once so the bar clears promptly.
+  if (!_segLoadTimer) { _pollSegLoad(); }
+}
 function renderSegLoad(s) {
   const box = document.getElementById("seg-load");
   if (!box) return;
@@ -1678,6 +1707,16 @@ function renderSegLoad(s) {
       }
     }
     if (msg) msg.textContent = s.message || "Loading model…";
+  } else if (_segBusy) {
+    // No model load in progress, but a segmentation request is running — show an
+    // indeterminate activity bar so the user gets feedback during inference.
+    box.style.display = "block";
+    box.classList.remove("seg-load-ready");
+    if (fill) {
+      fill.classList.add("indeterminate");
+      fill.style.width = "";
+    }
+    if (msg) msg.textContent = "Segmenting…";
   } else if (s && s.state === "ready" && _segLoadSawLoading) {
     // The load we were watching just finished — replace the progress bar with a
     // small persistent "Ready" label instead of hiding the row outright.
