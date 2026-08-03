@@ -91,6 +91,23 @@ one pool, so a 24 GB Mac holds both comfortably without a separate VRAM ceiling.
 
 ## Features
 
+### ⚠️ Multi-view reconstruction (experimental, temporarily hidden)
+
+Multi-view 3D reconstruction is fully implemented in the backend but currently hidden from the web UI due to performance optimization pending. The backend code (`run_multi_view()` in `InferencePipelinePointMap` and `InferencePipelineLowMemory`) is fully functional and available for **CLI/programmatic use**. To re-enable the UI, remove `display:none;` from the mode toggle in `static/index.html` line 733.
+
+**CLI usage (test multi-view reconstruction):**
+```bash
+condi activate sam-3d
+python main.py --multi-view --image-dir <images_directory> --masks-dir <masks_directory> --fusion-mode stochastic --output output.glb
+```
+
+Arguments:
+- `--multi-view`: Enable multi-view mode (requires ≥2 images and masks)
+- `--image-dir`: Directory containing input images
+- `--masks-dir`: Directory containing corresponding masks (SAM or manual)
+- `--fusion-mode`: `stochastic` (recommended, random view per step) or `multidiffusion` (all views per step)
+- `--view-indices`: Comma-separated view indices to use (e.g. `0,2,3`)
+
 ### Reconstruction
 
 - **Interactive segmentation.** Two prompt modes in the browser UI: **text /

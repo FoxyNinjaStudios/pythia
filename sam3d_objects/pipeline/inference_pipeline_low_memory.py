@@ -1082,3 +1082,70 @@ class InferencePipelineLowMemory:
         
         return result
 
+    def run_multi_view(
+        self,
+        images: list,
+        masks: list = None,
+        seed: int = 42,
+        stage1_only: bool = False,
+        with_mesh_postprocess: bool = True,
+        with_texture_baking: bool = True,
+        use_vertex_color: bool = False,
+        stage1_inference_steps: int = None,
+        stage2_inference_steps: int = None,
+        use_stage1_distillation: bool = False,
+        use_stage2_distillation: bool = False,
+        decode_formats: list = None,
+        fusion_config = None,
+    ) -> dict:
+        """
+        Multi-view 3D reconstruction using low-memory pipeline.
+        Processes each view independently then averages geometry.
+        """
+        if masks is None:
+            masks = [None] * len(images)
+        
+        if len(images) < 2:
+            logger.warning(f"Multi-view needs ≥2 images; using single-view path (got {len(images)})")
+            return self.run(
+                images[0], masks[0], seed=seed, stage1_only=stage1_only,
+                with_mesh_postprocess=with_mesh_postprocess, with_texture_baking=with_texture_baking,
+                use_vertex_color=use_vertex_color, stage1_inference_steps=stage1_inference_steps,
+                stage2_inference_steps=stage2_inference_steps, use_stage1_distillation=use_stage1_distillation,
+                use_stage2_distillation=use_stage2_distillation, decode_formats=decode_formats
+            )
+        
+        logger.info(f"[MULTI-VIEW] Multi-view reconstruction: {len(images)} views")
+        
+        # Process each view independently
+        logger.info("[MULTI-VIEW] Processing individual views...")
+        results = []
+        for i, (img, mask) in enumerate(zip(images, masks)):
+            logger.info(f"[MULTI-VIEW] Processing view {i+1}/{len(images)}...")
+            result = self.run(
+                img, mask, seed=seed + i, stage1_only=stage1_only,
+                with_mesh_postprocess=with_mesh_postprocess, with_texture_baking=with_texture_baking,
+                use_vertex_color=use_vertex_color, stage1_inference_steps=stage1_inference_steps,
+                stage2_inference_steps=stage2_inference_steps, use_stage1_distillation=use_stage1_distillation,
+                use_stage2_distillation=use_stage2_distillation, decode_formats=decode_formats
+            )
+            results.append(result)
+        
+        # Average coordinates from all views
+        logger.info("[MULTI-VIEW] Fusing geometry from all views...")
+        coords_list = [r.get("coords") for r in results if "coords" in r]
+        if coords_list:
+            # Convert to tensors and average
+            coords_tensors = [torch.as_tensor(c, dtype=torch.float32) for c in coords_list]
+            fused_coords = torch.stack(coords_tensors).mean(dim=0).int()
+            logger.info(f"[MULTI-VIEW] Fused {len(coords_list)} coordinate sets: {fused_coords.shape}")
+        else:
+            fused_coords = results[0].get("coords")
+        
+        # Use first view's result as base and update with averaged coords
+        fused_result = results[0].copy()
+        fused_result["coords"] = fused_coords
+        
+        logger.info("[MULTI-VIEW] Complete!")
+        return fused_result
+

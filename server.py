@@ -314,6 +314,24 @@ class DepthRequest(BaseModel):
     mask_b64: str   # base64-encoded PNG mask
 
 
+class MultiViewImage(BaseModel):
+    """Single view for multi-view reconstruction."""
+    image_id: str
+    mask_b64: str
+
+
+class ReconstructMultiViewRequest(BaseModel):
+    """Multi-view reconstruction request."""
+    images: List[MultiViewImage]
+    stage1_steps: int = 8
+    stage2_steps: int = 8
+    ss_distill: bool = True
+    distill: bool = False
+    fusion_mode: str = "stochastic"  # "stochastic" or "multidiffusion"
+    view_weighting: str = "uniform"  # "uniform" or "entropy"
+    num_views_select: Optional[int] = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1043,6 +1061,65 @@ async def reconstruct(req: ReconstructRequest):
     return {"job_id": job_id}
 
 
+@app.post("/reconstruct_multi_view")
+async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
+    """Multi-view 3D reconstruction from multiple uploaded images."""
+    if len(req.images) < 2:
+        raise HTTPException(400, "Multi-view reconstruction requires at least 2 images")
+    
+    # Verify all images exist and save masks
+    img_paths, mask_paths = [], []
+    for img_data in req.images:
+        img_path = UPLOAD_DIR / f"{img_data.image_id}.png"
+        if not img_path.exists():
+            raise HTTPException(404, f"Image {img_data.image_id} not found")
+        
+        # Decode and save mask
+        try:
+            mask_bytes = base64.b64decode(img_data.mask_b64)
+            mask_img = PILImage.open(io.BytesIO(mask_bytes)).convert("L")
+            mask_path = UPLOAD_DIR / f"{img_data.image_id}_mv_mask.png"
+            mask_img.save(mask_path)
+        except Exception as exc:
+            raise HTTPException(400, f"Invalid mask for {img_data.image_id}: {exc}")
+        
+        img_paths.append(str(img_path))
+        mask_paths.append(str(mask_path))
+    
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = JobState(job_id)
+    
+    # Free segmentation models before reconstruction
+    try:
+        from sam_wrapper import unload_segmentation_models
+        unload_segmentation_models()
+    except Exception:
+        pass
+    
+    # Clamp parameters to safe ranges
+    stage1_steps = max(1, min(int(req.stage1_steps), 100))
+    stage2_steps = max(1, min(int(req.stage2_steps), 100))
+    num_views_select = min(len(req.images), req.num_views_select) if req.num_views_select else None
+    
+    # Run in background thread
+    asyncio.get_event_loop().run_in_executor(
+        None,
+        _run_multi_view_reconstruction_sync,
+        job_id,
+        img_paths,
+        mask_paths,
+        stage1_steps,
+        stage2_steps,
+        bool(req.distill),
+        bool(req.ss_distill),
+        req.fusion_mode,
+        req.view_weighting,
+        num_views_select,
+    )
+    
+    return {"job_id": job_id}
+
+
 @app.post("/reset")
 async def reset():
     """Stop all in-flight work and free every in-memory model.
@@ -1651,6 +1728,130 @@ def _run_reconstruction_sync(
         root_logger.removeHandler(handler)
         # Unload the 3-D reconstruction model now the job is done so its weights
         # and working buffers are released back to the OS.
+        pipeline = None
+        import gc
+        gc.collect()
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def _run_multi_view_reconstruction_sync(
+    job_id: str,
+    img_paths: List[str],
+    mask_paths: List[str],
+    stage1_steps: int = 8,
+    stage2_steps: int = 8,
+    distill: bool = False,
+    ss_distill: bool = True,
+    fusion_mode: str = "stochastic",
+    view_weighting: str = "uniform",
+    num_views_select: Optional[int] = None,
+):
+    """Multi-view reconstruction pipeline – runs in a thread, updates job SSE queue."""
+    job = jobs[job_id]
+    root_logger = logging.getLogger()
+    handler = _PipelineLogHandler(job)
+    root_logger.addHandler(handler)
+
+    job.start_mem()
+    _mem_stop = threading.Event()
+
+    def _mem_sampler():
+        while not _mem_stop.is_set():
+            try:
+                job.sample_mem()
+            except Exception:
+                pass
+            _mem_stop.wait(0.5)
+
+    _mem_thread = threading.Thread(target=_mem_sampler, name=f"mem-{job_id}", daemon=True)
+    _mem_thread.start()
+
+    pipeline = None
+    try:
+        # Load all images and masks
+        images = []
+        masks = []
+        for img_path, mask_path in zip(img_paths, mask_paths):
+            images.append(np.array(PILImage.open(img_path).convert("RGB")))
+            masks.append(np.array(PILImage.open(mask_path).convert("L")))
+
+        if job.cancelled:
+            raise _JobCancelled()
+
+        job.update(f"Loading pipeline (multi-view, {len(images)} views)…", 5)
+
+        from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
+        from sam3d_objects.pipeline.inference_pipeline import MultiViewFusionConfig, MultiViewWeightingConfig
+        
+        _preimport_hydra_targets()
+        pipeline = InferencePipelineLowMemory(
+            config_path=str(paths.PIPELINE_CONFIG_PATH),
+            device="cpu",
+            dtype="float16",
+            cache_dir=str(paths.PIPELINE_CACHE_DIR),
+        )
+
+        if job.cancelled:
+            raise _JobCancelled()
+
+        job.update(f"Running multi-view reconstruction…", 12)
+
+        # Create fusion configuration
+        fusion_config = MultiViewFusionConfig(
+            fusion_mode=fusion_mode,
+            weighting=MultiViewWeightingConfig(
+                enabled=(view_weighting != "uniform"),
+                mode=view_weighting,
+                num_views_to_select=num_views_select,
+            ),
+        )
+
+        # Run multi-view reconstruction
+        output = pipeline.run_multi_view(
+            images,
+            masks,
+            seed=42,
+            stage1_only=False,
+            stage1_inference_steps=stage1_steps,
+            stage2_inference_steps=stage2_steps,
+            decode_formats=["mesh"],
+            fusion_config=fusion_config,
+            use_stage1_distillation=ss_distill,
+            use_stage2_distillation=distill,
+        )
+
+        result_mesh = output["glb"]
+
+        # Smooth the mesh
+        try:
+            from mesh_utils import taubin_smooth
+            result_mesh = taubin_smooth(result_mesh, iterations=10)
+        except Exception as exc:
+            logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
+
+        if job.cancelled:
+            raise _JobCancelled()
+
+        result_path = str(RESULT_DIR / f"{job_id}.glb")
+        job.update("Exporting GLB…", 95)
+        result_mesh.export(result_path, file_type="glb")
+
+        job.complete(result_path)
+        logger.info(f"[JOB {job_id}] Multi-view done → {result_path}")
+
+    except _JobCancelled:
+        job.cancel()
+        logger.info(f"[JOB {job_id}] Cancelled by client reset")
+    except Exception as exc:
+        job.fail(str(exc))
+        logger.error(f"[JOB {job_id}] Multi-view failed:\n{traceback.format_exc()}")
+    finally:
+        _mem_stop.set()
+        job.sample_mem()
+        root_logger.removeHandler(handler)
         pipeline = None
         import gc
         gc.collect()

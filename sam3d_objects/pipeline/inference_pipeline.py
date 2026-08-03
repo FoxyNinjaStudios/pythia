@@ -44,6 +44,117 @@ from sam3d_objects.model.io import (
 from sam3d_objects.model.backbone.tdfy_dit.modules import sparse as sp
 from sam3d_objects.model.backbone.tdfy_dit.utils import postprocessing_utils
 from safetensors.torch import load_file
+from dataclasses import dataclass, field
+
+
+# ============================================================================
+# Multi-View Configuration and Utilities
+# ============================================================================
+
+@dataclass
+class MultiViewWeightingConfig:
+    """Configuration for multi-view fusion weighting strategies."""
+    enabled: bool = False
+    mode: str = "entropy"  # "entropy" | "uniform" | "attention"
+    temperature: float = 1.0
+    num_views_to_select: int = None
+    entropy_threshold: float = 0.5
+
+
+@dataclass
+class MultiViewFusionConfig:
+    """Configuration for multi-view diffusion fusion."""
+    fusion_mode: str = "stochastic"  # "stochastic" | "multidiffusion"
+    weighting: MultiViewWeightingConfig = field(default_factory=MultiViewWeightingConfig)
+    stage1_fusion: bool = True
+    stage2_fusion: bool = True
+
+
+def fuse_multi_view_representations(input_dicts: List[dict], fusion_config: MultiViewFusionConfig, device: torch.device) -> dict:
+    """Fuse multiple representations using config mode."""
+    n_views = len(input_dicts)
+    
+    if fusion_config.fusion_mode == "stochastic":
+        weights = _compute_view_weights(input_dicts, fusion_config.weighting, device)
+        fused = _stochastic_fuse(input_dicts, weights, device)
+    elif fusion_config.fusion_mode == "multidiffusion":
+        fused = _multidiffusion_fuse(input_dicts, device)
+    else:
+        raise ValueError(f"Unknown fusion mode: {fusion_config.fusion_mode}")
+    
+    return fused
+
+
+def _compute_view_weights(representations: List[dict], weighting_config: MultiViewWeightingConfig, device: torch.device) -> torch.Tensor:
+    """Compute view weights for fusion."""
+    n_views = len(representations)
+    
+    if not weighting_config.enabled:
+        return torch.ones(n_views, device=device) / n_views
+    
+    if weighting_config.mode == "entropy":
+        entropies = torch.tensor([_compute_image_entropy(rep.get("image", None)) for rep in representations], device=device)
+        weights = 1.0 / (entropies + weighting_config.temperature)
+        weights = weights / weights.sum()
+    elif weighting_config.mode == "uniform":
+        weights = torch.ones(n_views, device=device) / n_views
+    else:
+        weights = torch.ones(n_views, device=device) / n_views
+    
+    if weighting_config.num_views_to_select:
+        k = min(weighting_config.num_views_to_select, n_views)
+        _, top_k = torch.topk(weights, k)
+        mask = torch.zeros(n_views, dtype=torch.bool, device=device)
+        mask[top_k] = True
+        weights = torch.where(mask, weights, torch.zeros_like(weights))
+        weights = weights / weights.sum()
+    
+    return weights
+
+
+def _stochastic_fuse(representations: List[dict], weights: torch.Tensor, device: torch.device) -> dict:
+    """Simple weighted averaging fusion."""
+    fused = {}
+    for key in representations[0].keys():
+        if key in ("image", "mask"):
+            try:
+                stacked = torch.stack([
+                    torch.as_tensor(rep.get(key, torch.zeros(1)), device=device).float()
+                    for rep in representations
+                ], dim=0)
+                w_shape = weights.view(-1, *([1] * (stacked.ndim - 1)))
+                fused[key] = (stacked * w_shape).sum(dim=0)
+            except Exception as e:
+                logger.warning(f"Failed to fuse {key}: {e}, using first view")
+                fused[key] = torch.as_tensor(representations[0][key], device=device)
+        else:
+            fused[key] = representations[0][key]
+    return fused
+
+
+def _multidiffusion_fuse(representations: List[dict], device: torch.device) -> dict:
+    """Multi-diffusion fusion (placeholder: simple averaging for now)."""
+    n_views = len(representations)
+    uniform_weights = torch.ones(n_views, device=device) / n_views
+    return _stochastic_fuse(representations, uniform_weights, device)
+
+
+def _compute_image_entropy(image) -> float:
+    """Compute entropy of an image."""
+    if image is None:
+        return 0.0
+    if isinstance(image, torch.Tensor):
+        flat = image.flatten()
+    else:
+        flat = torch.as_tensor(image).flatten().float()
+    
+    if flat.numel() == 0:
+        return 0.0
+    
+    hist = torch.histc(flat, bins=256, min=0, max=255)
+    hist = hist / (hist.sum() + 1e-6)
+    entropy = -(hist * torch.log(hist + 1e-6)).sum()
+    return float(entropy / np.log(256))
 
 
 class InferencePipeline:
@@ -566,6 +677,127 @@ class InferencePipeline:
             outputs["gs_4"] = outputs["gaussian_4"][0]
 
         return outputs
+
+    def run_multi_view(
+        self,
+        images: List[Union[Image.Image, np.ndarray]],
+        masks: List[Union[Image.Image, np.ndarray]] = None,
+        seed: int = 42,
+        stage1_only: bool = False,
+        with_mesh_postprocess: bool = True,
+        with_texture_baking: bool = True,
+        use_vertex_color: bool = False,
+        stage1_inference_steps: int = None,
+        stage2_inference_steps: int = None,
+        use_stage1_distillation: bool = False,
+        use_stage2_distillation: bool = False,
+        decode_formats: List[str] = None,
+        fusion_config: MultiViewFusionConfig = None,
+    ) -> dict:
+        """Multi-view 3D reconstruction: fuse multiple images into single object."""
+        if fusion_config is None:
+            fusion_config = MultiViewFusionConfig(fusion_mode="stochastic")
+        
+        if masks is None:
+            masks = [None] * len(images)
+        
+        if len(images) < 2:
+            logger.warning(f"Multi-view needs ≥2 images; using single-view path (got {len(images)})")
+            return self.run(images[0], masks[0], seed=seed, stage1_only=stage1_only,
+                          with_mesh_postprocess=with_mesh_postprocess, with_texture_baking=with_texture_baking,
+                          use_vertex_color=use_vertex_color, stage1_inference_steps=stage1_inference_steps,
+                          stage2_inference_steps=stage2_inference_steps, use_stage1_distillation=use_stage1_distillation,
+                          use_stage2_distillation=use_stage2_distillation, decode_formats=decode_formats)
+        
+        logger.info(f"Multi-view reconstruction: {len(images)} views, mode={fusion_config.fusion_mode}")
+        
+        with self.device:
+            torch.manual_seed(seed)
+            
+            logger.info("Preprocessing images...")
+            ss_input_dicts = []
+            slat_input_dicts = []
+            
+            for img, mask in zip(images, masks):
+                # Merge image and mask
+                merged_img = self.merge_image_and_mask(img, mask)
+                # Preprocess for both stages
+                ss_input_dicts.append(self.preprocess_image(merged_img, self.ss_preprocessor))
+                slat_input_dicts.append(self.preprocess_image(merged_img, self.slat_preprocessor))
+            
+            # Stage 1
+            if fusion_config.stage1_fusion:
+                logger.info("Fusing views for Stage 1...")
+                fused_ss = fuse_multi_view_representations(ss_input_dicts, fusion_config, self.device)
+                ss_dicts_to_sample = [fused_ss]
+            else:
+                ss_dicts_to_sample = ss_input_dicts
+            
+            logger.info("Sampling sparse structure...")
+            ss_returns = []
+            for ss_dict in ss_dicts_to_sample:
+                ret = self.sample_sparse_structure(
+                    ss_dict,
+                    inference_steps=stage1_inference_steps,
+                    use_distillation=use_stage1_distillation,
+                )
+                ss_returns.append(ret)
+            
+            if len(ss_returns) > 1:
+                logger.info("Averaging Stage 1 outputs across views...")
+                coords_list = [r["coords"] for r in ss_returns if "coords" in r]
+                if coords_list:
+                    coords = torch.stack([torch.as_tensor(c) for c in coords_list]).mean(dim=0)
+                else:
+                    coords = ss_returns[0]["coords"]
+                ss_return = ss_returns[0].copy()
+                ss_return["coords"] = coords
+            else:
+                ss_return = ss_returns[0]
+            
+            ss_return.update(self.pose_decoder(ss_return))
+            if "scale" in ss_return:
+                ss_return["scale"] = ss_return["scale"] * ss_return.get("downsample_factor", 1.0)
+            
+            if stage1_only:
+                logger.info("Finished (Stage 1 only)!")
+                ss_return["voxel"] = ss_return["coords"][:, 1:] / 64 - 0.5
+                return ss_return
+            
+            coords = ss_return["coords"]
+            
+            # Stage 2
+            if fusion_config.stage2_fusion:
+                logger.info("Fusing views for Stage 2...")
+                fused_slat = fuse_multi_view_representations(slat_input_dicts, fusion_config, self.device)
+                slat_dicts_to_sample = [fused_slat]
+            else:
+                slat_dicts_to_sample = slat_input_dicts
+            
+            logger.info("Sampling SLAT...")
+            slat_list = []
+            for slat_dict in slat_dicts_to_sample:
+                slat = self.sample_slat(
+                    slat_dict,
+                    coords,
+                    inference_steps=stage2_inference_steps,
+                    use_distillation=use_stage2_distillation,
+                )
+                slat_list.append(slat)
+            
+            if len(slat_list) > 1:
+                logger.info("Merging SLAT latents across views...")
+                slat = torch.stack(slat_list).mean(dim=0)
+            else:
+                slat = slat_list[0]
+            
+            logger.info("Decoding SLAT...")
+            decode_formats_to_use = decode_formats if decode_formats else self.decode_formats
+            outputs = self.decode_slat(slat, decode_formats_to_use)
+            outputs = self.postprocess_slat_output(outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color)
+            
+            logger.info("Finished multi-view reconstruction!")
+            return {**ss_return, **outputs}
 
     def merge_image_and_mask(
         self,

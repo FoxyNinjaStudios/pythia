@@ -325,15 +325,16 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SAM-3D MPS Pipeline: Image + Mask -> Voxels",
+        description="SAM-3D MPS Pipeline: Single-view or Multi-view 3D reconstruction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
     
+    # Single-view arguments
     parser.add_argument(
         "--image", "-i",
-        required=True,
-        help="Path to input image"
+        required=False,
+        help="Path to input image (required for single-view mode)"
     )
     parser.add_argument(
         "--mask", "-m",
@@ -349,6 +350,53 @@ def main():
         default=0,
         help="Index of mask in mask-dir (default: 0)"
     )
+    
+    # Multi-view arguments (NEW)
+    parser.add_argument(
+        "--multi-view",
+        action="store_true",
+        help="Enable multi-view mode for improved geometry and pose stability"
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=str,
+        default=None,
+        help="Directory with multiple views (required with --multi-view)"
+    )
+    parser.add_argument(
+        "--masks-dir",
+        type=str,
+        default=None,
+        help="Directory with masks for each view (optional with --multi-view)"
+    )
+    parser.add_argument(
+        "--view-indices",
+        type=str,
+        default=None,
+        help="Comma-separated view indices (e.g., '0,1,2') to select specific views"
+    )
+    parser.add_argument(
+        "--fusion-mode",
+        type=str,
+        choices=["stochastic", "multidiffusion"],
+        default="stochastic",
+        help="Multi-view fusion mode: 'stochastic' (random view per step) or 'multidiffusion' (fuse all)"
+    )
+    parser.add_argument(
+        "--view-weighting",
+        type=str,
+        choices=["uniform", "entropy"],
+        default="uniform",
+        help="View weighting strategy for multi-view fusion"
+    )
+    parser.add_argument(
+        "--num-views-select",
+        type=int,
+        default=None,
+        help="Limit to N best views (optional)"
+    )
+    
+    # Shared arguments
     parser.add_argument(
         "--output", "-o",
         default="outputs/voxels.stl",
@@ -478,8 +526,150 @@ def main():
 
     args = parser.parse_args()
     
+    # Multi-view mode
+    if args.multi_view:
+        if not args.image_dir:
+            parser.error("Multi-view mode (--multi-view) requires --image-dir")
+        
+        print("=" * 70)
+        print("SAM-3D MPS Pipeline (Multi-View Mode)")
+        print("=" * 70)
+        
+        # Load multi-view images and masks
+        import glob
+        image_files = sorted(
+            glob.glob(os.path.join(args.image_dir, "*.png")) +
+            glob.glob(os.path.join(args.image_dir, "*.jpg")) +
+            glob.glob(os.path.join(args.image_dir, "*.jpeg"))
+        )
+        
+        if not image_files:
+            parser.error(f"No images found in {args.image_dir}")
+        
+        if args.view_indices:
+            try:
+                indices = [int(i.strip()) for i in args.view_indices.split(",")]
+                image_files = [image_files[i] for i in indices if i < len(image_files)]
+            except (ValueError, IndexError) as e:
+                parser.error(f"Invalid --view-indices: {e}")
+        
+        if len(image_files) < 2:
+            parser.error(f"Multi-view requires at least 2 images, found {len(image_files)}")
+        
+        images, masks = [], []
+        for img_path in image_files:
+            images.append(load_image(img_path))
+            
+            if args.masks_dir:
+                base = os.path.basename(img_path)
+                mask_name = os.path.splitext(base)[0]
+                mask_path = os.path.join(args.masks_dir, f"{mask_name}.png")
+                if not os.path.exists(mask_path):
+                    mask_path = os.path.join(args.masks_dir, f"{mask_name}.jpg")
+                if os.path.exists(mask_path):
+                    masks.append(load_mask(mask_path))
+                else:
+                    print(f"[WARN] Mask not found for {base}, using None")
+                    masks.append(None)
+            else:
+                masks.append(None)
+        
+        print(f"[INFO] Loaded {len(images)} views from {args.image_dir}")
+        
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        if args.cache_dir:
+            os.makedirs(args.cache_dir, exist_ok=True)
+        
+        if args.simplify is None:
+            args.simplify = 0.9 if args.bake else 0.0
+        
+        # Import multi-view configuration
+        from sam3d_objects.pipeline.inference_pipeline import (
+            MultiViewFusionConfig, MultiViewWeightingConfig
+        )
+        from sam3d_objects.pipeline.inference_pipeline_low_memory import InferencePipelineLowMemory
+        
+        # Create fusion configuration
+        fusion_config = MultiViewFusionConfig(
+            fusion_mode=args.fusion_mode,
+            weighting=MultiViewWeightingConfig(
+                enabled=(args.view_weighting != "uniform"),
+                mode=args.view_weighting,
+                num_views_to_select=args.num_views_select,
+            ),
+        )
+        
+        # Initialize pipeline
+        pipeline = InferencePipelineLowMemory(
+            config_path="checkpoints/hf/pipeline.yaml",
+            device="cpu",
+            dtype="float16",
+            cache_dir=args.cache_dir if args.cache_dir else None,
+        )
+        
+        # Run multi-view reconstruction
+        output = pipeline.run_multi_view(
+            images, masks,
+            seed=args.seed,
+            stage1_only=args.voxels_only,
+            with_mesh_postprocess=not args.voxels_only,
+            with_texture_baking=args.bake,
+            use_vertex_color=not args.bake,
+            stage1_inference_steps=args.ss_steps,
+            stage2_inference_steps=args.steps,
+            use_stage1_distillation=args.ss_distill,
+            use_stage2_distillation=args.distill,
+            decode_formats=["mesh"] if not args.voxels_only else None,
+            fusion_config=fusion_config,
+        )
+        
+        # Post-processing
+        if not args.voxels_only and "glb" in output and output["glb"] is not None:
+            result_mesh = output["glb"]
+            
+            if args.smooth > 0:
+                try:
+                    from mesh_utils import taubin_smooth
+                    print(f"[INFO] Smoothing mesh ({args.smooth} iterations)...")
+                    result_mesh = taubin_smooth(result_mesh, iterations=args.smooth)
+                except Exception as exc:
+                    print(f"[WARN] Smoothing skipped: {exc}")
+            
+            if args.simplify and args.simplify > 0:
+                try:
+                    print(f"[INFO] Simplifying mesh to {100*(1-args.simplify):.1f}% vertices...")
+                    result_mesh = result_mesh.simplify(args.simplify)
+                except Exception as exc:
+                    print(f"[WARN] Simplification skipped: {exc}")
+            
+            if args.bake:
+                try:
+                    result_mesh.export(args.output, file_type="glb", include_normals=True)
+                except Exception as exc:
+                    print(f"[ERROR] Failed to export GLB: {exc}")
+                    raise
+            else:
+                result_mesh.export(args.output, file_type="glb")
+            
+            print(f"[SUCCESS] Multi-view reconstruction saved to {args.output}")
+        else:
+            print(f"[SUCCESS] Multi-view reconstruction (voxels only) completed")
+        
+        return
+    
+    # Single-view mode (existing logic)
+    if not args.image and not args.mask_dir:
+        parser.error("Must provide either --image (single-view) or --multi-view --image-dir")
+    
+    if not args.image:
+        parser.error("Single-view mode requires --image")
+    
     if not args.mask and not args.mask_dir:
         parser.error("Must provide either --mask or --mask-dir")
+    
+    print("=" * 70)
+    print("SAM-3D MPS Pipeline (Single-View Mode)")
+    print("=" * 70)
     
     # Determine output mode
     output_mesh = args.mesh and not args.voxels_only

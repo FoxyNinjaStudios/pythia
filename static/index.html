@@ -728,15 +728,35 @@ body.editing-3d main { max-width: calc(100vw - 400px); }
 
   <!-- ─── Step 1 : Upload ─────────────────────────────────────────────── -->
   <div class="card" id="step-upload">
-    <div class="card-title">Step 1 - Upload image</div>
+    <div class="card-title">Step 1 - Upload image(s)</div>
+    
+    <!-- Mode toggle: single-view vs multi-view (HIDDEN - multi-view optimization pending) -->
+    <div class="quality-row" style="margin-bottom:16px; display:none;">
+      <span class="label">Mode</span>
+      <div class="seg" id="mode-seg">
+        <button type="button" id="mode-single" class="active" onclick="setMode('single')" title="Single image reconstruction">Single-View</button>
+        <button type="button" id="mode-multi" onclick="setMode('multi')" title="Multi-image fusion">Multi-View</button>
+      </div>
+    </div>
+    
     <div id="drop-zone" onclick="document.getElementById('file-input').click()"
          ondragover="onDragOver(event)" ondragleave="onDragLeave(event)"
          ondrop="onDrop(event)">
       <div class="icon"><i class="fa-regular fa-image"></i></div>
-      <div>Drop an image here, or click to browse</div>
+      <div id="drop-text">Drop an image here, or click to browse</div>
       <div style="font-size:.75rem;margin-top:6px;opacity:.6">PNG · JPG · WebP</div>
       <input type="file" id="file-input" accept="image/*" onchange="onFileInput(event)"/>
     </div>
+    
+    <!-- Uploaded images display for multi-view mode -->
+    <div id="uploaded-images" style="display:none;margin-top:12px;">
+      <div style="font-size:0.8rem;color:var(--muted);margin-bottom:8px;">
+        Uploaded views: <span id="image-count">0</span>
+      </div>
+      <div id="image-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(60px,1fr));gap:8px;"></div>
+      <button class="btn-ghost" onclick="clearMultiViewImages()" style="margin-top:8px;">Clear all</button>
+    </div>
+    
     <div id="upload-progress" class="seg-load" style="display:none">
       <div class="seg-load-track"><div class="seg-load-fill"></div></div>
       <div class="seg-load-msg">Uploading…</div>
@@ -801,6 +821,24 @@ body.editing-3d main { max-width: calc(100vw - 400px); }
             <button type="button" data-s1="8"  data-s2="8"  data-steps="8 / 8"   onclick="setQuality(this)" class="active" title="Fastest - 8 / 8 steps">Fast<span class="sub"></span></button>
             <button type="button" data-s1="25" data-s2="12" data-steps="25 / 12" onclick="setQuality(this)" title="Balanced - 25 / 12 steps">Medium<span class="sub"></span></button>
             <button type="button" data-s1="40" data-s2="20" data-steps="40 / 20" onclick="setQuality(this)" title="Best geometry, slowest - 40 / 20 steps">Slow<span class="sub"></span></button>
+          </div>
+        </div>
+        
+        <!-- Multi-view fusion options (hidden - multi-view optimization pending) -->
+        <div id="mv-controls" style="display:none !important;">
+          <div class="quality-row">
+            <span class="label">Fusion mode</span>
+            <select id="fusion-mode" style="flex:1;">
+              <option value="stochastic">Stochastic (recommended)</option>
+              <option value="multidiffusion">MultiDiffusion</option>
+            </select>
+          </div>
+          <div class="quality-row">
+            <span class="label">View weighting</span>
+            <select id="view-weighting" style="flex:1;">
+              <option value="uniform">Uniform (all views)</option>
+              <option value="entropy">Entropy (best views)</option>
+            </select>
           </div>
         </div>
 
@@ -1194,6 +1232,67 @@ const maskCtx      = maskCanvas.getContext("2d");
 const markerCtx    = markerCanvas.getContext("2d");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Multi-View State Management
+// ─────────────────────────────────────────────────────────────────────────────
+let g_mode = "single";  // "single" or "multi"
+let g_multiViewImages = [];  // List of {image_id, mask_b64}
+
+function setMode(mode) {
+  g_mode = mode;
+  document.getElementById("mode-single").classList.toggle("active", mode === "single");
+  document.getElementById("mode-multi").classList.toggle("active", mode === "multi");
+  document.getElementById("file-input").multiple = (mode === "multi");
+  document.getElementById("drop-text").textContent = mode === "multi" 
+    ? "Drop images here, or click to browse (2+ images)"
+    : "Drop an image here, or click to browse";
+  document.getElementById("uploaded-images").style.display = mode === "multi" ? "block" : "none";
+  document.getElementById("mv-controls").style.display = mode === "multi" ? "block" : "none";
+  
+  if (mode === "single") {
+    g_multiViewImages = [];
+    clearMultiViewImages();
+  }
+}
+
+function addMultiViewImage(imageId, maskB64) {
+  g_multiViewImages.push({image_id: imageId, mask_b64: maskB64});
+  document.getElementById("image-count").textContent = g_multiViewImages.length;
+  
+  const grid = document.getElementById("image-grid");
+  const thumb = document.createElement("div");
+  thumb.style.cssText = "width:60px;height:60px;border-radius:6px;background:var(--border);position:relative;cursor:pointer;";
+  thumb.title = `View ${g_multiViewImages.length}`;
+  thumb.onclick = () => removeMultiViewImage(g_multiViewImages.length - 1);
+  grid.appendChild(thumb);
+  
+  // Show thumbnail
+  const img = document.createElement("img");
+  img.style.cssText = "width:100%;height:100%;border-radius:6px;object-fit:cover;opacity:0.7;";
+  img.src = document.getElementById("base-img").src; // Use the uploaded image
+  thumb.appendChild(img);
+}
+
+function removeMultiViewImage(index) {
+  g_multiViewImages.splice(index, 1);
+  document.getElementById("image-count").textContent = g_multiViewImages.length;
+  const grid = document.getElementById("image-grid");
+  grid.innerHTML = "";
+  g_multiViewImages.forEach((_, i) => {
+    const thumb = document.createElement("div");
+    thumb.style.cssText = "width:60px;height:60px;border-radius:6px;background:var(--border);";
+    thumb.title = `View ${i + 1}`;
+    thumb.onclick = () => removeMultiViewImage(i);
+    grid.appendChild(thumb);
+  });
+}
+
+function clearMultiViewImages() {
+  g_multiViewImages = [];
+  document.getElementById("image-count").textContent = "0";
+  document.getElementById("image-grid").innerHTML = "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Upload
 // ─────────────────────────────────────────────────────────────────────────────
 function onDragOver(e)  { e.preventDefault(); document.getElementById("drop-zone").classList.add("dragover"); }
@@ -1201,12 +1300,26 @@ function onDragLeave(e) { document.getElementById("drop-zone").classList.remove(
 function onDrop(e) {
   e.preventDefault();
   onDragLeave(e);
-  const f = e.dataTransfer.files[0];
-  if (f) uploadFile(f);
+  if (g_mode === "single") {
+    const f = e.dataTransfer.files[0];
+    if (f) uploadFile(f);
+  } else {
+    // Multi-view: upload all files
+    for (const f of e.dataTransfer.files) {
+      uploadFile(f);
+    }
+  }
 }
 function onFileInput(e) {
-  const f = e.target.files[0];
-  if (f) uploadFile(f);
+  if (g_mode === "single") {
+    const f = e.target.files[0];
+    if (f) uploadFile(f);
+  } else {
+    // Multi-view: upload all files
+    for (const f of e.target.files) {
+      uploadFile(f);
+    }
+  }
 }
 
 function uploadFile(file) {
@@ -1269,6 +1382,14 @@ function onUploadComplete(file, data) {
   resetHistory();
   updatePointCount();
   document.getElementById("generate-btn").disabled = true;
+  
+  // In multi-view mode, button text changes
+  const genBtn = document.getElementById("generate-btn");
+  if (g_mode === "multi") {
+    genBtn.innerHTML = g_multiViewImages.length >= 2 
+      ? 'Add mask & reconstruct <i class="fa-solid fa-arrow-right"></i>'
+      : 'Add mask (need 2+ views) <i class="fa-solid fa-arrow-right"></i>';
+  }
 
   // Show image on canvas
   const objectUrl = URL.createObjectURL(file);
@@ -1570,11 +1691,21 @@ async function runTextSegment() {
     lastMaskB64 = data.mask_b64 || null;
     if (lastMaskB64) {
       drawMask(lastMaskB64);
-      if (gen) gen.disabled = false;
+      
+      // In multi-view mode, add to list and prepare for next image
+      if (g_mode === "multi") {
+        addMultiViewImage(imageId, lastMaskB64);
+        if (gen) gen.disabled = g_multiViewImages.length < 2;
+        if (gen) gen.innerHTML = g_multiViewImages.length >= 2 
+          ? 'Reconstruct all <i class="fa-solid fa-arrow-right"></i>'
+          : 'Upload more images (need 2+) <i class="fa-solid fa-arrow-right"></i>';
+      } else {
+        if (gen) gen.disabled = false;
+      }
     } else {
       clearMask();
-      if (gen) gen.disabled = true;
-      alert('SAM 3 found no “' + text + '” in the image. Try a different word.');
+      if (gen && g_mode === "single") gen.disabled = true;
+      alert('SAM 3 found no "' + text + '" in the image. Try a different word.');
     }
   } catch (err) {
     if (err.name !== 'AbortError') console.error('Text segment error:', err);
@@ -1583,7 +1714,6 @@ async function runTextSegment() {
     if (btn) { btn.disabled = false; btn.textContent = 'Segment'; }
   }
 }
-
 async function runSegment() {
   if (!imageId || markers.filter(m => m.label === 1).length === 0) {
     clearMask(); return;
@@ -1774,11 +1904,24 @@ function drawMask(b64) {
 // Reconstruct
 // ─────────────────────────────────────────────────────────────────────────────
 async function startReconstruct() {
-  if (!imageId || !lastMaskB64) {
-    alert("Please click at least one positive point first.");
-    return;
+  if (g_mode === "single") {
+    // Single-view mode
+    if (!imageId || !lastMaskB64) {
+      alert("Please click at least one positive point first.");
+      return;
+    }
+    await startReconstructSingleView();
+  } else {
+    // Multi-view mode
+    if (g_multiViewImages.length < 2) {
+      alert("Multi-view reconstruction requires at least 2 images with masks.");
+      return;
+    }
+    await startReconstructMultiView();
   }
+}
 
+async function startReconstructSingleView() {
   // Switch to progress view
   document.getElementById("step-annotate").classList.add("hidden");
   document.getElementById("progress-card").style.display = "block";
@@ -1811,6 +1954,42 @@ async function startReconstruct() {
 
   listenProgress(job_id);
   openConsole();
+}
+
+async function startReconstructMultiView() {
+  // Switch to progress view
+  document.getElementById("step-annotate").classList.add("hidden");
+  document.getElementById("progress-card").style.display = "block";
+  document.getElementById("recon-mask-img").src = ""; // No single mask for multi-view
+  setProgress(5, "Sending request…");
+  startTimer();
+  ramReset();
+
+  const body = {
+    images: g_multiViewImages,
+    stage1_steps: qualitySteps.s1,
+    stage2_steps: qualitySteps.s2,
+    fusion_mode: document.getElementById("fusion-mode").value,
+    view_weighting: document.getElementById("view-weighting").value,
+  };
+  
+  try {
+    const res = await fetch("/reconstruct_multi_view", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const { job_id } = await res.json();
+    listenProgress(job_id);
+    openConsole();
+  } catch (err) {
+    alert("Multi-view reconstruction failed: " + err.message);
+    document.getElementById("step-annotate").classList.remove("hidden");
+    document.getElementById("progress-card").style.display = "none";
+  }
 }
 
 function setProgress(pct, msg) {
