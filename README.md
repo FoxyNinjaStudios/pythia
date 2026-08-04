@@ -108,6 +108,41 @@ Arguments:
 - `--fusion-mode`: `stochastic` (recommended, random view per step) or `multidiffusion` (all views per step)
 - `--view-indices`: Comma-separated view indices to use (e.g. `0,2,3`)
 
+### Stage 2 MPS Acceleration (Default)
+
+Stage 2 (SLAT texture & refinement) runs on Apple Silicon's Metal GPU (MPS) **by default** for improved speed. This uses standard PyTorch gather-scatter operations compatible with MPS—no custom Metal kernels required.
+
+**To disable MPS and use CPU-only:**
+```bash
+conda activate sam-3d
+python main.py --image <path> --mask-dir <masks> --no-stage2-mps --output output.glb
+```
+
+**Web API (disable MPS per-request):**
+Pass `"stage2_mps": false` in the `/reconstruct` or `/reconstruct_multi_view` POST request to disable for that request:
+```json
+{
+  "image_id": "...",
+  "mask_b64": "...",
+  "stage2_mps": false
+}
+```
+
+**Server startup:**
+```bash
+# MPS enabled (default)
+python server.py
+
+# MPS disabled
+python server.py --no-stage2-mps
+```
+
+**Notes:**
+- MPS is enabled by default for best performance on Apple Silicon
+- Falls back to CPU automatically if MPS is unavailable
+- Does not affect Stage 1 (sparse geometry) or decoding stages
+- Uses TRELLIS.2 sparse convolution pattern with gather-scatter operations
+
 ### Reconstruction
 
 - **Interactive segmentation.** Two prompt modes in the browser UI: **text /

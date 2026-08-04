@@ -200,9 +200,14 @@ class InferencePipeline:
         compile_model=False,
         slat_mean=SLAT_MEAN,
         slat_std=SLAT_STD,
+        use_stage2_mps=False,  # Enable MPS acceleration for Stage 2 (SLAT)
     ):
         self.rendering_engine = rendering_engine
         self.device = torch.device(device)
+        self.use_stage2_mps = use_stage2_mps
+        self.stage2_device = torch.device('mps' if (use_stage2_mps and torch.backends.mps.is_available()) else device)
+        if self.use_stage2_mps:
+            logger.info(f"[STAGE2-MPS] Stage 2 (SLAT) will run on: {self.stage2_device}")
         self.compile_model = compile_model
         logger.info(f"self.device: {self.device}")
         logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}")
@@ -960,6 +965,13 @@ class InferencePipeline:
     ) -> sp.SparseTensor:
         image = slat_input["image"]
         DEVICE = image.device
+        
+        # Use Stage 2 MPS if enabled and available
+        if self.use_stage2_mps and torch.backends.mps.is_available():
+            DEVICE = self.stage2_device
+            slat_input = {k: (v.to(DEVICE) if isinstance(v, torch.Tensor) else v) for k, v in slat_input.items()}
+            image = slat_input["image"]
+        
         slat_generator = self.models["slat_generator"]
         latent_shape = (image.shape[0],) + (coords.shape[0], 8)
         prev_inference_steps = slat_generator.inference_steps
@@ -973,11 +985,12 @@ class InferencePipeline:
             slat_generator.reverse_fn.strength = self.slat_cfg_strength
 
         logger.info(
-            "Sampling sparse latent: inference_steps={}, strength={}, interval={}, rescale_t={}",
+            "Sampling sparse latent: inference_steps={}, strength={}, interval={}, rescale_t={}, device={}",
             slat_generator.inference_steps,
             slat_generator.reverse_fn.strength,
             slat_generator.reverse_fn.interval,
             slat_generator.rescale_t,
+            DEVICE,
         )
 
         with torch.inference_mode():  # Changed from autocast(cuda) for CPU compatibility

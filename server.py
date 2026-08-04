@@ -171,6 +171,9 @@ _buf_handler = _LogBufferHandler()
 _buf_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s"))
 logging.getLogger().addHandler(_buf_handler)
 
+# Server-wide default for Stage 2 MPS (can be overridden per-request)
+_default_stage2_mps = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job state
@@ -307,6 +310,7 @@ class ReconstructRequest(BaseModel):
     # on by default; stage 2 (SLAT) is genuine flow matching, so `distill` (stage 2) is off.
     ss_distill: bool = True
     distill: bool = False
+    stage2_mps: bool = False  # (Experimental) Run Stage 2 on MPS GPU
 
 
 class DepthRequest(BaseModel):
@@ -327,6 +331,7 @@ class ReconstructMultiViewRequest(BaseModel):
     stage2_steps: int = 8
     ss_distill: bool = True
     distill: bool = False
+    stage2_mps: bool = False  # (Experimental) Run Stage 2 on MPS GPU
     fusion_mode: str = "stochastic"  # "stochastic" or "multidiffusion"
     view_weighting: str = "uniform"  # "uniform" or "entropy"
     num_views_select: Optional[int] = None
@@ -1045,6 +1050,9 @@ async def reconstruct(req: ReconstructRequest):
     # Clamp to a sane range so a bad client value can't hang the machine.
     stage1_steps = max(1, min(int(req.stage1_steps), 100))
     stage2_steps = max(1, min(int(req.stage2_steps), 100))
+    
+    # Use server default if request doesn't specify stage2_mps
+    use_stage2_mps = req.stage2_mps or _default_stage2_mps
 
     asyncio.get_event_loop().run_in_executor(
         None,
@@ -1056,6 +1064,7 @@ async def reconstruct(req: ReconstructRequest):
         stage2_steps,
         bool(req.distill),
         bool(req.ss_distill),
+        use_stage2_mps,
     )
 
     return {"job_id": job_id}
@@ -1101,6 +1110,9 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
     stage2_steps = max(1, min(int(req.stage2_steps), 100))
     num_views_select = min(len(req.images), req.num_views_select) if req.num_views_select else None
     
+    # Use server default if request doesn't specify stage2_mps
+    use_stage2_mps = req.stage2_mps or _default_stage2_mps
+    
     # Run in background thread
     asyncio.get_event_loop().run_in_executor(
         None,
@@ -1112,6 +1124,7 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
         stage2_steps,
         bool(req.distill),
         bool(req.ss_distill),
+        use_stage2_mps,
         req.fusion_mode,
         req.view_weighting,
         num_views_select,
@@ -1615,8 +1628,8 @@ def _run_reconstruction_sync(
     stage2_steps: int = 8,
     distill: bool = False,
     ss_distill: bool = True,
+    stage2_mps: bool = False,
 ):
-    """Full reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
     # Attach log handler so pipeline stages drive the progress bar
     root_logger = logging.getLogger()
@@ -1680,6 +1693,7 @@ def _run_reconstruction_sync(
             vertex_color_source="gaussian",
             use_stage1_distillation=ss_distill,
             use_stage2_distillation=distill,
+            use_stage2_mps=stage2_mps,
         )
 
         # The pipeline returns a per-vertex-coloured GLB: to_glb colours each
@@ -1745,6 +1759,7 @@ def _run_multi_view_reconstruction_sync(
     stage2_steps: int = 8,
     distill: bool = False,
     ss_distill: bool = True,
+    stage2_mps: bool = False,
     fusion_mode: str = "stochastic",
     view_weighting: str = "uniform",
     num_views_select: Optional[int] = None,
@@ -1821,6 +1836,7 @@ def _run_multi_view_reconstruction_sync(
             fusion_config=fusion_config,
             use_stage1_distillation=ss_distill,
             use_stage2_distillation=distill,
+            use_stage2_mps=stage2_mps,
         )
 
         result_mesh = output["glb"]
@@ -1893,10 +1909,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SAM-3D reconstruction server")
     parser.add_argument("--port", type=int, default=8005,
                         help="TCP port to listen on (default: 8005)")
+    parser.add_argument("--no-stage2-mps", action="store_true",
+                        help="Disable MPS acceleration for Stage 2 (SLAT). Enabled by default on Apple Silicon.")
     parser.add_argument("--silent", action="store_true",
                         help="Do not open the client in a browser after startup")
     args = parser.parse_args()
     port = args.port
+    
+    # Set global default for Stage 2 MPS (MPS enabled by default, disabled with --no-stage2-mps)
+    _default_stage2_mps = not args.no_stage2_mps
+    if _default_stage2_mps:
+        logger.info("[SERVER] Stage 2 MPS acceleration enabled")
+    else:
+        logger.info("[SERVER] Stage 2 MPS acceleration disabled (CPU mode)")
 
     # Open the client once the server is actually accepting connections (unless
     # --silent). Runs on a daemon thread that waits for the port to bind, so it

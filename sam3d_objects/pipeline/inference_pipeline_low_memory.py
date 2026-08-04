@@ -484,6 +484,7 @@ class InferencePipelineLowMemory:
         stage2_inference_steps=None,
         use_stage1_distillation=False,
         use_stage2_distillation=False,
+        use_stage2_mps=False,
         decode_formats=None,
         use_cache: bool = True,
         simplify_ratio: float = 0.0,
@@ -792,13 +793,16 @@ class InferencePipelineLowMemory:
                 "slat_generator_config_path", "slat_generator_ckpt_path"
             )
             
-            # Move SLAT generator to MPS for GPU acceleration (critical for performance)
-            if torch.backends.mps.is_available():
-                mps_device = torch.device("mps")
+            # Move SLAT generator to MPS for GPU acceleration if enabled
+            stage2_device = self.device
+            if use_stage2_mps and torch.backends.mps.is_available():
+                stage2_device = torch.device("mps")
                 logger.info(f"[LOW-MEM] Moving SLAT generator to MPS for GPU acceleration")
-                slat_generator.to(mps_device)
+                slat_generator.to(stage2_device)
                 if slat_condition_embedder is not None:
-                    slat_condition_embedder.to(mps_device)
+                    slat_condition_embedder.to(stage2_device)
+            else:
+                logger.info(f"[LOW-MEM] Stage 2 running on: {stage2_device}")
             
             # Configure generator
             inference_steps = stage2_inference_steps or self.slat_inference_steps
@@ -821,12 +825,10 @@ class InferencePipelineLowMemory:
                     # Config has slat_condition_input_mapping: [] (empty list)
                     # This means all inputs go as kwargs to the embedder
                     if slat_condition_embedder is not None:
-                        # Move all tensor inputs to MPS to match embedder device
-                        if torch.backends.mps.is_available():
-                            mps_device = torch.device("mps")
-                            for key, value in slat_input_dict.items():
-                                if isinstance(value, torch.Tensor):
-                                    slat_input_dict[key] = value.to(mps_device)
+                        # Move all tensor inputs to stage2_device
+                        for key, value in slat_input_dict.items():
+                            if isinstance(value, torch.Tensor):
+                                slat_input_dict[key] = value.to(stage2_device)
                         # Pass all inputs as kwargs (matching config with empty mapping)
                         cond_tokens = slat_condition_embedder(**slat_input_dict)
                         condition_args = (cond_tokens, coords.cpu().numpy())
@@ -838,7 +840,7 @@ class InferencePipelineLowMemory:
                     
                     slat_raw = slat_generator(
                         latent_shape,
-                        slat_input_dict["image"].device,
+                        stage2_device,
                         *condition_args,
                         **condition_kwargs,
                     )
@@ -1095,6 +1097,7 @@ class InferencePipelineLowMemory:
         stage2_inference_steps: int = None,
         use_stage1_distillation: bool = False,
         use_stage2_distillation: bool = False,
+        use_stage2_mps: bool = False,
         decode_formats: list = None,
         fusion_config = None,
     ) -> dict:
@@ -1112,7 +1115,7 @@ class InferencePipelineLowMemory:
                 with_mesh_postprocess=with_mesh_postprocess, with_texture_baking=with_texture_baking,
                 use_vertex_color=use_vertex_color, stage1_inference_steps=stage1_inference_steps,
                 stage2_inference_steps=stage2_inference_steps, use_stage1_distillation=use_stage1_distillation,
-                use_stage2_distillation=use_stage2_distillation, decode_formats=decode_formats
+                use_stage2_distillation=use_stage2_distillation, use_stage2_mps=use_stage2_mps, decode_formats=decode_formats
             )
         
         logger.info(f"[MULTI-VIEW] Multi-view reconstruction: {len(images)} views")
@@ -1127,7 +1130,7 @@ class InferencePipelineLowMemory:
                 with_mesh_postprocess=with_mesh_postprocess, with_texture_baking=with_texture_baking,
                 use_vertex_color=use_vertex_color, stage1_inference_steps=stage1_inference_steps,
                 stage2_inference_steps=stage2_inference_steps, use_stage1_distillation=use_stage1_distillation,
-                use_stage2_distillation=use_stage2_distillation, decode_formats=decode_formats
+                use_stage2_distillation=use_stage2_distillation, use_stage2_mps=use_stage2_mps, decode_formats=decode_formats
             )
             results.append(result)
         

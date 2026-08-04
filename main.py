@@ -266,6 +266,7 @@ def run_pipeline(
         vertex_color_source=vertex_color_source,
         use_stage1_distillation=ss_distill,
         use_stage2_distillation=distill,
+        use_stage2_mps=not args.no_stage2_mps,
         full_res_geometry=full_res_geometry,
     )
     
@@ -494,6 +495,13 @@ def main():
         help="Also distill STAGE 2 (SLAT). The released SLAT weights are not shortcut-"
              "distilled, so this is experimental and usually degrades texture quality; "
              "leave it off. Stage 1 is distilled by default (see --ss-distill)."
+    )
+    parser.add_argument(
+        "--no-stage2-mps",
+        action="store_true",
+        help="Disable MPS acceleration for Stage 2 (SLAT texture & refinement). "
+             "Stage 2 runs on MPS (Metal GPU) by default on Apple Silicon for improved speed. "
+             "Use this flag to force CPU-only processing if needed."
     )
 
     parser.add_argument(
