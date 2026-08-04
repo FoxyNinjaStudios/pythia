@@ -143,6 +143,33 @@ python server.py --no-stage2-mps
 - Does not affect Stage 1 (sparse geometry) or decoding stages
 - Uses TRELLIS.2 sparse convolution pattern with gather-scatter operations
 
+### Low-memory pipeline improvements
+
+The low-memory inference pipeline (`InferencePipelineLowMemory`) has been refactored for **robustness and clarity**:
+
+**Device coordination fixes:**
+- Fixed Stage 2 MPS device handling to prevent tensor device mismatches
+- Centralized device selection logic (new `get_stage2_device()` helper)
+- Explicit tensor migration: inputs moved to stage2_device before generation, SLAT moved back to base device after
+
+**Memory & I/O optimizations:**
+- Single SLAT save (eliminated redundant double saves)
+- Improved model cleanup with proper CPU transition before deletion
+- MPS cache clearing with error handling
+
+**Robustness enhancements:**
+- Comprehensive error handling around model loading and caching
+- Graceful fallbacks (e.g., use vertex color if Gaussian unavailable)
+- Better logging with stage-specific prefixes (`[S0]`, `[S1]`, `[S2]`, `[S3]`)
+- Clearer per-stage timing output with device info
+
+**Developer experience:**
+- Complete docstrings and type hints
+- Organized code sections (memory utilities, caching, pipeline logic)
+- Clear comments and timing checkpoints throughout
+
+These improvements maintain full **backward compatibility** and don't change the external API or behavior—just the internal robustness and maintainability.
+
 ### Reconstruction
 
 - **Interactive segmentation.** Two prompt modes in the browser UI: **text /
