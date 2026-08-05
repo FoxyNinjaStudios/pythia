@@ -1157,6 +1157,11 @@ let qualitySteps = { s1: 8, s2: 8 };   // Fast preset (stage1 / stage2 inference
 let screenWakeLock = null;       // Screen Wake Lock API handle
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Utility: DOM element selector
+// ─────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Screen Wake Lock (keep display on during reconstruction)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2410,8 +2415,6 @@ let killed     = new Set();             // welded face indices removed by the st
 let bboxDiag   = 1;                     // model bounding-box diagonal (edge-trim scale)
 let curBlobURL = null;                 // object URL currently shown / exportable
 let debounceId = null;
-
-const $ = (id) => document.getElementById(id);
 
 // ── Welded working set: unique vertices + faces in welded index space ──────────
 function buildWorking(geometry) {
@@ -4022,7 +4025,7 @@ function closeExport() {
 
 // ── Models status sidebar ──────────────────────────────────────────────────
 let _modelsPollTimer = null;
-const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3: "fa-comment-dots", sam3d: "fa-cube", moge: "fa-layer-group", dino: "fa-diagram-project" };
+const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3: "fa-comment-dots", sam3d: "fa-cube", moge: "fa-layer-group", dino: "fa-diagram-project", pcn: "fa-droplet", vae: "fa-sparkles" };
 const MODEL_LABEL = { loaded: "Loaded", downloaded: "Downloaded", not_downloaded: "Missing" };
 const _modelNames = {};
 const _modelGated = {};
