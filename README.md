@@ -292,10 +292,7 @@ and update the 3D preview live:
   (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
   **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
   **Neon**. Live preview in viewport; applies on download when baking is enabled.
-- **AI Mesh Cleanup** (optional, Metal-accelerated). Advanced post-processing using machine learning:
-  - **AI Denoise (PCN).** Point Completion Network denoises point clouds, removing noise artifacts. ~2–5 seconds. Loads denoising model on demand with intelligent memory management.
-  - **AI Complete (Shape VAE).** 3D Variational Autoencoder completes and refines complex/incomplete geometry, useful for highly ambiguous reconstructions. ~5–10 seconds. Runs on Metal (MPS) for GPU acceleration.
-  Both AI stages are optional, run on CPU or Metal (MPS) depending on availability, and unload models after cleanup to free GPU memory for other tasks.
+- **AI Mesh Cleanup** (experimental, placeholder). The UI includes checkboxes for Point Completion Network (PCN) and 3D Shape VAE stages, but these are currently untrained architectural stubs without weights. The feature compiles and runs without errors but produces no actual denoising or completion—it passes geometry through unchanged. Implementation is first-party AGPL code; trained weights are not yet included. Future work: obtain or train weights to make the feature functional.
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
   for web/`model-viewer` use.
@@ -627,6 +624,12 @@ following were built here:
     download / load status and downloads missing weights from Hugging Face,
     including token entry and gated-repo handling for SAM 3D Objects (see
     [Model management](#model-management-web-ui)).
+9. **Experimental AI mesh cleanup (placeholder).** UI controls for Point
+    Completion Network (PCN) denoising and 3D Shape VAE completion are wired
+    into the export pipeline, with Metal acceleration support for iOS/MPS. The
+    underlying models are currently untrained stubs (architecture only, random
+    weights, no trained weights included). The feature is non-functional pending
+    weight procurement or training.
 
 ## Troubleshooting
 
@@ -707,7 +710,11 @@ IP available under a separate commercial license.
 - **What is actually in this repository.** Two license regimes coexist in the
   tree, and this is deliberate:
   - **First-party application code** (web app, splatting, baking, geometry work,
-    cleanup, editing): **AGPL-3.0**.
+    editing, AI cleanup UI/architecture): **AGPL-3.0**. This includes the
+    Point Completion Network (PCN) and 3D Shape VAE architectures implemented
+    in `mesh_cleanup_ai.py`, which are currently untrained stubs without
+    weights—the UI controls are wired but the feature is non-functional pending
+    trained weights.
   - **`sam3d_objects/`**: under Meta's **SAM License** (see
     [`sam3d_objects/LICENSE`](sam3d_objects/LICENSE)), not AGPL.
 
@@ -733,6 +740,8 @@ IP available under a separate commercial license.
   | DINOv2 | Image features | Apache 2.0 |
   | MoGe | Depth estimation | MIT |
   | SAM 3D Objects | Reconstruction model + weights | Meta SAM License |
+  | Point Completion Network (PCN) | AI point cloud denoising (experimental, untrained) | AGPL-3.0 (first-party code, no weights) |
+  | 3D Shape VAE | AI geometry completion (experimental, untrained) | AGPL-3.0 (first-party code, no weights) |
 
 - **Model weights (Meta SAM License).** The SAM 3D model weights and the code
   under [`sam3d_objects/`](sam3d_objects/LICENSE) are provided by Meta under the
