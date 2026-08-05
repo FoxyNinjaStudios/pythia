@@ -135,11 +135,6 @@ class SparseTensor:
                         self.coords[self.layout[i], 0] == i
                     ), f"The data of batch {i} is not contiguous"
             except Exception as e:
-                print("Debugging information:")
-                print(f"- Shape: {self.shape}")
-                print(f"- Layout: {self.layout}")
-                print(f"- Scale: {self._scale}")
-                print(f"- Coords: {self.coords}")
                 raise e
 
     def __cal_shape(self, feats, coords):

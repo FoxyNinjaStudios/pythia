@@ -72,7 +72,7 @@ logging.getLogger("sam3d.server").warning(
 )
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -173,6 +173,10 @@ logging.getLogger().addHandler(_buf_handler)
 
 # Server-wide default for Stage 2 MPS (can be overridden per-request)
 _default_stage2_mps = False
+# Server-wide default for text mask refinement
+_refine_text_mask_enabled = False
+# Disable client-side console logging
+_disable_client_logs = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +315,9 @@ class ReconstructRequest(BaseModel):
     ss_distill: bool = True
     distill: bool = False
     stage2_mps: bool = False  # (Experimental) Run Stage 2 on MPS GPU
+    # Post-process mesh cleanup
+    simplify_ratio: Optional[float] = 0.9  # Decimation: 0.0=none, 0.95=heavy; default 0.9
+    smooth_iterations: int = 0  # Taubin smoothing: 0=off, max 500 (default: 10 passes)
 
 
 class DepthRequest(BaseModel):
@@ -335,6 +342,9 @@ class ReconstructMultiViewRequest(BaseModel):
     fusion_mode: str = "stochastic"  # "stochastic" or "multidiffusion"
     view_weighting: str = "uniform"  # "uniform" or "entropy"
     num_views_select: Optional[int] = None
+    # Post-process mesh cleanup
+    simplify_ratio: Optional[float] = 0.9  # Decimation: 0.0=none, 0.95=heavy; default 0.9
+    smooth_iterations: int = 0  # Taubin smoothing: 0=off, max 500 (default: 10 passes)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,7 +410,23 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.get("/")
 async def root():
-    return FileResponse(os.path.join(static_dir, "index.html"))
+    html_path = os.path.join(static_dir, "index.html")
+    with open(html_path, "r") as f:
+        html_content = f.read()
+    # Inject a global JavaScript variable to control client-side logging
+    # Also hide the console card if logs are disabled
+    inject_script = f"""<script>
+window.DISABLE_CLIENT_LOGS = {str(_disable_client_logs).lower()};
+if (window.DISABLE_CLIENT_LOGS) {{
+  document.addEventListener('DOMContentLoaded', function() {{
+    const consoleCard = document.getElementById('console-card');
+    if (consoleCard) consoleCard.style.display = 'none';
+  }});
+}}
+</script>"""
+    # Insert the script right after <head> tag
+    html_content = html_content.replace("<head>", f"<head>\n{inject_script}", 1)
+    return HTMLResponse(content=html_content)
 
 
 # ── Model status ────────────────────────────────────────────────────────────────
@@ -1053,6 +1079,10 @@ async def reconstruct(req: ReconstructRequest):
     
     # Use server default if request doesn't specify stage2_mps
     use_stage2_mps = req.stage2_mps or _default_stage2_mps
+    
+    # Post-process mesh cleanup parameters
+    simplify_ratio = req.simplify_ratio
+    smooth_iterations = max(0, min(int(req.smooth_iterations), 500))
 
     asyncio.get_event_loop().run_in_executor(
         None,
@@ -1065,6 +1095,8 @@ async def reconstruct(req: ReconstructRequest):
         bool(req.distill),
         bool(req.ss_distill),
         use_stage2_mps,
+        simplify_ratio,
+        smooth_iterations,
     )
 
     return {"job_id": job_id}
@@ -1110,6 +1142,10 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
     stage2_steps = max(1, min(int(req.stage2_steps), 100))
     num_views_select = min(len(req.images), req.num_views_select) if req.num_views_select else None
     
+    # Post-process mesh cleanup parameters
+    simplify_ratio = req.simplify_ratio
+    smooth_iterations = max(0, min(int(req.smooth_iterations), 500))
+    
     # Use server default if request doesn't specify stage2_mps
     use_stage2_mps = req.stage2_mps or _default_stage2_mps
     
@@ -1128,6 +1164,8 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
         req.fusion_mode,
         req.view_weighting,
         num_views_select,
+        simplify_ratio,
+        smooth_iterations,
     )
     
     return {"job_id": job_id}
@@ -1334,7 +1372,7 @@ def _sam_predict(image, positive_points, negative_points):
 
 def _sam_predict_text(image, text):
     from sam_wrapper import predict_mask_text
-    return predict_mask_text(image, text)
+    return predict_mask_text(image, text, refine=_refine_text_mask_enabled)
 
 
 def _load_text_seg_model():
@@ -1629,6 +1667,8 @@ def _run_reconstruction_sync(
     distill: bool = False,
     ss_distill: bool = True,
     stage2_mps: bool = False,
+    simplify_ratio: Optional[float] = None,
+    smooth_iterations: int = 0,
 ):
     job = jobs[job_id]
     # Attach log handler so pipeline stages drive the progress bar
@@ -1705,13 +1745,25 @@ def _run_reconstruction_sync(
         # overlay is intentionally disabled here.
         result_mesh = output["glb"]
 
-        # Sand off the 64^3 voxel staircase on oblique silhouettes. The 2D mask is
-        # full-res/soft; the geometry grid is not, so the step lives in the mesh.
-        # Volume-preserving Taubin keeps thin parts (legs) while removing stepping.
+        # Post-process: Decimation (mesh simplification)
+        if simplify_ratio and simplify_ratio > 0.0:
+            try:
+                simplify_ratio = max(0.0, min(simplify_ratio, 0.99))
+                target_reduction = 100 * simplify_ratio
+                logger.info(f"[JOB {job_id}] Simplifying mesh to {100*(1-simplify_ratio):.1f}% vertices…")
+                result_mesh = result_mesh.simplify(simplify_ratio)
+                logger.info(f"[JOB {job_id}] Mesh simplified to {len(result_mesh.vertices)} vertices")
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] mesh simplification skipped: {exc}")
+
+        # Post-process: Smoothing (Taubin smoothing to de-staircase the 64³ voxel grid)
+        # Default to 10 iterations if not specified; allow up to 500
+        smooth_iters = smooth_iterations if smooth_iterations > 0 else 10
         try:
             from mesh_utils import taubin_smooth
-
-            result_mesh = taubin_smooth(result_mesh, iterations=10)
+            logger.info(f"[JOB {job_id}] Taubin-smoothing mesh ({smooth_iters} iterations)…")
+            result_mesh = taubin_smooth(result_mesh, iterations=smooth_iters)
+            logger.info(f"[JOB {job_id}] Mesh smoothed")
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
 
@@ -1763,6 +1815,8 @@ def _run_multi_view_reconstruction_sync(
     fusion_mode: str = "stochastic",
     view_weighting: str = "uniform",
     num_views_select: Optional[int] = None,
+    simplify_ratio: Optional[float] = None,
+    smooth_iterations: int = 0,
 ):
     """Multi-view reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
@@ -1841,10 +1895,24 @@ def _run_multi_view_reconstruction_sync(
 
         result_mesh = output["glb"]
 
-        # Smooth the mesh
+        # Post-process: Decimation (mesh simplification)
+        if simplify_ratio and simplify_ratio > 0.0:
+            try:
+                simplify_ratio = max(0.0, min(simplify_ratio, 0.99))
+                logger.info(f"[JOB {job_id}] Simplifying mesh to {100*(1-simplify_ratio):.1f}% vertices…")
+                result_mesh = result_mesh.simplify(simplify_ratio)
+                logger.info(f"[JOB {job_id}] Mesh simplified to {len(result_mesh.vertices)} vertices")
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] mesh simplification skipped: {exc}")
+
+        # Post-process: Smoothing (Taubin smoothing to de-staircase the 64³ voxel grid)
+        # Default to 10 iterations if not specified; allow up to 500
+        smooth_iters = smooth_iterations if smooth_iterations > 0 else 10
         try:
             from mesh_utils import taubin_smooth
-            result_mesh = taubin_smooth(result_mesh, iterations=10)
+            logger.info(f"[JOB {job_id}] Taubin-smoothing mesh ({smooth_iters} iterations)…")
+            result_mesh = taubin_smooth(result_mesh, iterations=smooth_iters)
+            logger.info(f"[JOB {job_id}] Mesh smoothed")
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
 
@@ -1911,13 +1979,19 @@ if __name__ == "__main__":
                         help="TCP port to listen on (default: 8005)")
     parser.add_argument("--no-stage2-mps", action="store_true",
                         help="Disable MPS acceleration for Stage 2 (SLAT). Enabled by default on Apple Silicon.")
+    parser.add_argument("--refine-text-mask", action="store_true",
+                        help="Enable text mask refinement for SAM 3 segmentation (disabled by default)")
+    parser.add_argument("--no-client-logs", action="store_true",
+                        help="Disable client-side console logging in the web UI")
     parser.add_argument("--silent", action="store_true",
                         help="Do not open the client in a browser after startup")
     args = parser.parse_args()
     port = args.port
     
-    # Set global default for Stage 2 MPS (MPS enabled by default, disabled with --no-stage2-mps)
+    # Set global defaults from CLI arguments
     _default_stage2_mps = not args.no_stage2_mps
+    _refine_text_mask_enabled = args.refine_text_mask
+    _disable_client_logs = args.no_client_logs
     if _default_stage2_mps:
         logger.info("[SERVER] Stage 2 MPS acceleration enabled")
     else:

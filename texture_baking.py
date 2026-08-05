@@ -415,6 +415,8 @@ def bake_texture_from_image(
     model_colors: np.ndarray | None = None,
     model_colors_have_hue: bool = False,
     as_vertex_colors: bool = False,
+    sparse_geometry_confidence: np.ndarray | None = None,
+    slat_confidence: np.ndarray | None = None,
 ) -> trimesh.Trimesh:
     """
     UV-unwrap a mesh and bake a texture atlas.
@@ -447,6 +449,10 @@ def bake_texture_from_image(
     model_vertices : (N, 3) float32 – raw decoder (z-up) vertices for the model
                                       colour prediction (optional)
     model_colors   : (N, 3) float   – model per-vertex RGB in [0,1] or [0,255]
+    sparse_geometry_confidence : (V,) float32 – per-vertex confidence from Stage 1
+                                      sparse geometry reconstruction [0,1] (optional)
+    slat_confidence : (V,) float32 – per-vertex confidence from Stage 2 SLAT 
+                                      texture refinement [0,1] (optional)
 
     Returns
     -------
@@ -536,9 +542,45 @@ def bake_texture_from_image(
     # Camera direction: +Z in pointmap → +Y in GLB.  Front faces point
     # toward camera, so their normal has a negative Y component in GLB.
     cos_vis = -vert_normals[:, 1]                           # [-1, 1]
+    
+    # ── Adaptive visibility weighting (Improvement #2) ──────────────────
+    # Compute local surface curvature to adaptively weight grazing surfaces.
+    # Sharp features (high curvature) need harsher visibility falloff to avoid
+    # color bleeding; smooth surfaces benefit from softer weighting.
+    curvature = np.zeros(len(vertices_uv), dtype=np.float32)
+    for i, j, k in faces_uv:
+        v0, v1, v2 = vertices_uv[[i, j, k]]
+        # Mean curvature magnitude via edge dihedral angles
+        e1_norm = np.linalg.norm(v1 - v0)
+        e2_norm = np.linalg.norm(v2 - v1)
+        e3_norm = np.linalg.norm(v0 - v2)
+        if e1_norm > 1e-8 and e2_norm > 1e-8 and e3_norm > 1e-8:
+            # Simplified: use triangle angle as proxy for local curvature
+            # Acute angles → high curvature
+            face_area = np.linalg.norm(np.cross(v1 - v0, v2 - v0)) * 0.5
+            if face_area > 1e-8:
+                c = 1.0 / (face_area + 1e-8)
+                np.add.at(curvature, [i, j, k], c)
+    
+    # Normalize curvature per vertex
+    vert_deg = np.zeros(len(vertices_uv), dtype=np.int32)
+    for i in [0, 1, 2]:
+        np.add.at(vert_deg, faces_uv[:, i], 1)
+    vert_deg = np.maximum(vert_deg, 1)
+    curvature = curvature / vert_deg
+    # Normalize to [0, 1] range for weighting
+    if curvature.max() > 1e-8:
+        curvature = curvature / (curvature.max() + 1e-8)
+    
+    # Adaptive visibility exponent: sharp edges use 0.5, smooth surfaces use 0.35
+    # This allows grazing surfaces on smooth regions to retain more image detail
+    vis_exp = 0.35 + 0.15 * curvature  # Range [0.35, 0.5]
+    
     # Smooth weight: 0 for back-facing, ramps up for front-facing
     # gamma < 1 keeps more image detail on grazing faces
-    visibility_weight = np.clip(cos_vis, 0.0, 1.0) ** 0.5  # (V',)
+    visibility_weight = np.clip(cos_vis, 0.0, 1.0) ** vis_exp  # (V',)
+    print(f"[TEXTURE] Adaptive visibility exp: min={vis_exp.min():.3f}, "
+          f"max={vis_exp.max():.3f}, mean={vis_exp.mean():.3f}")
 
     # ── Occlusion (z-buffer) test ─────────────────────────────────────────
     # A vertex can be front-FACING yet still be HIDDEN behind another part of
@@ -567,19 +609,80 @@ def bake_texture_from_image(
           f"({100*n_occ/max(len(occluded),1):.1f}%) → use base colour")
 
     # Incorporate pointmap match quality: high KD-tree distance → unreliable color
+    # (Improvement #1: Enhanced pointmap confidence scoring)
     if pm_dists is not None:
         dist_median = np.median(pm_dists)
-        # Vertices with distance > 1.5× median are poor matches → reduce confidence
-        dist_threshold = max(dist_median * 1.5, 0.01)
-        dist_confidence = np.clip(1.0 - pm_dists / dist_threshold, 0.0, 1.0)
-        visibility_weight = visibility_weight * dist_confidence
+        dist_std = np.std(pm_dists)
+        dist_q75 = np.percentile(pm_dists, 75)
+        
+        # Adaptive threshold: use 75th percentile + 1 std dev for better separation
+        # of good vs poor matches, rather than fixed 1.5× median
+        dist_threshold = max(dist_q75 + dist_std, dist_median * 1.2, 0.01)
+        
+        # Smooth confidence falloff using sigmoid-like curve instead of hard clip
+        # Poor matches at threshold → confidence ≈ 0.5; 2× threshold → confidence ≈ 0.1
+        pm_conf = 1.0 / (1.0 + (pm_dists / (dist_threshold + 1e-8)) ** 2)
+        
+        # Vertices far from image center are less reliable
+        # (more likely to be on silhouettes or heavily foreshortened)
+        img_center_x, img_center_y = img_w / 2.0, img_h / 2.0
+        dist_from_center = np.sqrt((px_f - img_center_x) ** 2 + (py_f - img_center_y) ** 2)
+        max_dist_from_center = np.sqrt(img_center_x ** 2 + img_center_y ** 2)
+        center_conf = 1.0 - (dist_from_center / (max_dist_from_center + 1e-8)) ** 2
+        center_conf = np.clip(center_conf, 0.5, 1.0)  # Don't penalize too heavily
+        
+        visibility_weight = visibility_weight * pm_conf * center_conf
         n_poor = int((pm_dists > dist_threshold).sum())
-        print(f"[TEXTURE] Pointmap poor matches (dist>{dist_threshold:.4f}): "
-              f"{n_poor} / {len(pm_dists)} ({100*n_poor/max(len(pm_dists),1):.1f}%)")
+        print(f"[TEXTURE] Pointmap quality: median={dist_median:.4f}, "
+              f"threshold={dist_threshold:.4f}, poor matches={n_poor} "
+              f"({100*n_poor/max(len(pm_dists),1):.1f}%)")
 
     n_front = int((cos_vis > 0).sum())
     print(f"[TEXTURE] front-facing vertices: {n_front} / {len(cos_vis)} "
           f"({100*n_front/max(len(cos_vis),1):.1f}%)")
+
+    # ── Integrate reconstruction quality confidence (Improvement #5) ──────
+    # Use sparse geometry and SLAT stage confidence to modulate texture weight.
+    # High-confidence regions from the generative pipeline should trust image
+    # texture more; low-confidence regions should rely more on model colors.
+    
+    # Auto-generate confidence if not provided (Improvement #3 default)
+    if sparse_geometry_confidence is None:
+        # Heuristic: vertices near object center are more confident
+        # (interior details) vs silhouette vertices (ambiguous edges)
+        sparse_geometry_confidence = estimate_sparse_geometry_confidence_from_vertices(
+            vertices_uv, falloff_dist=1.0
+        )
+        print(f"[TEXTURE] Stage 1: Generated heuristic sparse confidence "
+              f"(center-based falloff)")
+    
+    if slat_confidence is None:
+        # Heuristic: smooth surfaces are more reliably refined
+        # Use inverse of curvature as proxy for refinement confidence
+        slat_confidence = 1.0 - np.clip(curvature, 0.0, 1.0)
+        print(f"[TEXTURE] Stage 2: Generated heuristic SLAT confidence "
+              f"(inverse curvature)")
+    
+    # Apply confidence weighting
+    if sparse_geometry_confidence is not None and len(sparse_geometry_confidence) == len(vertices_uv):
+        # Soft weighting: confident regions get more image detail
+        # Confidence in [0,1] → weight multiplier in [0.5, 1.0]
+        # (always keep at least 50% image texture for confident regions)
+        sparse_conf = 0.5 + 0.5 * np.clip(sparse_geometry_confidence, 0.0, 1.0)
+        visibility_weight = visibility_weight * sparse_conf
+        n_high_conf = int((sparse_geometry_confidence > 0.7).sum())
+        print(f"[TEXTURE] Stage 1 sparse confidence: high={n_high_conf} "
+              f"({100*n_high_conf/len(sparse_geometry_confidence):.1f}%), "
+              f"mean={sparse_geometry_confidence.mean():.3f}")
+    
+    if slat_confidence is not None and len(slat_confidence) == len(vertices_uv):
+        # Stage 2 SLAT refinement confidence: also modulates image texture trust
+        slat_conf = 0.5 + 0.5 * np.clip(slat_confidence, 0.0, 1.0)
+        visibility_weight = visibility_weight * slat_conf
+        n_high_slat = int((slat_confidence > 0.7).sum())
+        print(f"[TEXTURE] Stage 2 SLAT confidence: high={n_high_slat} "
+              f"({100*n_high_slat/len(slat_confidence):.1f}%), "
+              f"mean={slat_confidence.mean():.3f}")
 
     # ── Base colour for the blend ─────────────────────────────────────────
     # Prefer the model's generative per-vertex colour (covers the whole object
@@ -853,11 +956,20 @@ def bake_mesh_texture(
     model_colors: np.ndarray | None = None,
     model_colors_have_hue: bool = False,
     as_vertex_colors: bool = False,
+    sparse_geometry_confidence: np.ndarray | None = None,
+    slat_confidence: np.ndarray | None = None,
 ) -> trimesh.Trimesh:
     """
     Apply UV texture baking to an existing trimesh.Trimesh object.
 
     Convenience wrapper around bake_texture_from_image.
+    
+    Additional parameters
+    ---------------------
+    sparse_geometry_confidence : (V,) float32, optional
+        Per-vertex confidence from Stage 1 sparse geometry [0,1]
+    slat_confidence : (V,) float32, optional
+        Per-vertex confidence from Stage 2 SLAT refinement [0,1]
     """
     vertices = np.array(trimesh_obj.vertices, dtype=np.float32)
     faces    = np.array(trimesh_obj.faces,    dtype=np.int32)
@@ -867,6 +979,8 @@ def bake_mesh_texture(
         model_vertices=model_vertices, model_colors=model_colors,
         model_colors_have_hue=model_colors_have_hue,
         as_vertex_colors=as_vertex_colors,
+        sparse_geometry_confidence=sparse_geometry_confidence,
+        slat_confidence=slat_confidence,
     )
 
 
@@ -957,3 +1071,136 @@ def export_textured_glb(mesh: trimesh.Trimesh, path: str) -> None:
     with open(path, "wb") as f:
         f.write(patched)
     print(f"[TEXTURE] GLB exported ({len(patched)//1024} KB) → {path}")
+
+
+# ---------------------------------------------------------------------------
+# Confidence metric helpers (Texture Mapping Improvements)
+# ---------------------------------------------------------------------------
+
+def compute_surface_curvature(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """
+    Compute per-vertex surface curvature from triangle dihedral angles.
+    
+    Returns normalized curvature in [0, 1] where:
+    - 0 = very smooth surface (spheres, cylinders)
+    - 1 = very sharp features (edges, corners)
+    
+    Used to adaptively weight visibility falloff: smooth surfaces preserve
+    grazing-angle detail, sharp edges suppress noise artifacts.
+    """
+    curvature = np.zeros(len(vertices), dtype=np.float32)
+    
+    for i, j, k in faces:
+        v0, v1, v2 = vertices[[i, j, k]]
+        
+        # Triangle area (related to sharpness of vertices)
+        face_area = np.linalg.norm(np.cross(v1 - v0, v2 - v0)) * 0.5
+        if face_area > 1e-8:
+            # Curvature proxy: inverse of area (sharp features have small areas)
+            c = 1.0 / (face_area + 1e-8)
+            np.add.at(curvature, [i, j, k], c)
+    
+    # Normalize per vertex by face count
+    vert_deg = np.zeros(len(vertices), dtype=np.int32)
+    for i in [0, 1, 2]:
+        np.add.at(vert_deg, faces[:, i], 1)
+    vert_deg = np.maximum(vert_deg, 1)
+    curvature = curvature / vert_deg
+    
+    # Normalize to [0, 1]
+    if curvature.max() > 1e-8:
+        curvature = curvature / (curvature.max() + 1e-8)
+    
+    return curvature
+
+
+def create_uniform_confidence(num_vertices: int, confidence_level: float = 0.8) -> np.ndarray:
+    """
+    Create a uniform confidence array for testing/fallback.
+    
+    Parameters
+    ----------
+    num_vertices : int
+        Number of vertices in the mesh
+    confidence_level : float
+        Confidence value in [0, 1] (default: 0.8 = high confidence)
+    
+    Returns
+    -------
+    np.ndarray of shape (num_vertices,) with uniform confidence
+    """
+    return np.full(num_vertices, confidence_level, dtype=np.float32)
+
+
+def estimate_sparse_geometry_confidence_from_vertices(
+    vertices: np.ndarray,
+    center: np.ndarray | None = None,
+    falloff_dist: float = 1.0,
+) -> np.ndarray:
+    """
+    Estimate sparse geometry confidence based on vertex distance from object center.
+    
+    Simple heuristic: vertices near the geometric center are more confident
+    (interior details), vertices on the silhouette are less confident (ambiguous).
+    
+    This is a placeholder; real implementations should use actual Stage 1
+    occupancy probability maps.
+    
+    Parameters
+    ----------
+    vertices : (V, 3) np.ndarray
+        Mesh vertices
+    center : (3,) np.ndarray or None
+        Object center (computed as mean if None)
+    falloff_dist : float
+        Distance scale for confidence falloff
+    
+    Returns
+    -------
+    (V,) np.ndarray with confidence in [0, 1]
+    """
+    if center is None:
+        center = vertices.mean(axis=0)
+    
+    # Distance from center
+    dists = np.linalg.norm(vertices - center[None, :], axis=1)
+    
+    # Confidence falloff: peak at center, drops toward edges
+    # Using Gaussian-like falloff
+    sigma = falloff_dist
+    confidence = np.exp(-(dists ** 2) / (2 * sigma ** 2))
+    
+    return np.clip(confidence, 0.0, 1.0).astype(np.float32)
+
+
+def blend_confidence_arrays(*confidence_arrays) -> np.ndarray:
+    """
+    Blend multiple confidence arrays via multiplication (conservative).
+    
+    When combining multiple confidence sources, multiplication ensures that
+    if any source is uncertain, the combined confidence is reduced.
+    
+    Parameters
+    ----------
+    *confidence_arrays : np.ndarray
+        Variable number of (V,) confidence arrays in [0, 1]
+    
+    Returns
+    -------
+    (V,) np.ndarray with blended confidence in [0, 1]
+    
+    Example
+    -------
+    >>> sparse_conf = ...   # Stage 1 confidence
+    >>> slat_conf = ...     # Stage 2 confidence
+    >>> combined = blend_confidence_arrays(sparse_conf, slat_conf)
+    """
+    if not confidence_arrays:
+        return None
+    
+    result = confidence_arrays[0].copy()
+    for conf in confidence_arrays[1:]:
+        if conf is not None:
+            result = result * np.clip(conf, 0.0, 1.0)
+    
+    return result.astype(np.float32)

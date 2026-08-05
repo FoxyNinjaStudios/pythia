@@ -476,6 +476,7 @@ def predict_mask_text(
     image: np.ndarray,
     text: str,
     score_threshold: float = 0.3,
+    refine: bool = False,
 ) -> np.ndarray:
     """
     Predict a segmentation mask from a text (concept) prompt using SAM 3.
@@ -485,13 +486,14 @@ def predict_mask_text(
     image           : (H, W, 3) uint8 RGB image
     text            : concept phrase, e.g. "chair" or "blue mug"
     score_threshold : minimum instance confidence to keep
+    refine          : whether to refine the mask with anti-aliasing (default: False)
 
     Returns
     -------
     (H, W) uint8 mask (255 = foreground, 0 = background). Empty if the phrase is
-    blank or SAM 3 finds no matching instance. The mask is returned hard-edged;
-    the downstream ``smooth_mask``/``refine_mask`` pass anti-aliases it to the
-    same soft-alpha contract as the point-prompt path.
+    blank or SAM 3 finds no matching instance. When refine=True, the mask edges
+    are anti-aliased using morphological smoothing to remove the staircasing from
+    SAM 3's 256px decoder output.
     """
     text = (text or "").strip()
     H, W = image.shape[:2]
@@ -521,8 +523,12 @@ def predict_mask_text(
     # Text prompts return every matching instance; reconstruction wants a single
     # object, so keep the highest-confidence one.
     best = int(torch.as_tensor(scores).argmax())
-    m = np.asarray(masks[best].detach().to("cpu").numpy())
-    return (m > 0.5).astype(np.uint8) * 255
+    prob = np.asarray(masks[best].detach().to("cpu").numpy(), dtype=np.float32)
+    # Optionally refine the mask with anti-aliasing to remove staircased edges
+    if refine:
+        return _refine_mask(prob)
+    else:
+        return (prob > 0.5).astype(np.uint8) * 255
 
 
 def _refine_mask(prob: np.ndarray, image: Optional[np.ndarray] = None) -> np.ndarray:

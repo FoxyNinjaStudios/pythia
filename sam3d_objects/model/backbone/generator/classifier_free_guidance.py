@@ -107,7 +107,6 @@ class ClassifierFreeGuidance(torch.nn.Module):
 
     def inner_forward(self, x, t, is_cond, strength, *args_cond, **kwargs_cond):
         x_shape = x.shape if hasattr(x, 'shape') else f"dict_keys={list(x.keys()) if isinstance(x, dict) else type(x)}"
-        print(f"[DEBUG CFG] inner_forward: is_cond={is_cond}, x_shape={x_shape}, len(args_cond)={len(args_cond)}")
         y_cond = self.backbone(x, t, *args_cond, **kwargs_cond)
         if is_cond:
             return y_cond
@@ -116,7 +115,6 @@ class ClassifierFreeGuidance(torch.nn.Module):
                 args_cond,
                 kwargs_cond,
             )
-            print(f"[DEBUG CFG] unconditional call: args_cond types={[type(a).__name__ for a in args_cond]}, kwargs_cond keys={list(kwargs_cond.keys())}")
             y_uncond = self.backbone(x, t, *args_cond, **kwargs_cond)
             return self._cfg_step(y_cond, y_uncond, strength)
 

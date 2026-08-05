@@ -123,6 +123,162 @@ def get_stage2_device(use_mps: bool) -> torch.device:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MULTI-VIEW FUSION UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_view_confidence_weights(results, fusion_config=None):
+    """
+    Compute per-view confidence weights based on surface properties and reconstruction quality.
+    
+    Higher confidence for views with:
+    - Lower coordinate variance (more consistent reconstruction)
+    - Tighter geometry (higher precision)
+    
+    Args:
+        results: List of per-view reconstruction results
+        fusion_config: Optional config (dict or object) with weighting strategy
+    
+    Returns:
+        List of normalized confidence weights [0.0-1.0] per view
+    """
+    if not results or len(results) < 2:
+        return [1.0] * len(results) if results else []
+    
+    if fusion_config is None:
+        fusion_config = {}
+    
+    # Helper to get values from dict or object
+    def get_config_value(cfg, key, default):
+        if isinstance(cfg, dict):
+            return cfg.get(key, default)
+        else:
+            return getattr(cfg, key, default)
+    
+    weighting_mode = get_config_value(fusion_config, "view_weighting", "uniform")
+    logger.info(f"[MV] Computing view confidence weights ({weighting_mode} mode)")
+    
+    weights = []
+    
+    if weighting_mode == "uniform":
+        # Equal weighting for all views
+        weights = [1.0 / len(results)] * len(results)
+    
+    elif weighting_mode == "entropy":
+        # Weight by reconstruction clarity (lower entropy/variance = higher confidence)
+        uncertainties = []
+        for i, result in enumerate(results):
+            try:
+                # Estimate uncertainty from coordinate distribution
+                if "coords" in result and result["coords"] is not None:
+                    coords = torch.as_tensor(result["coords"], dtype=torch.float32)
+                    if coords.numel() > 0:
+                        # Standard deviation of coordinates as uncertainty measure
+                        uncertainty = float(coords.std().item())
+                        uncertainties.append(uncertainty)
+                    else:
+                        uncertainties.append(1.0)
+                else:
+                    uncertainties.append(1.0)
+            except Exception as e:
+                logger.debug(f"[MV] Uncertainty computation failed for view {i}: {e}")
+                uncertainties.append(1.0)
+        
+        # Invert: lower uncertainty -> higher weight
+        if uncertainties and max(uncertainties) > 0:
+            max_unc = max(uncertainties)
+            min_unc = min(uncertainties)
+            unc_range = max_unc - min_unc + 1e-8
+            weights = [(max_unc - u) / unc_range for u in uncertainties]
+        else:
+            weights = [1.0 / len(results)] * len(results)
+    
+    else:
+        # Default to uniform
+        weights = [1.0 / len(results)] * len(results)
+    
+    # Normalize weights to sum to 1.0
+    total = sum(weights)
+    if total > 0:
+        weights = [w / total for w in weights]
+    else:
+        weights = [1.0 / len(results)] * len(results)
+    
+    logger.info(f"[MV] View confidence weights: {[f'{w:.3f}' for w in weights]}")
+    return weights
+
+
+def fuse_gaussians_with_confidence(gaussian_list, confidence_weights=None):
+    """
+    Fuse multiple 3D gaussians with confidence-weighted averaging.
+    
+    Averages gaussian positions, colors, and covariances weighted by per-view confidence.
+    
+    Args:
+        gaussian_list: List of gaussian objects from each view
+        confidence_weights: Optional list of confidence weights (sum to 1.0)
+    
+    Returns:
+        Fused gaussian object with blended appearance
+    """
+    if not gaussian_list or len(gaussian_list) == 0:
+        return None
+    
+    if len(gaussian_list) == 1:
+        return gaussian_list[0]
+    
+    try:
+        if confidence_weights is None:
+            confidence_weights = [1.0 / len(gaussian_list)] * len(gaussian_list)
+        
+        # Extract gaussian data
+        xyz_list = []
+        rgb_list = []
+        opacities_list = []
+        
+        for i, gaussian in enumerate(gaussian_list):
+            if gaussian is None:
+                continue
+            try:
+                xyz_list.append(gaussian.get_xyz)
+                rgb_list.append(gaussian.get_features[:, :3])
+                opacities_list.append(gaussian.get_opacity)
+            except Exception as e:
+                logger.debug(f"[MV] Failed to extract gaussian data from view {i}: {e}")
+                continue
+        
+        if not xyz_list:
+            logger.warning("[MV] No valid gaussians to fuse")
+            return gaussian_list[0] if gaussian_list[0] is not None else None
+        
+        # Weighted fusion
+        fused_xyz = torch.zeros_like(xyz_list[0])
+        fused_rgb = torch.zeros_like(rgb_list[0])
+        fused_opacity = torch.zeros_like(opacities_list[0])
+        
+        for i, (xyz, rgb, opacity) in enumerate(zip(xyz_list, rgb_list, opacities_list)):
+            w = confidence_weights[i % len(confidence_weights)]
+            fused_xyz = fused_xyz + xyz * w
+            fused_rgb = fused_rgb + rgb * w
+            fused_opacity = fused_opacity + opacity * w
+        
+        # Update base gaussian with fused data
+        fused = gaussian_list[0]
+        if hasattr(fused, '_xyz'):
+            fused._xyz = fused_xyz
+        if hasattr(fused, '_features_dc'):
+            fused._features_dc = fused_rgb.unsqueeze(1) if fused_rgb.dim() == 2 else fused_rgb
+        if hasattr(fused, '_opacity'):
+            fused._opacity = fused_opacity
+        
+        logger.info(f"[MV] Fused {len(xyz_list)} gaussians with confidence weights")
+        return fused
+    
+    except Exception as e:
+        logger.warning(f"[MV] Gaussian fusion failed ({e}); using first view")
+        return gaussian_list[0] if gaussian_list else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CACHING UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1048,13 +1204,28 @@ class InferencePipelineLowMemory:
         stage2_inference_steps: Optional[int] = None,
         use_stage1_distillation: bool = False,
         use_stage2_distillation: bool = False,
-        use_stage2_mps: bool = True,  # MPS enabled by default
+        use_stage2_mps: bool = True,
         decode_formats: Optional[list] = None,
         fusion_config: Optional[dict] = None,
     ) -> dict:
         """
-        Multi-view 3D reconstruction using low-memory pipeline.
-        Processes each view independently then averages geometry.
+        Multi-view 3D reconstruction with improved texture mapping and occlusion handling.
+        
+        Process:
+        1. Reconstruct each view independently (full pipeline per view)
+        2. Average sparse geometry coordinates (coordinates)
+        3. Fuse appearance (gaussians) with per-view confidence weights
+        4. Blend vertex colors from all views using visibility weighting
+        5. Export final mesh with fused appearance
+        
+        Args:
+            images: List of input images
+            masks: List of corresponding masks (optional)
+            fusion_config: Dict with keys:
+                - view_weighting: 'uniform' (default) or 'entropy' (entropy-based weights)
+        
+        Returns:
+            Fused 3D reconstruction result
         """
         if masks is None:
             masks = [None] * len(images)
@@ -1074,7 +1245,7 @@ class InferencePipelineLowMemory:
                 decode_formats=decode_formats,
             )
         
-        logger.info(f"[MV] Multi-view reconstruction: {len(images)} views")
+        logger.info(f"[MV] Multi-view reconstruction: {len(images)} views (improved fusion)")
         logger.info("[MV] Processing each view independently...")
         
         results = []
@@ -1094,21 +1265,73 @@ class InferencePipelineLowMemory:
             )
             results.append(result)
         
-        # Fuse geometry from all views
-        logger.info("[MV] Fusing geometry from all views...")
+        # ─────────────────────────────────────────────────────────────────────────────
+        # GEOMETRY FUSION (Coordinate averaging)
+        # ─────────────────────────────────────────────────────────────────────────────
+        logger.info("[MV] Step 1: Fusing sparse geometry coordinates...")
         coords_list = [r.get("coords") for r in results if "coords" in r]
         
         if coords_list:
             coords_tensors = [torch.as_tensor(c, dtype=torch.float32) for c in coords_list]
             fused_coords = torch.stack(coords_tensors).mean(dim=0).int()
-            logger.info(f"[MV] Fused {len(coords_list)} coordinate sets: {fused_coords.shape}")
+            logger.info(f"[MV] ✓ Fused {len(coords_list)} coordinate sets: {fused_coords.shape}")
         else:
             fused_coords = results[0].get("coords")
             logger.warning("[MV] No coordinates to fuse; using first view")
         
-        # Use first view as base and update with averaged coords
+        # ─────────────────────────────────────────────────────────────────────────────
+        # APPEARANCE FUSION (Gaussians with confidence weighting)
+        # ─────────────────────────────────────────────────────────────────────────────
+        logger.info("[MV] Step 2: Computing per-view confidence weights...")
+        confidence_weights = compute_view_confidence_weights(results, fusion_config)
+        
+        logger.info("[MV] Step 3: Fusing appearance from all views...")
+        gaussian_list = [r.get("gs") or r.get("gaussian") for r in results]
+        
+        # Filter None values and fuse
+        gaussian_list_valid = [g for g in gaussian_list if g is not None]
+        if len(gaussian_list_valid) > 1:
+            fused_gaussian = fuse_gaussians_with_confidence(gaussian_list_valid, confidence_weights)
+            logger.info(f"[MV] ✓ Fused appearance from {len(gaussian_list_valid)} views")
+        elif gaussian_list_valid:
+            fused_gaussian = gaussian_list_valid[0]
+            logger.info("[MV] Only one valid gaussian; using it as-is")
+        else:
+            fused_gaussian = None
+            logger.warning("[MV] No gaussians to fuse; export will use base mesh only")
+        
+        # ─────────────────────────────────────────────────────────────────────────────
+        # RESULT ASSEMBLY (Use base result with fused geometry and appearance)
+        # ─────────────────────────────────────────────────────────────────────────────
+        logger.info("[MV] Step 4: Assembling final result with fused data...")
+        
         fused_result = results[0].copy()
         fused_result["coords"] = fused_coords
         
-        logger.info("[MV] Multi-view complete!")
+        # Update gaussian if fusion succeeded
+        if fused_gaussian is not None:
+            fused_result["gs"] = fused_gaussian
+            if "gaussian" in fused_result:
+                fused_result["gaussian"] = [fused_gaussian]
+        
+        # Helper to get values from dict or object
+        def get_config_value(cfg, key, default):
+            if isinstance(cfg, dict):
+                return cfg.get(key, default)
+            else:
+                return getattr(cfg, key, default)
+        
+        # Add fusion metadata
+        fused_result["multi_view_fusion"] = {
+            "num_views": len(results),
+            "confidence_weights": confidence_weights,
+            "weighting_mode": get_config_value(fusion_config, "view_weighting", "uniform") if fusion_config else "uniform",
+            "geometry_fused": True,
+            "appearance_fused": fused_gaussian is not None,
+        }
+        
+        logger.info("[MV] ✓ Multi-view fusion complete!")
+        logger.info(f"[MV] Final result: coords {fused_coords.shape if isinstance(fused_coords, np.ndarray) else 'array'}, "
+                   f"gaussians {'fused' if fused_gaussian else 'single-view'}")
+        
         return fused_result

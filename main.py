@@ -627,6 +627,7 @@ def main():
             stage2_inference_steps=args.steps,
             use_stage1_distillation=args.ss_distill,
             use_stage2_distillation=args.distill,
+            use_stage2_mps=not args.no_stage2_mps,
             decode_formats=["mesh"] if not args.voxels_only else None,
             fusion_config=fusion_config,
         )

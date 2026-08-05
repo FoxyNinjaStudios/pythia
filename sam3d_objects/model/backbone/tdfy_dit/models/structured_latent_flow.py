@@ -361,26 +361,17 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
             d = condition_kwargs.pop("d", None)
             
         coords = torch.tensor(coords).to(x.device)
-        # DEBUG: Trace what x is at entry
-        print(f"[DEBUG SLAT] forward entry: x type={type(x)}, x shape={x.shape}")
-        print(f"[DEBUG SLAT] x[0] type={type(x[0])}, x[0] shape={x[0].shape}, x[0] is None={x[0] is None}")
-        print(f"[DEBUG SLAT] condition_args len={len(condition_args)}, types={[type(a).__name__ for a in condition_args]}")
         x = sp.SparseTensor(
             feats=x[0],
             coords=coords,
         )
-        # DEBUG: Check feats immediately after creation
-        print(f"[DEBUG SLAT] After SparseTensor creation: x.feats={x.feats}, x.data._features={getattr(x.data, '_features', 'NO_ATTR')}")
         cfg_activate = condition_kwargs.pop("cfg", False)
-        print(f"[DEBUG SLAT] cfg_activate={cfg_activate}, force_zeros_cond={self.force_zeros_cond}")
         if self.force_zeros_cond and cfg_activate:
             # TODO: @weiyaowang, refactor to read directly from embedder
             cond = self.condition_embedder(*condition_args, **condition_kwargs)
             cond = cond * 0
         else:
             cond = self.condition_embedder(*condition_args, **condition_kwargs)
-        print(f"[DEBUG SLAT] cond type={type(cond)}, cond shape={cond.shape if hasattr(cond, 'shape') else 'N/A'}")
-        print(f"[DEBUG SLAT] calling super().forward with x.feats shape={x.feats.shape if x.feats is not None else 'None'}")
         h = super().forward(x, t, cond, d)
         h = h.feats[None]
         return h
