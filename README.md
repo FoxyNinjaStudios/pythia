@@ -292,6 +292,10 @@ and update the 3D preview live:
   (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
   **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
   **Neon**. Live preview in viewport; applies on download when baking is enabled.
+- **AI Mesh Cleanup** (optional, Metal-accelerated). Advanced post-processing using machine learning:
+  - **AI Denoise (PCN).** Point Completion Network denoises point clouds, removing noise artifacts. ~2–5 seconds. Loads denoising model on demand with intelligent memory management.
+  - **AI Complete (Shape VAE).** 3D Variational Autoencoder completes and refines complex/incomplete geometry, useful for highly ambiguous reconstructions. ~5–10 seconds. Runs on Metal (MPS) for GPU acceleration.
+  Both AI stages are optional, run on CPU or Metal (MPS) depending on availability, and unload models after cleanup to free GPU memory for other tasks.
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
   for web/`model-viewer` use.

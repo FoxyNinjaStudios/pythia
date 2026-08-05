@@ -1055,6 +1055,19 @@ if (document.readyState === 'loading') {
           <input type="checkbox" id="opt-bake" onchange="onExportOpt()" checked />
         </div>
         <p class="tool-hint">On: color lives in a texture → shows in macOS Quick&nbsp;Look / Preview (larger file). Off: per-vertex color like the SAM export → much smaller (~5&nbsp;MB), shows in model-viewer / three.js / Blender but gray in Quick&nbsp;Look.</p>
+
+        <!-- AI Mesh Cleanup Controls -->
+        <div class="opt-row" style="border-top: 1px solid #444; margin-top: 12px; padding-top: 12px;">
+          <label for="opt-ai-denoise">AI Denoise</label>
+          <input type="checkbox" id="opt-ai-denoise" onchange="onExportOpt()" />
+        </div>
+        <p class="tool-hint">Use Point Completion Network (PCN) to denoise point clouds. Removes noise artifacts; ~2-5 seconds overhead.</p>
+        <div class="opt-row">
+          <label for="opt-ai-complete">AI Complete</label>
+          <input type="checkbox" id="opt-ai-complete" onchange="onExportOpt()" />
+        </div>
+        <p class="tool-hint">Use 3D Shape VAE to complete/refine geometry. Useful for complex or incomplete reconstructions; ~5-10 seconds overhead.</p>
+
         <div class="opt-row">
           <label for="opt-compress">Meshopt compress</label>
           <input type="checkbox" id="opt-compress" onchange="onExportOpt()" />
@@ -2016,7 +2029,9 @@ async function startReconstructSingleView() {
   await acquireScreenWakeLock();
 
   const body = { image_id: imageId, mask_b64: lastMaskB64,
-                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2 };
+                 stage1_steps: qualitySteps.s1, stage2_steps: qualitySteps.s2,
+                 ai_denoise: $("opt-ai-denoise") ? $("opt-ai-denoise").checked : false,
+                 ai_complete: $("opt-ai-complete") ? $("opt-ai-complete").checked : false };
   const res  = await fetch("/reconstruct", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -2044,6 +2059,8 @@ async function startReconstructMultiView() {
     stage2_steps: qualitySteps.s2,
     fusion_mode: document.getElementById("fusion-mode").value,
     view_weighting: document.getElementById("view-weighting").value,
+    ai_denoise: $("opt-ai-denoise") ? $("opt-ai-denoise").checked : false,
+    ai_complete: $("opt-ai-complete") ? $("opt-ai-complete").checked : false,
   };
   
   try {

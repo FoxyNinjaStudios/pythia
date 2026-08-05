@@ -83,6 +83,12 @@ from pydantic import BaseModel
 # hub cache there too, *before* any huggingface_hub / transformers import.
 import paths
 paths.configure_hf_cache()
+
+# ── AI mesh cleanup manager (must be after paths configuration) ────────────────
+try:
+    import ai_mesh_cleanup_manager
+except ImportError:
+    ai_mesh_cleanup_manager = None
 paths.ensure_dirs()
 
 UPLOAD_DIR = paths.UPLOAD_DIR
@@ -318,6 +324,9 @@ class ReconstructRequest(BaseModel):
     # Post-process mesh cleanup
     simplify_ratio: Optional[float] = 0.9  # Decimation: 0.0=none, 0.95=heavy; default 0.9
     smooth_iterations: int = 0  # Taubin smoothing: 0=off, max 500 (default: 10 passes)
+    # AI-based mesh cleanup (optional, runs on Metal/GPU when available)
+    ai_denoise: bool = False  # Use PCN for point cloud denoising
+    ai_complete: bool = False  # Use VAE for shape completion/refinement
 
 
 class DepthRequest(BaseModel):
@@ -345,6 +354,9 @@ class ReconstructMultiViewRequest(BaseModel):
     # Post-process mesh cleanup
     simplify_ratio: Optional[float] = 0.9  # Decimation: 0.0=none, 0.95=heavy; default 0.9
     smooth_iterations: int = 0  # Taubin smoothing: 0=off, max 500 (default: 10 passes)
+    # AI-based mesh cleanup (optional, runs on Metal/GPU when available)
+    ai_denoise: bool = False  # Use PCN for point cloud denoising
+    ai_complete: bool = False  # Use VAE for shape completion/refinement
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,6 +371,12 @@ def _shutdown_cleanup() -> None:
     try:
         from sam_wrapper import unload_segmentation_models
         unload_segmentation_models()
+    except Exception:
+        pass
+    try:
+        # Clean up AI mesh cleanup models
+        if ai_mesh_cleanup_manager:
+            ai_mesh_cleanup_manager.cleanup_ai_on_shutdown()
     except Exception:
         pass
     try:
@@ -465,6 +483,9 @@ _MODEL_META = {
     # reconstruction generators. Not an HF repo: it is fetched from torch.hub
     # (facebookresearch/dinov2 code + the reg4 pretrained weights).
     "dino":  {"repo": None,                      "gated": False, "dl_bytes": 1_217_607_321},
+    # AI mesh cleanup models (builtin, no download required)
+    "pcn":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
+    "vae":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
 }
 
 
@@ -860,6 +881,14 @@ def _models_status() -> list:
     dino_down, dino_size = _dino_cache()
     dino_loaded = sam3d_running
 
+    # 5) AI mesh cleanup models (builtin, no download required)
+    pcn_loaded = False
+    vae_loaded = False
+    if ai_mesh_cleanup_manager:
+        ai_status = ai_mesh_cleanup_manager.get_ai_model_status()
+        pcn_loaded = ai_status.get("pcn-denoise", {}).get("loaded", False)
+        vae_loaded = ai_status.get("shape-vae", {}).get("loaded", False)
+
     def entry(mid, name, role, downloaded, loaded, size):
         status = "loaded" if (downloaded and loaded) else (
             "downloaded" if downloaded else "not_downloaded"
@@ -889,6 +918,10 @@ def _models_status() -> list:
               moge_down, moge_loaded, moge_size),
         entry("dino", "DINOv2 ViT-L/14", "Image feature backbone",
               dino_down, dino_loaded, dino_size),
+        entry("pcn", "Point Completion Network", "AI mesh denoising",
+              True, pcn_loaded, 50_000_000),
+        entry("vae", "3D Shape VAE", "AI mesh completion",
+              True, vae_loaded, 80_000_000),
     ]
 
 
@@ -965,6 +998,51 @@ async def purge_model(model_id: str):
     return {"ok": True, "freed": _human_size(freed)}
 
 
+@app.post("/ai/model/{model_id}/load")
+async def load_ai_model(model_id: str):
+    """Load an AI mesh cleanup model (PCN or VAE) into memory."""
+    if not ai_mesh_cleanup_manager:
+        raise HTTPException(503, "AI mesh cleanup not available.")
+    
+    valid_models = {"pcn-denoise", "shape-vae"}
+    if model_id not in valid_models:
+        raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
+    
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, ai_mesh_cleanup_manager.load_ai_model, model_id)
+    
+    if not success:
+        raise HTTPException(500, f"Failed to load {model_id}")
+    
+    return {"ok": True, "model": model_id, "loaded": True}
+
+
+@app.post("/ai/model/{model_id}/unload")
+async def unload_ai_model(model_id: str):
+    """Unload an AI mesh cleanup model to free memory."""
+    if not ai_mesh_cleanup_manager:
+        raise HTTPException(503, "AI mesh cleanup not available.")
+    
+    valid_models = {"pcn-denoise", "shape-vae"}
+    if model_id not in valid_models:
+        raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
+    
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, ai_mesh_cleanup_manager.unload_ai_model, model_id)
+    
+    return {"ok": True, "model": model_id, "loaded": False}
+
+
+@app.post("/ai/models/unload-all")
+async def unload_all_ai_models():
+    """Unload all AI mesh cleanup models to free GPU/Metal memory."""
+    if not ai_mesh_cleanup_manager:
+        raise HTTPException(503, "AI mesh cleanup not available.")
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, ai_mesh_cleanup_manager.unload_all_ai_models)
+    
+    return {"ok": True, "message": "All AI models unloaded"}
 
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
@@ -1083,6 +1161,8 @@ async def reconstruct(req: ReconstructRequest):
     # Post-process mesh cleanup parameters
     simplify_ratio = req.simplify_ratio
     smooth_iterations = max(0, min(int(req.smooth_iterations), 500))
+    ai_denoise = getattr(req, 'ai_denoise', False)
+    ai_complete = getattr(req, 'ai_complete', False)
 
     asyncio.get_event_loop().run_in_executor(
         None,
@@ -1097,6 +1177,8 @@ async def reconstruct(req: ReconstructRequest):
         use_stage2_mps,
         simplify_ratio,
         smooth_iterations,
+        ai_denoise,
+        ai_complete,
     )
 
     return {"job_id": job_id}
@@ -1145,6 +1227,8 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
     # Post-process mesh cleanup parameters
     simplify_ratio = req.simplify_ratio
     smooth_iterations = max(0, min(int(req.smooth_iterations), 500))
+    ai_denoise = getattr(req, 'ai_denoise', False)
+    ai_complete = getattr(req, 'ai_complete', False)
     
     # Use server default if request doesn't specify stage2_mps
     use_stage2_mps = req.stage2_mps or _default_stage2_mps
@@ -1166,6 +1250,8 @@ async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
         num_views_select,
         simplify_ratio,
         smooth_iterations,
+        ai_denoise,
+        ai_complete,
     )
     
     return {"job_id": job_id}
@@ -1669,6 +1755,8 @@ def _run_reconstruction_sync(
     stage2_mps: bool = False,
     simplify_ratio: Optional[float] = None,
     smooth_iterations: int = 0,
+    ai_denoise: bool = False,
+    ai_complete: bool = False,
 ):
     job = jobs[job_id]
     # Attach log handler so pipeline stages drive the progress bar
@@ -1767,6 +1855,30 @@ def _run_reconstruction_sync(
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
 
+        # Post-process: AI-based cleanup (point cloud denoising + shape completion)
+        if ai_denoise or ai_complete:
+            try:
+                if ai_mesh_cleanup_manager:
+                    logger.info(f"[JOB {job_id}] Applying AI mesh cleanup (denoise={ai_denoise}, complete={ai_complete})…")
+                    vertices = result_mesh.vertices.copy()
+                    faces = result_mesh.faces.copy()
+                    
+                    vertices, faces = ai_mesh_cleanup_manager.apply_ai_cleanup(
+                        vertices, faces,
+                        enable_denoising=ai_denoise,
+                        enable_completion=ai_complete,
+                        verbose=True,
+                    )
+                    
+                    result_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+                    if result_mesh.vertex_colors is not None and len(result_mesh.vertex_colors) == len(vertices):
+                        result_mesh.vertex_colors = result_mesh.vertex_colors[:len(vertices)]
+                    logger.info(f"[JOB {job_id}] AI cleanup complete")
+                else:
+                    logger.warning(f"[JOB {job_id}] AI mesh cleanup not available")
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] AI mesh cleanup skipped: {exc}")
+
         if job.cancelled:
             raise _JobCancelled()
 
@@ -1817,6 +1929,8 @@ def _run_multi_view_reconstruction_sync(
     num_views_select: Optional[int] = None,
     simplify_ratio: Optional[float] = None,
     smooth_iterations: int = 0,
+    ai_denoise: bool = False,
+    ai_complete: bool = False,
 ):
     """Multi-view reconstruction pipeline – runs in a thread, updates job SSE queue."""
     job = jobs[job_id]
@@ -1915,6 +2029,30 @@ def _run_multi_view_reconstruction_sync(
             logger.info(f"[JOB {job_id}] Mesh smoothed")
         except Exception as exc:
             logger.warning(f"[JOB {job_id}] mesh smoothing skipped: {exc}")
+
+        # Post-process: AI-based cleanup (point cloud denoising + shape completion)
+        if ai_denoise or ai_complete:
+            try:
+                if ai_mesh_cleanup_manager:
+                    logger.info(f"[JOB {job_id}] Applying AI mesh cleanup (denoise={ai_denoise}, complete={ai_complete})…")
+                    vertices = result_mesh.vertices.copy()
+                    faces = result_mesh.faces.copy()
+                    
+                    vertices, faces = ai_mesh_cleanup_manager.apply_ai_cleanup(
+                        vertices, faces,
+                        enable_denoising=ai_denoise,
+                        enable_completion=ai_complete,
+                        verbose=True,
+                    )
+                    
+                    result_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+                    if result_mesh.vertex_colors is not None and len(result_mesh.vertex_colors) == len(vertices):
+                        result_mesh.vertex_colors = result_mesh.vertex_colors[:len(vertices)]
+                    logger.info(f"[JOB {job_id}] AI cleanup complete")
+                else:
+                    logger.warning(f"[JOB {job_id}] AI mesh cleanup not available")
+            except Exception as exc:
+                logger.warning(f"[JOB {job_id}] AI mesh cleanup skipped: {exc}")
 
         if job.cancelled:
             raise _JobCancelled()
