@@ -287,6 +287,11 @@ and update the 3D preview live:
   colored in `model-viewer` / three.js / Blender.
 - **Texture size & format.** 512–4096 px atlas, **JPEG** (smaller) or **PNG**
   (lossless).
+- **Texture themes** (optional, web UI only). Apply artistic filters to baked textures:
+  **None** (original), **Minecraft** (blocky), **Cartoony** (cell-shaded), **Sketch**
+  (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
+  **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
+  **Neon**. Live preview in viewport; applies on download when baking is enabled.
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
   for web/`model-viewer` use.
@@ -465,6 +470,25 @@ Look, and USDZ conversion ignore per-vertex color** and show the model grey. The
   per-vertex-color GLB (smallest file; colored in `model-viewer` / three.js /
   Blender). Baking runs **client-side** at download time.
 - **Texture size / format.** 512–4096 px atlas, JPEG (smaller) or PNG (lossless).
+- **Texture themes.** Apply artistic filters to the baked texture atlas (web UI only):
+  - **None / Original**: Baked texture without filters (default)
+  - **Minecraft**: Blocky posterization (64-level quantization) for game-style models
+  - **Cartoony**: Cell-shaded effect (32-level posterization) for cartoon aesthetics
+  - **Sketch**: Inverted grayscale pencil drawing effect
+  - **Low-Poly**: 6× downsampling + upsampling for stylized low-poly look
+  - **Watercolor**: Desaturated with brightening for painted wash effect
+  - **Retro**: 64×64 extreme downsampling + posterization for 8-bit nostalgia
+  - **Oil Painting**: Blurred then posterized for artistic effect
+  - **Comic**: Bold 48-level posterization for comic-book style
+  - **Pixelated**: 16-pixel grid pixelation effect
+  - **Posterized**: Reduced to 16 colors (4 levels per channel)
+  - **Grayscale**: Black and white desaturation
+  - **Sepia**: Vintage warm-tone coloring
+  - **High Contrast**: 1.8× contrast amplification for graphic impact
+  - **Neon**: 1.3× saturation boost for electric, vibrant look
+  
+  Themes are previewed live in the viewport when baking is enabled; the same theme
+  is applied on download. When baking is disabled, themes are ignored.
 - **Simplify mesh.** meshoptimizer decimation (0–90%) applied before export.
 - **Meshopt compress** (opt-in, GLB only). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via glTF-Transform for much smaller web-ready GLBs;
