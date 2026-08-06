@@ -39,6 +39,7 @@ dependencies = [
     "loguru>=0.7.0",
     
     # Utils
+    "gdown>=5.0.0",
     "tqdm>=4.66.0",
     "easydict>=1.10.0",
     "optree>=0.10.0",

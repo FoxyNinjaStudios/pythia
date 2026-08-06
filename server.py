@@ -881,12 +881,17 @@ def _models_status() -> list:
     dino_down, dino_size = _dino_cache()
     dino_loaded = sam3d_running
 
-    # 5) AI mesh cleanup models (builtin, no download required)
+    # 5) AI mesh cleanup models (Point Completion Network, SnowflakeNet, Shape VAE)
     pcn_loaded = False
+    snowflakenet_loaded = False
+    snowflakenet_down = False
     vae_loaded = False
     if ai_mesh_cleanup_manager:
         ai_status = ai_mesh_cleanup_manager.get_ai_model_status()
         pcn_loaded = ai_status.get("pcn-denoise", {}).get("loaded", False)
+        snowflakenet_status = ai_status.get("snowflakenet", {}).get("status", "missing")
+        snowflakenet_loaded = ai_status.get("snowflakenet", {}).get("loaded", False)
+        snowflakenet_down = snowflakenet_status in ("downloaded", "loaded")
         vae_loaded = ai_status.get("shape-vae", {}).get("loaded", False)
 
     def entry(mid, name, role, downloaded, loaded, size):
@@ -920,7 +925,9 @@ def _models_status() -> list:
               dino_down, dino_loaded, dino_size),
         entry("pcn", "Point Completion Network", "AI mesh denoising",
               True, pcn_loaded, 50_000_000),
-        entry("vae", "3D Shape VAE", "AI mesh completion",
+        entry("snowflakenet", "SnowflakeNet (SPD)", "AI mesh completion",
+              snowflakenet_down, snowflakenet_loaded, 350_000_000),
+        entry("vae", "3D Shape VAE", "AI mesh completion (fallback)",
               True, vae_loaded, 80_000_000),
     ]
 

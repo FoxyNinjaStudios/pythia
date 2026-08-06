@@ -1,7 +1,7 @@
 """
 Server-side AI mesh cleanup model management and inference.
-Handles loading, unloading, and running PCN denoising + Shape VAE completion on Metal/GPU.
-Supports downloading pretrained weights from Hugging Face and memory lifecycle management.
+Handles loading, unloading, and running PCN denoising + Shape VAE/SnowflakeNet completion on Metal/GPU.
+Supports downloading pretrained weights from Hugging Face and Google Drive.
 """
 
 import os
@@ -22,6 +22,16 @@ AI_CLEANUP_MODELS = {
         "source": "huggingface",
         "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/pcn_model.pt",
         "license": "MIT (wentaoyuan/pcn PyTorch port)",
+    },
+    "snowflakenet": {
+        "name": "SnowflakeNet (Snowflake Point Deconvolution)",
+        "description": "Advanced point cloud completion using Snowflake Point Deconvolution with Skip-Transformer. Fills holes and refines geometry with learned patterns (ICCV 2021, TPAMI 2023).",
+        "size_mb": 350,
+        "source": "gdrive",
+        "gdrive_folder_id": "1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR",
+        "gdrive_model_file": "spd_scannet_mix.ckpt",
+        "license": "MIT (AllenXiangX/SnowflakeNet)",
+        "paper": "https://arxiv.org/abs/2202.09367",
     },
     "shape-vae": {
         "name": "3D Shape VAE",
@@ -82,12 +92,24 @@ def download_ai_model(model_id: str) -> bool:
     try:
         import mesh_cleanup_ai
         
-        # Map to mesh_cleanup_ai model name
-        mesh_model_name = "pcn" if model_id == "pcn-denoise" else "shape_vae"
-        url = AI_CLEANUP_MODELS[model_id]["url"]
+        meta = AI_CLEANUP_MODELS[model_id]
         
-        logger.info(f"Downloading {model_id} weights…")
-        weight_path = mesh_cleanup_ai._download_weight(mesh_model_name, url)
+        if meta["source"] == "gdrive":
+            # Download from Google Drive using gdown
+            mesh_model_name = "snowflakenet"
+            logger.info(f"Downloading {model_id} weights from Google Drive…")
+            weight_path = mesh_cleanup_ai._download_gdrive_weight(
+                mesh_model_name,
+                meta["gdrive_folder_id"],
+                meta["gdrive_model_file"]
+            )
+        else:
+            # Download from Hugging Face
+            mesh_model_name = "pcn" if model_id == "pcn-denoise" else "shape_vae"
+            url = meta["url"]
+            logger.info(f"Downloading {model_id} weights from {meta['source']}…")
+            weight_path = mesh_cleanup_ai._download_weight(mesh_model_name, url)
+        
         return weight_path is not None and weight_path.exists()
     
     except Exception as e:
@@ -112,6 +134,12 @@ def load_ai_model(model_id: str) -> bool:
             if model_id == "pcn-denoise":
                 logger.info("Loading PCN denoising model…")
                 model = mesh_cleanup_ai.load_pcn_model()
+                _ai_models_loaded[model_id] = model
+                return model is not None
+            
+            elif model_id == "snowflakenet":
+                logger.info("Loading SnowflakeNet completion model…")
+                model = mesh_cleanup_ai.load_shape_vae_model()
                 _ai_models_loaded[model_id] = model
                 return model is not None
             

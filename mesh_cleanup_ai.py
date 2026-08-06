@@ -1,7 +1,7 @@
 """
 AI-based mesh cleanup using point cloud denoising and shape completion VAE.
 Runs on Metal (MPS) where available, with intelligent memory management.
-Supports downloading pretrained weights from Hugging Face.
+Supports downloading pretrained weights from Hugging Face and Google Drive.
 """
 
 import os
@@ -9,6 +9,7 @@ import hashlib
 from pathlib import Path
 from urllib.request import urlopen
 from typing import Optional, Tuple
+import subprocess
 
 import numpy as np
 import torch
@@ -28,7 +29,8 @@ WEIGHT_CONFIG = {
         "paper": "https://arxiv.org/abs/2312.10017",
     },
     "snowflakenet": {
-        "gdrive_url": "https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR",
+        "gdrive_folder_id": "1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR",
+        "gdrive_model_file": "spd_scannet_mix.ckpt",
         "pretrained": True,
         "source": "MIT (AllenXiangX/SnowflakeNet)",
         "paper": "https://arxiv.org/abs/2202.09367",
@@ -102,6 +104,48 @@ def _download_weight(model_name: str, url: str) -> Optional[Path]:
     
     except Exception as e:
         logger.error(f"Failed to download {model_name} weights: {e}")
+        if filepath.exists():
+            filepath.unlink()
+        return None
+
+
+def _download_gdrive_weight(model_name: str, folder_id: str, filename: str) -> Optional[Path]:
+    """Download weight from Google Drive folder if not cached. Returns path or None."""
+    filepath = CHECKPOINTS_DIR / f"{model_name}_model.pt"
+    
+    # Already downloaded
+    if filepath.exists():
+        logger.info(f"Using cached {model_name} weights at {filepath}")
+        return filepath
+    
+    logger.info(f"Downloading {model_name} weights from Google Drive ({filename})…")
+    try:
+        import gdown
+        
+        # Download from Google Drive folder using folder ID and filename
+        # Construct the URL for direct file access in the folder
+        file_url = f"https://drive.google.com/uc?id={folder_id.replace('folders/', '')}"
+        
+        # Use gdown to download from the folder
+        output = str(filepath)
+        gdown.download_folder(folder_id, output=str(CHECKPOINTS_DIR), quiet=False)
+        
+        # The file should now be in the checkpoints directory
+        downloaded_file = CHECKPOINTS_DIR / filename
+        if downloaded_file.exists():
+            # Rename to standard model name
+            downloaded_file.rename(filepath)
+            logger.info(f"Successfully downloaded {model_name} to {filepath}")
+            return filepath
+        else:
+            logger.error(f"Downloaded folder but could not find {filename}")
+            return None
+        
+    except ImportError:
+        logger.error("gdown not installed; cannot download from Google Drive")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to download {model_name} from Google Drive: {e}")
         if filepath.exists():
             filepath.unlink()
         return None
@@ -206,7 +250,7 @@ def load_pcn_model():
 
 
 def load_shape_vae_model():
-    """Load shape completion model (POC-SLT or fallback simple VAE)."""
+    """Load shape completion model (SnowflakeNet or fallback simple VAE)."""
     global _shape_vae_model
     if _shape_vae_model is not None:
         return _shape_vae_model
@@ -216,14 +260,26 @@ def load_shape_vae_model():
     # Try SnowflakeNet (Snowflake Point Deconvolution) first
     try:
         logger.info("Attempting to load SnowflakeNet for shape completion…")
-        try:
-            # SnowflakeNet requires downloading from Google Drive (manual or via gdown)
-            # For now, gracefully fall back if weights aren't available
-            config = WEIGHT_CONFIG["snowflakenet"]
-            logger.info("SnowflakeNet weights available at: " + config["gdrive_url"])
-            logger.info("Consider downloading from Google Drive and placing in checkpoints/ai_cleanup/")
-        except ImportError:
-            logger.info("SnowflakeNet dependencies not installed, using fallback simple model…")
+        config = WEIGHT_CONFIG["snowflakenet"]
+        
+        # Try to download/load SnowflakeNet weights from Google Drive
+        weight_path = _download_gdrive_weight(
+            "snowflakenet",
+            config["gdrive_folder_id"],
+            config["gdrive_model_file"]
+        )
+        
+        if weight_path and weight_path.exists():
+            try:
+                # Try to load as a pretrained model checkpoint
+                # SnowflakeNet expects a specific architecture, so this is best-effort
+                checkpoint = torch.load(weight_path, map_location=device)
+                logger.info(f"✓ SnowflakeNet weights loaded from {weight_path} (modern, MIT licensed)")
+                # Return checkpoint info for custom SnowflakeNet loading in inference
+                _shape_vae_model = checkpoint
+                return _shape_vae_model
+            except Exception as e:
+                logger.warning(f"Could not load SnowflakeNet checkpoint: {e}, using fallback VAE…")
     except Exception as e:
         logger.info(f"SnowflakeNet not available ({e}), falling back to simple model…")
     
@@ -253,7 +309,7 @@ def load_shape_vae_model():
             logger.warning("Fallback VAE weights not available, using random initialization")
         
         _shape_vae_model = model
-        logger.info("✓ Simple voxel VAE ready (using random weights; consider upgrading to POC-SLT)")
+        logger.info("✓ Simple voxel VAE ready (using random weights; consider upgrading to SnowflakeNet)")
         
     except Exception as e:
         logger.error(f"Failed to load Shape VAE model: {e}")
