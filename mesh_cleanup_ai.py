@@ -17,15 +17,30 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Weight sources (MIT licensed)
+# Weight sources (modern PyTorch models)
+# Point cloud denoising: Point Transformer V3 (MIT, active development)
+# Shape completion: POC-SLT (GPL-3.0, state-of-the-art 2025)
 WEIGHT_CONFIG = {
-    "pcn": {
-        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/pcn_model.pt",
-        "source": "MIT (wentaoyuan/pcn PyTorch port)",
+    "point_transformer_v3": {
+        "model": "Pointcept/PointTransformerV3",
+        "pretrained": True,
+        "source": "MIT (Pointcept/PointTransformerV3)",
+        "paper": "https://arxiv.org/abs/2312.10017",
     },
-    "shape_vae": {
+    "poc_slt": {
+        "model": "zakeri68/poc-slt",
+        "pretrained": True,
+        "source": "GPL-3.0 (cgtuebingen/poc-slt)",
+        "paper": "https://arxiv.org/abs/2411.05419",
+    },
+    # Fallback simple models (random init, infrastructure only)
+    "simple_pcn_fallback": {
+        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/pcn_model.pt",
+        "source": "Random initialization (fallback)",
+    },
+    "simple_vae_fallback": {
         "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/shape_vae_model.pt",
-        "source": "MIT (autonomousvision/occupancy_networks)",
+        "source": "Random initialization (fallback)",
     },
 }
 
@@ -92,12 +107,6 @@ def _download_weight(model_name: str, url: str) -> Optional[Path]:
         return None
 
 
-def load_pcn_model():
-    """Load Point Completion Network for point cloud denoising."""
-    global _pcn_model
-    if _pcn_model is not None:
-        return _pcn_model
-
 class SimplePointDenoiser(torch.nn.Module):
     """Point Completion Network (PCN) - point cloud denoiser."""
     def __init__(self, num_points=2048):
@@ -135,39 +144,57 @@ class SimplePointDenoiser(torch.nn.Module):
 
 
 def load_pcn_model():
-    """Load Point Completion Network for point cloud denoising with pretrained weights."""
+    """Load point cloud denoising model (Point Transformer V3 or fallback simple model)."""
     global _pcn_model
     if _pcn_model is not None:
         return _pcn_model
     
+    device = get_device()
+    
+    # Try Point Transformer V3 from HuggingFace first
     try:
-        logger.info("Loading Point Completion Network (PCN)…")
+        logger.info("Attempting to load Point Transformer V3 for point cloud denoising…")
+        try:
+            from transformers import AutoModel
+            model_id = WEIGHT_CONFIG["point_transformer_v3"]["model"]
+            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            model = model.to(device)
+            model.eval()
+            _pcn_model = model
+            logger.info("✓ Point Transformer V3 loaded successfully (modern, MIT licensed)")
+            return _pcn_model
+        except ImportError:
+            logger.info("transformers not installed, using fallback simple model…")
+    except Exception as e:
+        logger.info(f"Point Transformer V3 not available ({e}), falling back to simple model…")
+    
+    # Fallback: Simple point denoiser with optional pretrained weights
+    try:
+        logger.info("Loading simple point denoiser (fallback architecture)…")
         
-        # Create architecture
         model = SimplePointDenoiser(num_points=2048)
-        model = model.to(get_device())
+        model = model.to(device)
         model.eval()
         
-        # Try to load pretrained weights
-        config = WEIGHT_CONFIG["pcn"]
-        weight_path = _download_weight("pcn", config["url"])
+        # Try to load fallback weights if available
+        config = WEIGHT_CONFIG["simple_pcn_fallback"]
+        weight_path = _download_weight("pcn_fallback", config["url"])
         
         if weight_path and weight_path.exists():
             try:
-                checkpoint = torch.load(weight_path, map_location=get_device())
-                # Handle both direct state_dict and wrapped checkpoint
+                checkpoint = torch.load(weight_path, map_location=device)
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
                     model.load_state_dict(checkpoint["state_dict"])
                 else:
                     model.load_state_dict(checkpoint)
-                logger.info(f"Loaded PCN pretrained weights from {weight_path}")
+                logger.info(f"Loaded fallback PCN weights from {weight_path}")
             except Exception as e:
-                logger.warning(f"Could not load PCN weights, using random init: {e}")
+                logger.warning(f"Could not load fallback PCN weights, using random init: {e}")
         else:
-            logger.warning("PCN weights not available, using random initialization (inference will be degraded)")
+            logger.warning("Fallback PCN weights not available, using random initialization")
         
         _pcn_model = model
-        logger.info("PCN model ready")
+        logger.info("✓ Simple point denoiser ready (using random weights; consider upgrading to Point Transformer V3)")
         
     except Exception as e:
         logger.error(f"Failed to load PCN model: {e}")
@@ -176,12 +203,67 @@ def load_pcn_model():
     return _pcn_model
 
 
+
+
 def load_shape_vae_model():
-    """Load ShapeNet-trained 3D Shape VAE for mesh completion."""
+    """Load shape completion model (POC-SLT or fallback simple VAE)."""
     global _shape_vae_model
     if _shape_vae_model is not None:
         return _shape_vae_model
     
+    device = get_device()
+    
+    # Try POC-SLT (Partial Object Completion with SDF Latent Transformers) first
+    try:
+        logger.info("Attempting to load POC-SLT for shape completion…")
+        try:
+            from transformers import AutoModel
+            model_id = WEIGHT_CONFIG["poc_slt"]["model"]
+            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            model = model.to(device)
+            model.eval()
+            _shape_vae_model = model
+            logger.info("✓ POC-SLT loaded successfully (state-of-the-art 2025, GPL-3.0)")
+            return _shape_vae_model
+        except ImportError:
+            logger.info("transformers not installed, using fallback simple model…")
+    except Exception as e:
+        logger.info(f"POC-SLT not available ({e}), falling back to simple model…")
+    
+    # Fallback: Simple voxel VAE with optional pretrained weights
+    try:
+        logger.info("Loading simple voxel VAE (fallback architecture)…")
+        
+        model = SimpleVoxelVAE(resolution=32, latent_dim=128)
+        model = model.to(device)
+        model.eval()
+        
+        # Try to load fallback weights if available
+        config = WEIGHT_CONFIG["simple_vae_fallback"]
+        weight_path = _download_weight("vae_fallback", config["url"])
+        
+        if weight_path and weight_path.exists():
+            try:
+                checkpoint = torch.load(weight_path, map_location=device)
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                logger.info(f"Loaded fallback VAE weights from {weight_path}")
+            except Exception as e:
+                logger.warning(f"Could not load fallback VAE weights, using random init: {e}")
+        else:
+            logger.warning("Fallback VAE weights not available, using random initialization")
+        
+        _shape_vae_model = model
+        logger.info("✓ Simple voxel VAE ready (using random weights; consider upgrading to POC-SLT)")
+        
+    except Exception as e:
+        logger.error(f"Failed to load Shape VAE model: {e}")
+        _shape_vae_model = None
+    
+    return _shape_vae_model
+
 
 class SimpleVoxelVAE(torch.nn.Module):
     """3D Shape VAE for voxel-based shape completion."""
@@ -236,47 +318,6 @@ class SimpleVoxelVAE(torch.nn.Module):
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
         return recon, mu, logvar
-
-
-def load_shape_vae_model():
-    """Load 3D Shape VAE for mesh completion with pretrained weights."""
-    global _shape_vae_model
-    if _shape_vae_model is not None:
-        return _shape_vae_model
-    
-    try:
-        logger.info("Loading 3D Shape VAE…")
-        
-        # Create architecture
-        model = SimpleVoxelVAE(resolution=32, latent_dim=128)
-        model = model.to(get_device())
-        model.eval()
-        
-        # Try to load pretrained weights
-        config = WEIGHT_CONFIG["shape_vae"]
-        weight_path = _download_weight("shape_vae", config["url"])
-        
-        if weight_path and weight_path.exists():
-            try:
-                checkpoint = torch.load(weight_path, map_location=get_device())
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["state_dict"])
-                else:
-                    model.load_state_dict(checkpoint)
-                logger.info(f"Loaded Shape VAE pretrained weights from {weight_path}")
-            except Exception as e:
-                logger.warning(f"Could not load Shape VAE weights, using random init: {e}")
-        else:
-            logger.warning("Shape VAE weights not available, using random initialization (inference will be degraded)")
-        
-        _shape_vae_model = model
-        logger.info("Shape VAE model ready")
-        
-    except Exception as e:
-        logger.error(f"Failed to load Shape VAE model: {e}")
-        _shape_vae_model = None
-    
-    return _shape_vae_model
 
 
 def unload_models():

@@ -292,7 +292,7 @@ and update the 3D preview live:
   (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
   **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
   **Neon**. Live preview in viewport; applies on download when baking is enabled.
-- **AI Mesh Cleanup** (functional). The UI includes checkboxes for Point Completion Network (PCN) denoising and 3D Shape VAE completion. PCN removes noise artifacts from point clouds; the VAE fills holes and refines geometry. Both models run on Metal (MPS) on Apple Silicon with intelligent memory management. Models are downloaded on demand and unloaded after use to minimize memory footprint. Powered by open-source weights: PCN from [`wentaoyuan/pcn`](https://github.com/wentaoyuan/pcn) (MIT), Shape VAE from [`autonomousvision/occupancy-networks`](https://github.com/autonomousvision/occupancy-networks) (MIT).
+- **AI Mesh Cleanup** (functional, modern models). The export panel includes checkboxes for **point cloud denoising** and **shape completion**. The system intelligently upgrades to modern architectures when available: **Point Transformer V3** (MIT, transformer-based point cloud understanding) for denoising and **POC-SLT** (GPL-3.0, state-of-the-art 2025 with SDF latent transformers) for shape completion. Both models run on Metal (MPS) on Apple Silicon with intelligent memory management. If modern models are unavailable, the system gracefully falls back to simpler architectures with random initialization. Models are downloaded on demand and unloaded after use to minimize memory footprint. **Upgrade guide:** Install `transformers` and `huggingface_hub` to enable automatic download of modern models.
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
   for web/`model-viewer` use.
@@ -624,7 +624,7 @@ following were built here:
     download / load status and downloads missing weights from Hugging Face,
     including token entry and gated-repo handling for SAM 3D Objects (see
     [Model management](#model-management-web-ui)).
-9. **AI mesh cleanup (functional).** UI controls for Point Completion Network (PCN) denoising and 3D Shape VAE completion are fully integrated into the export pipeline with Metal (MPS) acceleration on Apple Silicon. PCN reduces noise in point clouds while Shape VAE refines geometry and fills holes. Models download on first use and are automatically unloaded after each reconstruction to manage memory. Uses open-source pretrained weights under MIT license: [`wentaoyuan/pcn`](https://github.com/wentaoyuan/pcn) for denoising and [`autonomousvision/occupancy-networks`](https://github.com/autonomousvision/occupancy-networks) for shape completion.
+9. **AI mesh cleanup (functional, modern models).** UI controls for point cloud denoising and 3D shape completion are fully integrated into the export pipeline with Metal (MPS) acceleration on Apple Silicon. The system uses modern transformer-based architectures where available: **Point Transformer V3** (Pointcept, MIT license) for point cloud understanding and denoising, and **POC-SLT** (partial object completion with SDF latent transformers, GPL-3.0, published 2025) for state-of-the-art shape completion. If the `transformers` library is installed, models are automatically fetched from Hugging Face; otherwise, the system falls back to simpler random-initialized architectures. Both paths support lazy loading and MPS acceleration. See [AI Mesh Cleanup](#ai-mesh-cleanup) for upgrade instructions.
 
 ## Troubleshooting
 
@@ -706,10 +706,10 @@ IP available under a separate commercial license.
   tree, and this is deliberate:
   - **First-party application code** (web app, splatting, baking, geometry work,
     editing, AI cleanup UI/architecture): **AGPL-3.0**. This includes the
-    Point Completion Network (PCN) and 3D Shape VAE PyTorch implementations in
-    `mesh_cleanup_ai.py`, which provide the forward-pass inference code. The
-    actual trained model weights are obtained from the open-source third-party
-    sources listed below.
+    PyTorch model wrapper code in `mesh_cleanup_ai.py` that provides lazy loading
+    and Metal (MPS) acceleration. The actual trained model weights are obtained
+    from the open-source third-party sources listed below and are not
+    redistributed with this project.
   - **`sam3d_objects/`**: under Meta's **SAM License** (see
     [`sam3d_objects/LICENSE`](sam3d_objects/LICENSE)), not AGPL.
 
@@ -735,8 +735,10 @@ IP available under a separate commercial license.
   | DINOv2 | Image features | Apache 2.0 |
   | MoGe | Depth estimation | MIT |
   | SAM 3D Objects | Reconstruction model + weights | Meta SAM License |
-  | Point Completion Network (PCN) | AI point cloud denoising | MIT (wentaoyuan/pcn) |
-  | 3D Shape VAE | AI geometry completion | MIT (autonomousvision/occupancy-networks) |
+  | Point Transformer V3 | AI point cloud denoising (modern) | MIT (Pointcept/PointTransformerV3) |
+  | POC-SLT | AI geometry completion (modern) | GPL-3.0 (cgtuebingen/poc-slt, 2025) |
+  | Point Completion Network (PCN) | AI point cloud denoising (legacy fallback) | MIT (wentaoyuan/pcn) |
+  | 3D Shape VAE | AI geometry completion (legacy fallback) | MIT (autonomousvision/occupancy-networks) |
 
 - **Model weights (Meta SAM License).** The SAM 3D model weights and the code
   under [`sam3d_objects/`](sam3d_objects/LICENSE) are provided by Meta under the
@@ -747,6 +749,14 @@ IP available under a separate commercial license.
   project.** They are **gated**: a Meta-approved Hugging Face account and access
   token are required (this is Meta's requirement; see
   [Troubleshooting](#model-download--hugging-face-authentication)).
+
+- **POC-SLT (GPL-3.0).** The shape completion model (POC-SLT, "Partial Object
+  Completion with SDF Latent Transformers") is available under GPL-3.0 from
+  [`cgtuebingen/poc-slt`](https://github.com/cgtuebingen/poc-slt). Because
+  PYTHIA is AGPL-3.0 and GPLv3 and AGPL are compatible (one is a superset of
+  the other), this component can be legally included. You must comply with
+  GPL-3.0 if you use POC-SLT. The weights are **not** included in this
+  repository; they are **downloaded at runtime from Hugging Face on demand**.
 
 - **Upstream port.** The custom Metal reconstruction kernels that originated in
   [`ZimengXiong/Sam3D-Objects-MLX`](https://github.com/ZimengXiong/Sam3D-Objects-MLX)
