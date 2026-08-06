@@ -483,8 +483,9 @@ _MODEL_META = {
     # reconstruction generators. Not an HF repo: it is fetched from torch.hub
     # (facebookresearch/dinov2 code + the reg4 pretrained weights).
     "dino":  {"repo": None,                      "gated": False, "dl_bytes": 1_217_607_321},
-    # AI mesh cleanup models (builtin, no download required)
+    # AI mesh cleanup models
     "pcn":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
+    "snowflakenet": {"repo": None, "gated": False, "dl_bytes": 367_300_000, "ai_model": True},
     "vae":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
 }
 
@@ -671,6 +672,20 @@ def _download_worker(model_id: str) -> None:
                     shutil.rmtree(nested, ignore_errors=True)
             finally:
                 stop.set()
+        elif model_id == "snowflakenet":
+            # AI mesh completion model from Google Drive
+            import mesh_cleanup_ai
+            stop = _start_progress_sampler(
+                "snowflakenet", Path("checkpoints/ai_cleanup"), 
+                meta.get("dl_bytes", 0), "Downloading SnowflakeNet SPD")
+            try:
+                mesh_cleanup_ai._download_gdrive_weight(
+                    "snowflakenet",
+                    "1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR",  # Google Drive folder ID
+                    "spd_scannet_mix.ckpt"  # File name
+                )
+            finally:
+                stop.set()
         else:
             raise ValueError(f"Unknown model '{model_id}'")
         _set_dl(model_id, state="done", message="Download complete.", progress=1.0)
@@ -762,6 +777,23 @@ def _purge_model(model_id: str) -> int:
                 shutil.rmtree(repo, ignore_errors=True)
         except Exception as exc:
             logger.warning("DINOv2 purge failed: %s", exc)
+    elif model_id == "snowflakenet":
+        # Delete SnowflakeNet weights from ai_cleanup cache
+        try:
+            ai_cleanup = Path("checkpoints/ai_cleanup")
+            if ai_cleanup.exists():
+                for f in ai_cleanup.glob("*"):
+                    try:
+                        if f.is_file():
+                            freed += f.stat().st_size
+                            f.unlink()
+                    except OSError:
+                        pass
+            # Also unload from memory
+            if ai_mesh_cleanup_manager:
+                ai_mesh_cleanup_manager.unload_ai_model("snowflakenet")
+        except Exception as exc:
+            logger.warning("SnowflakeNet purge failed: %s", exc)
     return freed
 
 
