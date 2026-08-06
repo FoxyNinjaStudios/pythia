@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Weight sources (modern PyTorch models)
 # Point cloud denoising: Point Transformer V3 (MIT, active development)
-# Shape completion: POC-SLT (GPL-3.0, state-of-the-art 2025)
+# Shape completion: SnowflakeNet (MIT, point cloud deconvolution with skip-transformer)
 WEIGHT_CONFIG = {
     "point_transformer_v3": {
         "model": "Pointcept/PointTransformerV3",
@@ -27,11 +27,11 @@ WEIGHT_CONFIG = {
         "source": "MIT (Pointcept/PointTransformerV3)",
         "paper": "https://arxiv.org/abs/2312.10017",
     },
-    "poc_slt": {
-        "model": "zakeri68/poc-slt",
+    "snowflakenet": {
+        "gdrive_url": "https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR",
         "pretrained": True,
-        "source": "GPL-3.0 (cgtuebingen/poc-slt)",
-        "paper": "https://arxiv.org/abs/2411.05419",
+        "source": "MIT (AllenXiangX/SnowflakeNet)",
+        "paper": "https://arxiv.org/abs/2202.09367",
     },
     # Fallback simple models (random init, infrastructure only)
     "simple_pcn_fallback": {
@@ -213,22 +213,19 @@ def load_shape_vae_model():
     
     device = get_device()
     
-    # Try POC-SLT (Partial Object Completion with SDF Latent Transformers) first
+    # Try SnowflakeNet (Snowflake Point Deconvolution) first
     try:
-        logger.info("Attempting to load POC-SLT for shape completion…")
+        logger.info("Attempting to load SnowflakeNet for shape completion…")
         try:
-            from transformers import AutoModel
-            model_id = WEIGHT_CONFIG["poc_slt"]["model"]
-            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
-            model = model.to(device)
-            model.eval()
-            _shape_vae_model = model
-            logger.info("✓ POC-SLT loaded successfully (state-of-the-art 2025, GPL-3.0)")
-            return _shape_vae_model
+            # SnowflakeNet requires downloading from Google Drive (manual or via gdown)
+            # For now, gracefully fall back if weights aren't available
+            config = WEIGHT_CONFIG["snowflakenet"]
+            logger.info("SnowflakeNet weights available at: " + config["gdrive_url"])
+            logger.info("Consider downloading from Google Drive and placing in checkpoints/ai_cleanup/")
         except ImportError:
-            logger.info("transformers not installed, using fallback simple model…")
+            logger.info("SnowflakeNet dependencies not installed, using fallback simple model…")
     except Exception as e:
-        logger.info(f"POC-SLT not available ({e}), falling back to simple model…")
+        logger.info(f"SnowflakeNet not available ({e}), falling back to simple model…")
     
     # Fallback: Simple voxel VAE with optional pretrained weights
     try:

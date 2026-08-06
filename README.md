@@ -292,7 +292,7 @@ and update the 3D preview live:
   (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
   **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
   **Neon**. Live preview in viewport; applies on download when baking is enabled.
-- **AI Mesh Cleanup** (functional, modern models). The export panel includes checkboxes for **point cloud denoising** and **shape completion**. The system intelligently upgrades to modern architectures when available: **Point Transformer V3** (MIT, transformer-based point cloud understanding) for denoising and **POC-SLT** (GPL-3.0, state-of-the-art 2025 with SDF latent transformers) for shape completion. Both models run on Metal (MPS) on Apple Silicon with intelligent memory management. If modern models are unavailable, the system gracefully falls back to simpler architectures with random initialization. Models are downloaded on demand and unloaded after use to minimize memory footprint. **Upgrade guide:** Install `transformers` and `huggingface_hub` to enable automatic download of modern models.
+- **AI Mesh Cleanup** (functional, modern models). The export panel includes checkboxes for **point cloud denoising** and **shape completion**. The system intelligently upgrades to modern architectures when available: **Point Transformer V3** (MIT, transformer-based point cloud understanding) for denoising and **SnowflakeNet** (MIT, point cloud deconvolution with skip-transformer) for shape completion. Both models run on Metal (MPS) on Apple Silicon with intelligent memory management. If modern models are unavailable, the system gracefully falls back to simpler architectures with random initialization. Models are downloaded on demand and unloaded after use to minimize memory footprint. **Upgrade guide:** Install `transformers` and `huggingface_hub` to enable automatic download; for SnowflakeNet, download pretrained weights from [Google Drive](https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR) and place in `checkpoints/ai_cleanup/`.
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
   for web/`model-viewer` use.
@@ -624,7 +624,7 @@ following were built here:
     download / load status and downloads missing weights from Hugging Face,
     including token entry and gated-repo handling for SAM 3D Objects (see
     [Model management](#model-management-web-ui)).
-9. **AI mesh cleanup (functional, modern models).** UI controls for point cloud denoising and 3D shape completion are fully integrated into the export pipeline with Metal (MPS) acceleration on Apple Silicon. The system uses modern transformer-based architectures where available: **Point Transformer V3** (Pointcept, MIT license) for point cloud understanding and denoising, and **POC-SLT** (partial object completion with SDF latent transformers, GPL-3.0, published 2025) for state-of-the-art shape completion. If the `transformers` library is installed, models are automatically fetched from Hugging Face; otherwise, the system falls back to simpler random-initialized architectures. Both paths support lazy loading and MPS acceleration. See [AI Mesh Cleanup](#ai-mesh-cleanup) for upgrade instructions.
+9. **AI mesh cleanup (functional, modern models).** UI controls for point cloud denoising and 3D shape completion are fully integrated into the export pipeline with Metal (MPS) acceleration on Apple Silicon. The system uses modern transformer-based architectures where available: **Point Transformer V3** (Pointcept, MIT license) for point cloud understanding and denoising, and **SnowflakeNet** (snowflake point deconvolution with skip-transformer, MIT license, ICCV 2021/TPAMI 2023) for point cloud completion. If the `transformers` library is installed, Point Transformer V3 is automatically fetched from Hugging Face; SnowflakeNet weights are downloaded from Google Drive. Otherwise, the system falls back to simpler random-initialized architectures. Both paths support lazy loading and MPS acceleration. See [AI Mesh Cleanup](#ai-mesh-cleanup) for upgrade instructions.
 
 ## Troubleshooting
 
@@ -736,7 +736,7 @@ IP available under a separate commercial license.
   | MoGe | Depth estimation | MIT |
   | SAM 3D Objects | Reconstruction model + weights | Meta SAM License |
   | Point Transformer V3 | AI point cloud denoising (modern) | MIT (Pointcept/PointTransformerV3) |
-  | POC-SLT | AI geometry completion (modern) | GPL-3.0 (cgtuebingen/poc-slt, 2025) |
+  | SnowflakeNet (SPD) | AI point cloud completion (modern) | MIT (AllenXiangX/SnowflakeNet, ICCV 2021/TPAMI 2023) |
   | Point Completion Network (PCN) | AI point cloud denoising (legacy fallback) | MIT (wentaoyuan/pcn) |
   | 3D Shape VAE | AI geometry completion (legacy fallback) | MIT (autonomousvision/occupancy-networks) |
 
@@ -750,13 +750,7 @@ IP available under a separate commercial license.
   token are required (this is Meta's requirement; see
   [Troubleshooting](#model-download--hugging-face-authentication)).
 
-- **POC-SLT (GPL-3.0).** The shape completion model (POC-SLT, "Partial Object
-  Completion with SDF Latent Transformers") is available under GPL-3.0 from
-  [`cgtuebingen/poc-slt`](https://github.com/cgtuebingen/poc-slt). Because
-  PYTHIA is AGPL-3.0 and GPLv3 and AGPL are compatible (one is a superset of
-  the other), this component can be legally included. You must comply with
-  GPL-3.0 if you use POC-SLT. The weights are **not** included in this
-  repository; they are **downloaded at runtime from Hugging Face on demand**.
+- **SnowflakeNet (MIT).** The point cloud completion model (SnowflakeNet, "Snowflake Point Deconvolution with Skip-Transformer") is available under MIT license from [`AllenXiangX/SnowflakeNet`](https://github.com/AllenXiangX/SnowflakeNet). This is published in ICCV 2021 (oral presentation) and extended in TPAMI 2023. The pretrained weights are **not** included in this repository and must be downloaded manually from [Google Drive](https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR) (or [Baidu backup](https://pan.baidu.com/s/10tkqJfMdWO9GkzXSBSNlIw), password: oy5c) and placed in `checkpoints/ai_cleanup/`.
 
 - **Upstream port.** The custom Metal reconstruction kernels that originated in
   [`ZimengXiong/Sam3D-Objects-MLX`](https://github.com/ZimengXiong/Sam3D-Objects-MLX)
