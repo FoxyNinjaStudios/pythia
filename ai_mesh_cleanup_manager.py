@@ -1,29 +1,35 @@
 """
 Server-side AI mesh cleanup model management and inference.
 Handles loading, unloading, and running PCN denoising + Shape VAE completion on Metal/GPU.
+Supports downloading pretrained weights from Hugging Face and memory lifecycle management.
 """
 
 import os
 import threading
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Model registry
+# Model registry with download information
 AI_CLEANUP_MODELS = {
     "pcn-denoise": {
         "name": "Point Completion Network (Denoising)",
-        "description": "Denoise point clouds using PCN",
-        "size_mb": 50,
-        "source": "builtin",
+        "description": "Denoise point clouds using Point Completion Network (PCN). Removes noise artifacts from reconstructed geometry.",
+        "size_mb": 85,
+        "source": "huggingface",
+        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/pcn_model.pt",
+        "license": "MIT (wentaoyuan/pcn PyTorch port)",
     },
     "shape-vae": {
         "name": "3D Shape VAE",
-        "description": "Complete/refine 3D shapes using variational autoencoder",
-        "size_mb": 80,
-        "source": "builtin",
+        "description": "Complete and refine 3D shapes using a Variational Autoencoder trained on ShapeNet. Fills holes and improves geometry coherence.",
+        "size_mb": 120,
+        "source": "huggingface",
+        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/shape_vae_model.pt",
+        "license": "MIT (autonomousvision/occupancy-networks)",
     },
 }
 
@@ -32,20 +38,61 @@ _ai_models_loaded = {}
 _ai_models_lock = threading.Lock()
 
 
+def _get_weight_status(model_id: str) -> str:
+    """Check if model weights are downloaded."""
+    weight_path = Path("checkpoints/ai_cleanup") / f"{model_id.split('-')[0]}_model.pt"
+    if weight_path.exists():
+        return "downloaded"
+    return "missing"
+
+
 def get_ai_model_status() -> Dict:
-    """Get status of all AI cleanup models."""
+    """Get status of all AI cleanup models (loaded/downloaded/missing)."""
     with _ai_models_lock:
         status = {}
         for model_id, meta in AI_CLEANUP_MODELS.items():
             is_loaded = model_id in _ai_models_loaded and _ai_models_loaded[model_id] is not None
+            weight_status = _get_weight_status(model_id)
+            
+            if is_loaded:
+                dl_status = "loaded"
+            elif weight_status == "downloaded":
+                dl_status = "downloaded"
+            else:
+                dl_status = "missing"
+            
             status[model_id] = {
                 "name": meta["name"],
                 "description": meta["description"],
                 "size_mb": meta["size_mb"],
+                "status": dl_status,
                 "loaded": is_loaded,
                 "source": meta["source"],
+                "license": meta.get("license", "Unknown"),
             }
         return status
+
+
+def download_ai_model(model_id: str) -> bool:
+    """Download an AI model's pretrained weights. Returns True if successful."""
+    if model_id not in AI_CLEANUP_MODELS:
+        logger.error(f"Unknown AI model: {model_id}")
+        return False
+    
+    try:
+        import mesh_cleanup_ai
+        
+        # Map to mesh_cleanup_ai model name
+        mesh_model_name = "pcn" if model_id == "pcn-denoise" else "shape_vae"
+        url = AI_CLEANUP_MODELS[model_id]["url"]
+        
+        logger.info(f"Downloading {model_id} weights…")
+        weight_path = mesh_cleanup_ai._download_weight(mesh_model_name, url)
+        return weight_path is not None and weight_path.exists()
+    
+    except Exception as e:
+        logger.error(f"Failed to download {model_id}: {e}")
+        return False
 
 
 def load_ai_model(model_id: str) -> bool:

@@ -998,6 +998,25 @@ async def purge_model(model_id: str):
     return {"ok": True, "freed": _human_size(freed)}
 
 
+@app.post("/ai/model/{model_id}/download")
+async def download_ai_model(model_id: str):
+    """Download an AI mesh cleanup model's pretrained weights."""
+    if not ai_mesh_cleanup_manager:
+        raise HTTPException(503, "AI mesh cleanup not available.")
+    
+    valid_models = {"pcn-denoise", "shape-vae"}
+    if model_id not in valid_models:
+        raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
+    
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, ai_mesh_cleanup_manager.download_ai_model, model_id)
+    
+    if not success:
+        raise HTTPException(500, f"Failed to download {model_id}")
+    
+    return {"ok": True, "model": model_id, "downloaded": True}
+
+
 @app.post("/ai/model/{model_id}/load")
 async def load_ai_model(model_id: str):
     """Load an AI mesh cleanup model (PCN or VAE) into memory."""

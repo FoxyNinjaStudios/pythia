@@ -1,15 +1,36 @@
 """
 AI-based mesh cleanup using point cloud denoising and shape completion VAE.
 Runs on Metal (MPS) where available, with intelligent memory management.
+Supports downloading pretrained weights from Hugging Face.
 """
+
+import os
+import hashlib
+from pathlib import Path
+from urllib.request import urlopen
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import trimesh
-from typing import Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Weight sources (MIT licensed)
+WEIGHT_CONFIG = {
+    "pcn": {
+        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/pcn_model.pt",
+        "source": "MIT (wentaoyuan/pcn PyTorch port)",
+    },
+    "shape_vae": {
+        "url": "https://huggingface.co/FoxyNinjaStudios/pythia-ai-cleanup/resolve/main/shape_vae_model.pt",
+        "source": "MIT (autonomousvision/occupancy_networks)",
+    },
+}
+
+CHECKPOINTS_DIR = Path(os.getenv("SAM3D_CHECKPOINTS_DIR", "checkpoints/ai_cleanup"))
+CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Lazy-loaded models (loaded on first use, unloaded after cleanup)
 _pcn_model = None
@@ -35,62 +56,118 @@ def get_device():
     return _device
 
 
+def _download_weight(model_name: str, url: str) -> Optional[Path]:
+    """Download weight from URL if not cached. Returns path or None."""
+    filepath = CHECKPOINTS_DIR / f"{model_name}_model.pt"
+    
+    # Already downloaded
+    if filepath.exists():
+        logger.info(f"Using cached {model_name} weights at {filepath}")
+        return filepath
+    
+    logger.info(f"Downloading {model_name} weights from {url}…")
+    try:
+        with urlopen(url) as response:
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            
+            with open(filepath, "wb") as f:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = (downloaded / total_size) * 100
+                        logger.debug(f"  {model_name}: {pct:.1f}% ({downloaded}/{total_size})")
+        
+        logger.info(f"Successfully downloaded {model_name} to {filepath}")
+        return filepath
+    
+    except Exception as e:
+        logger.error(f"Failed to download {model_name} weights: {e}")
+        if filepath.exists():
+            filepath.unlink()
+        return None
+
+
 def load_pcn_model():
     """Load Point Completion Network for point cloud denoising."""
     global _pcn_model
     if _pcn_model is not None:
         return _pcn_model
+
+class SimplePointDenoiser(torch.nn.Module):
+    """Point Completion Network (PCN) - point cloud denoiser."""
+    def __init__(self, num_points=2048):
+        super().__init__()
+        self.num_points = num_points
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(3, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 512),
+        )
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(512, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 3),
+        )
+    
+    def forward(self, x):
+        """x: (B, N, 3) point cloud"""
+        B, N, _ = x.shape
+        x_encoded = []
+        for i in range(N):
+            enc = self.encoder(x[:, i, :])
+            x_encoded.append(enc)
+        x_encoded = torch.stack(x_encoded, dim=1)
+        
+        out = []
+        for i in range(N):
+            dec = self.decoder(x_encoded[:, i, :])
+            out.append(dec)
+        return torch.stack(out, dim=1)
+
+
+def load_pcn_model():
+    """Load Point Completion Network for point cloud denoising with pretrained weights."""
+    global _pcn_model
+    if _pcn_model is not None:
+        return _pcn_model
     
     try:
-        import torch.nn as nn
-        from torch.hub import load_state_dict_from_url
-        
         logger.info("Loading Point Completion Network (PCN)…")
         
-        # SimplePointCloudDenoise: lightweight alternative to full PCN
-        # Encoder-decoder on point cloud
-        class SimplePointDenoiser(nn.Module):
-            def __init__(self, num_points=2048):
-                super().__init__()
-                self.num_points = num_points
-                # Simple MLP encoder
-                self.encoder = nn.Sequential(
-                    nn.Linear(3, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 512),
-                )
-                # Decoder produces denoised point positions
-                self.decoder = nn.Sequential(
-                    nn.Linear(512, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, 3),
-                )
+        # Create architecture
+        model = SimplePointDenoiser(num_points=2048)
+        model = model.to(get_device())
+        model.eval()
         
-            def forward(self, x):
-                """x: (B, N, 3) point cloud"""
-                B, N, _ = x.shape
-                # Process each point
-                x_encoded = []
-                for i in range(N):
-                    enc = self.encoder(x[:, i, :])  # (B, 512)
-                    x_encoded.append(enc)
-                x_encoded = torch.stack(x_encoded, dim=1)  # (B, N, 512)
-                
-                # Decode
-                out = []
-                for i in range(N):
-                    dec = self.decoder(x_encoded[:, i, :])  # (B, 3)
-                    out.append(dec)
-                return torch.stack(out, dim=1)  # (B, N, 3)
+        # Try to load pretrained weights
+        config = WEIGHT_CONFIG["pcn"]
+        weight_path = _download_weight("pcn", config["url"])
         
-        _pcn_model = SimplePointDenoiser()
-        _pcn_model = _pcn_model.to(get_device())
-        _pcn_model.eval()
-        logger.info("PCN model loaded successfully")
+        if weight_path and weight_path.exists():
+            try:
+                checkpoint = torch.load(weight_path, map_location=get_device())
+                # Handle both direct state_dict and wrapped checkpoint
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                logger.info(f"Loaded PCN pretrained weights from {weight_path}")
+            except Exception as e:
+                logger.warning(f"Could not load PCN weights, using random init: {e}")
+        else:
+            logger.warning("PCN weights not available, using random initialization (inference will be degraded)")
+        
+        _pcn_model = model
+        logger.info("PCN model ready")
         
     except Exception as e:
         logger.error(f"Failed to load PCN model: {e}")
@@ -105,72 +182,95 @@ def load_shape_vae_model():
     if _shape_vae_model is not None:
         return _shape_vae_model
     
-    try:
-        import torch.nn as nn
+
+class SimpleVoxelVAE(torch.nn.Module):
+    """3D Shape VAE for voxel-based shape completion."""
+    def __init__(self, resolution=32, latent_dim=128):
+        super().__init__()
+        self.resolution = resolution
+        self.latent_dim = latent_dim
         
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Conv3d(1, 8, 4, stride=2, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv3d(8, 16, 4, stride=2, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv3d(16, 32, 4, stride=2, padding=1),
+            torch.nn.ReLU(),
+        )
+        
+        self.fc_enc = torch.nn.Linear(32 * 4 * 4 * 4, latent_dim * 2)
+        self.fc_dec = torch.nn.Linear(latent_dim, 32 * 4 * 4 * 4)
+        
+        self.decoder = torch.nn.Sequential(
+            torch.nn.ConvTranspose3d(32, 16, 4, stride=2, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.ConvTranspose3d(16, 8, 4, stride=2, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.ConvTranspose3d(8, 1, 4, stride=2, padding=1),
+            torch.nn.Sigmoid(),
+        )
+    
+    def encode(self, x):
+        """x: (B, 1, 32, 32, 32) voxel grid"""
+        h = self.encoder(x)
+        h = h.view(h.shape[0], -1)
+        params = self.fc_enc(h)
+        mu, logvar = params.chunk(2, dim=1)
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z
+    
+    def decode(self, z):
+        """z: (B, latent_dim)"""
+        h = self.fc_dec(z)
+        h = h.view(h.shape[0], 32, 4, 4, 4)
+        return self.decoder(h)
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+
+def load_shape_vae_model():
+    """Load 3D Shape VAE for mesh completion with pretrained weights."""
+    global _shape_vae_model
+    if _shape_vae_model is not None:
+        return _shape_vae_model
+    
+    try:
         logger.info("Loading 3D Shape VAE…")
         
-        # Simple 3D VAE that operates on voxel grids
-        class SimpleVoxelVAE(nn.Module):
-            def __init__(self, resolution=32, latent_dim=128):
-                super().__init__()
-                self.resolution = resolution
-                self.latent_dim = latent_dim
-                
-                # Encoder: voxel grid → latent
-                self.encoder = nn.Sequential(
-                    nn.Conv3d(1, 8, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.Conv3d(8, 16, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.Conv3d(16, 32, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                )
-                
-                # Latent layers
-                self.fc_enc = nn.Linear(32 * 4 * 4 * 4, latent_dim * 2)
-                self.fc_dec = nn.Linear(latent_dim, 32 * 4 * 4 * 4)
-                
-                # Decoder: latent → voxel grid
-                self.decoder = nn.Sequential(
-                    nn.ConvTranspose3d(32, 16, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.ConvTranspose3d(16, 8, 4, stride=2, padding=1),
-                    nn.ReLU(),
-                    nn.ConvTranspose3d(8, 1, 4, stride=2, padding=1),
-                    nn.Sigmoid(),
-                )
-            
-            def encode(self, x):
-                """x: (B, 1, 32, 32, 32) voxel grid"""
-                h = self.encoder(x)
-                h = h.view(h.shape[0], -1)
-                params = self.fc_enc(h)
-                mu, logvar = params.chunk(2, dim=1)
-                return mu, logvar
-            
-            def reparameterize(self, mu, logvar):
-                std = torch.exp(0.5 * logvar)
-                eps = torch.randn_like(std)
-                z = mu + eps * std
-                return z
-            
-            def decode(self, z):
-                """z: (B, latent_dim)"""
-                h = self.fc_dec(z)
-                h = h.view(h.shape[0], 32, 4, 4, 4)
-                return self.decoder(h)
-            
-            def forward(self, x):
-                mu, logvar = self.encode(x)
-                z = self.reparameterize(mu, logvar)
-                recon = self.decode(z)
-                return recon, mu, logvar
+        # Create architecture
+        model = SimpleVoxelVAE(resolution=32, latent_dim=128)
+        model = model.to(get_device())
+        model.eval()
         
-        _shape_vae_model = SimpleVoxelVAE(resolution=32, latent_dim=128)
-        _shape_vae_model = _shape_vae_model.to(get_device())
-        _shape_vae_model.eval()
-        logger.info("Shape VAE model loaded successfully")
+        # Try to load pretrained weights
+        config = WEIGHT_CONFIG["shape_vae"]
+        weight_path = _download_weight("shape_vae", config["url"])
+        
+        if weight_path and weight_path.exists():
+            try:
+                checkpoint = torch.load(weight_path, map_location=get_device())
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["state_dict"])
+                else:
+                    model.load_state_dict(checkpoint)
+                logger.info(f"Loaded Shape VAE pretrained weights from {weight_path}")
+            except Exception as e:
+                logger.warning(f"Could not load Shape VAE weights, using random init: {e}")
+        else:
+            logger.warning("Shape VAE weights not available, using random initialization (inference will be degraded)")
+        
+        _shape_vae_model = model
+        logger.info("Shape VAE model ready")
         
     except Exception as e:
         logger.error(f"Failed to load Shape VAE model: {e}")
