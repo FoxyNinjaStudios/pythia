@@ -1011,7 +1011,7 @@ async def download_ai_model(model_id: str):
     if not ai_mesh_cleanup_manager:
         raise HTTPException(503, "AI mesh cleanup not available.")
     
-    valid_models = {"pcn-denoise", "shape-vae"}
+    valid_models = {"pcn-denoise", "snowflakenet", "shape-vae"}
     if model_id not in valid_models:
         raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
     
@@ -1026,11 +1026,11 @@ async def download_ai_model(model_id: str):
 
 @app.post("/ai/model/{model_id}/load")
 async def load_ai_model(model_id: str):
-    """Load an AI mesh cleanup model (PCN or VAE) into memory."""
+    """Load an AI mesh cleanup model (PCN, SnowflakeNet, or VAE) into memory."""
     if not ai_mesh_cleanup_manager:
         raise HTTPException(503, "AI mesh cleanup not available.")
     
-    valid_models = {"pcn-denoise", "shape-vae"}
+    valid_models = {"pcn-denoise", "snowflakenet", "shape-vae"}
     if model_id not in valid_models:
         raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
     
@@ -1049,7 +1049,7 @@ async def unload_ai_model(model_id: str):
     if not ai_mesh_cleanup_manager:
         raise HTTPException(503, "AI mesh cleanup not available.")
     
-    valid_models = {"pcn-denoise", "shape-vae"}
+    valid_models = {"pcn-denoise", "snowflakenet", "shape-vae"}
     if model_id not in valid_models:
         raise HTTPException(400, f"Invalid AI model. Choose from: {valid_models}")
     
