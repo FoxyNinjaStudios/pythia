@@ -16,6 +16,12 @@ import torch
 import trimesh
 import logging
 
+try:
+    import open3d as o3d
+    OPEN3D_AVAILABLE = True
+except ImportError:
+    OPEN3D_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Weight sources (modern PyTorch models)
@@ -205,25 +211,31 @@ class SimplePointDenoiser(torch.nn.Module):
 def load_pcn_model():
     """Load point cloud denoising model.
     
-    NOTE: Point cloud denoising is NOT functional in this build because:
-    - Point Transformer V3 from HuggingFace doesn't have a transformers-compatible config
-    - SimplePointDenoiser fallback has no trained weights available
+    Point Transformer V3 is the primary choice but has compatibility issues.
+    This function now returns a marker indicating Open3D fallback denoising is available.
     
-    Returns None to disable denoising gracefully.
+    NOTE: Returns None to indicate "use Open3D denoising fallback" rather than ML-based denoising.
+    The actual denoising happens in denoise_point_cloud_open3d().
     """
     global _pcn_model, _pcn_load_attempted
     
     if _pcn_load_attempted:
-        return _pcn_model  # Return cached result (None)
+        return _pcn_model  # Return cached result
     
     _pcn_load_attempted = True
-    logger.warning("⚠ Point cloud denoising is disabled: no trained models available")
-    logger.warning("  - Point Transformer V3: Not compatible with transformers.AutoModel")
-    logger.warning("  - SimplePointDenoiser: No trained weights")
-    logger.warning("  To enable denoising, provide trained weights for PCN models")
     
-    _pcn_model = None
-    return None
+    if not OPEN3D_AVAILABLE:
+        logger.warning("⚠ Point cloud denoising is disabled: Open3D not available")
+        logger.warning("  Install open3d to enable robust statistical denoising")
+        _pcn_model = None
+        return None
+    
+    logger.info("✓ Point cloud denoising: Using Open3D statistical denoising (fallback for Point Transformer V3)")
+    logger.info("  - Statistical outlier removal + radius-based filtering")
+    logger.info("  - Deterministic, no ML weights needed")
+    
+    _pcn_model = "open3d_fallback"  # Marker indicating to use Open3D denoising
+    return _pcn_model
 
 
 
@@ -368,27 +380,140 @@ def unload_models():
     logger.info("AI mesh cleanup models unloaded")
 
 
+def denoise_point_cloud_open3d(
+    vertices: np.ndarray,
+    nb_neighbors: int = 20,
+    std_ratio: float = 2.0,
+    radius: float = None,
+    min_points: int = 10,
+    apply_smooth: bool = False,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Denoise a point cloud using Open3D statistical methods (fallback for Point Transformer V3).
+    
+    This combines two proven techniques:
+    1. Statistical Outlier Removal (SOR): Removes points farther than std_ratio * std_dev from neighbors
+    2. Radius-based Outlier Removal (ROR): Removes points with too few neighbors in a radius
+    
+    Args:
+        vertices: (V, 3) point positions
+        nb_neighbors: Number of neighbors to consider for statistics (default 20)
+        std_ratio: Standard deviation multiplier for outlier threshold (default 2.0, stricter = higher)
+        radius: Radius for neighbor search (auto-estimated from point density if None)
+        min_points: Minimum neighbors within radius (ROR threshold)
+        apply_smooth: If True, apply bilateral filtering after outlier removal
+        verbose: Print progress
+    
+    Returns:
+        (V', 3) denoised vertices (may be fewer points if outliers removed)
+    """
+    if not OPEN3D_AVAILABLE:
+        logger.warning("Open3D not available, returning original vertices")
+        return vertices
+    
+    if verbose:
+        logger.info(f"Denoising point cloud: {len(vertices)} points → Open3D statistical methods")
+    
+    try:
+        # Convert to Open3D point cloud
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+        
+        # Estimate radius from average point spacing if not provided
+        if radius is None:
+            # Rough estimate: radius ~ 1.5x average nearest neighbor distance
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
+            dists = []
+            kdtree = o3d.geometry.KDTreeFlann(pcd)
+            for i in range(min(1000, len(vertices))):  # Sample to estimate
+                _, idx, _ = kdtree.search_knn_vector_3d(pcd.points[i], 2)
+                if len(idx) > 1:
+                    dist = np.linalg.norm(np.asarray(pcd.points[idx[1]]) - np.asarray(pcd.points[i]))
+                    dists.append(dist)
+            avg_spacing = np.median(dists) if dists else 0.01
+            radius = avg_spacing * 3.0  # 3x nearest neighbor distance
+        
+        # Statistical Outlier Removal
+        pcd_sor, idx_sor = pcd.remove_statistical_outlier(
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio
+        )
+        
+        if verbose:
+            logger.info(f"  After SOR: {len(pcd_sor.points)} points (removed {len(vertices) - len(pcd_sor.points)})")
+        
+        # Radius-based Outlier Removal
+        pcd_ror, idx_ror = pcd_sor.remove_radius_outlier(
+            nb_points=min_points,
+            radius=radius
+        )
+        
+        if verbose:
+            logger.info(f"  After ROR: {len(pcd_ror.points)} points (removed {len(pcd_sor.points) - len(pcd_ror.points)})")
+        
+        # Optional bilateral filtering for additional smoothing
+        if apply_smooth and len(pcd_ror.points) > 0:
+            try:
+                # Try Laplacian smoothing (available in newer versions)
+                pcd_ror = pcd_ror.filter_smooth_laplacian(
+                    number_of_iterations=5,
+                    lambda_filter=0.5
+                )
+                if verbose:
+                    logger.info(f"  After smoothing: {len(pcd_ror.points)} points")
+            except AttributeError:
+                # Fallback: use simple averaging if Laplacian smoothing unavailable
+                if verbose:
+                    logger.info(f"  Laplacian smoothing unavailable, skipping")
+
+        
+        result = np.asarray(pcd_ror.points, dtype=np.float32)
+        
+        if verbose:
+            logger.info(f"Denoising complete: {len(result)} points")
+        
+        return result
+    
+    except Exception as e:
+        logger.error(f"Open3D denoising failed: {e}, returning original vertices")
+        return vertices
 def denoise_point_cloud(
     vertices: np.ndarray,
     num_points: int = 2048,
     verbose: bool = False,
 ) -> np.ndarray:
     """
-    Denoise a point cloud using PCN.
+    Denoise a point cloud using available denoising method.
+    
+    Tries ML-based Point Transformer V3 first, falls back to Open3D statistical denoising.
     
     Args:
         vertices: (V, 3) point positions
-        num_points: Number of points to sample/use
+        num_points: Number of points to sample/use (for ML methods)
         verbose: Print progress
     
     Returns:
-        (V, 3) denoised vertices
+        (V, 3) or (V', 3) denoised vertices
     """
     model = load_pcn_model()
+    
+    # Use Open3D fallback if available
+    if model == "open3d_fallback":
+        return denoise_point_cloud_open3d(
+            vertices,
+            nb_neighbors=20,
+            std_ratio=2.0,
+            apply_smooth=True,
+            verbose=verbose
+        )
+    
+    # Model is None or unavailable
     if model is None:
-        logger.warning("PCN model unavailable, skipping denoising")
+        logger.warning("No denoising method available (Open3D not installed), returning original vertices")
         return vertices
     
+    # ML-based denoising (if Point Transformer V3 becomes available)
     try:
         device = get_device()
         original_count = len(vertices)
@@ -434,13 +559,15 @@ def denoise_point_cloud(
         denoised_np = denoised_np[:original_count]
         
         if verbose:
-            logger.info(f"Point cloud denoised: {len(vertices)} points")
+            logger.info(f"Point cloud denoised (ML): {len(vertices)} points")
         
         return denoised_np
     
     except Exception as e:
         logger.error(f"Point cloud denoising failed: {e}")
         return vertices
+
+
 
 
 def complete_shape_voxel(
