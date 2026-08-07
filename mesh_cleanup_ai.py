@@ -383,19 +383,20 @@ def unload_models():
 def denoise_mesh_inplace(
     vertices: np.ndarray,
     faces: np.ndarray,
-    iterations: int = 5,
+    iterations: int = 1,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Denoise a mesh by smoothing vertices in-place (preserves topology and faces).
     
     Uses Laplacian smoothing with neighborhood averaging to reduce noise without
-    removing vertices or changing mesh connectivity.
+    removing vertices or changing mesh connectivity. Tuned for subtle smoothing
+    that removes high-frequency noise without distorting geometry significantly.
     
     Args:
         vertices: (V, 3) mesh vertices
         faces: (F, 3) mesh faces (triangle indices)
-        iterations: Number of smoothing iterations (default 5)
+        iterations: Number of smoothing iterations (default 1 for subtle effect)
         verbose: Print progress
     
     Returns:
@@ -409,18 +410,29 @@ def denoise_mesh_inplace(
         logger.info(f"Smoothing mesh: {len(vertices)} vertices → Laplacian smoothing")
     
     try:
+        # Identify vertices actually used in faces
+        used_vertices = np.unique(faces.flatten())
+        
         # Create mesh
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
         mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
         
         # Apply Laplacian smoothing (preserves topology)
+        # iterations=1: minimal passes through the mesh
+        # lambda_filter=0.1: very light smoothing
         mesh_smooth = mesh.filter_smooth_laplacian(
-            number_of_iterations=iterations,
-            lambda_filter=0.5
+            number_of_iterations=1,
+            lambda_filter=0.1
         )
         
         smoothed_vertices = np.asarray(mesh_smooth.vertices, dtype=np.float32)
+        
+        # Handle orphaned vertices (not in any face) - keep original to avoid NaN
+        for v_idx in range(len(vertices)):
+            if v_idx not in used_vertices:
+                smoothed_vertices[v_idx] = vertices[v_idx]
+        
         smoothed_faces = faces  # Faces unchanged
         
         if verbose:
