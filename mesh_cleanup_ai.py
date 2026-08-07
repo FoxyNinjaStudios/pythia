@@ -118,28 +118,41 @@ def _download_gdrive_weight(model_name: str, folder_id: str, filename: str) -> O
         logger.info(f"Using cached {model_name} weights at {filepath}")
         return filepath
     
-    logger.info(f"Downloading {model_name} weights from Google Drive ({filename})…")
+    logger.info(f"Downloading {model_name} weights from Google Drive…")
     try:
         import gdown
+        import shutil
         
-        # Download from Google Drive folder using folder ID and filename
-        # Construct the URL for direct file access in the folder
-        file_url = f"https://drive.google.com/uc?id={folder_id.replace('folders/', '')}"
-        
-        # Use gdown to download from the folder
-        output = str(filepath)
+        # Download the entire Google Drive folder
         gdown.download_folder(folder_id, output=str(CHECKPOINTS_DIR), quiet=False)
         
-        # The file should now be in the checkpoints directory
-        downloaded_file = CHECKPOINTS_DIR / filename
-        if downloaded_file.exists():
-            # Rename to standard model name
-            downloaded_file.rename(filepath)
-            logger.info(f"Successfully downloaded {model_name} to {filepath}")
-            return filepath
+        # For SnowflakeNet, look for the completion model in the downloaded folder
+        if model_name == "snowflakenet":
+            # The folder contains multiple model types; use the best PCN completion model
+            completion_dir = CHECKPOINTS_DIR / "completion"
+            if completion_dir.exists():
+                # Prefer the Chamfer Distance L1 model (ckpt-best-pcn-cd_l1.pth)
+                model_file = completion_dir / "ckpt-best-pcn-cd_l1.pth"
+                if model_file.exists():
+                    shutil.copy(str(model_file), str(filepath))
+                    logger.info(f"Successfully downloaded {model_name} to {filepath}")
+                    return filepath
+                else:
+                    logger.error(f"Downloaded folder but could not find PCN model")
+                    return None
+            else:
+                logger.error(f"Downloaded folder but could not find completion/ subdirectory")
+                return None
         else:
-            logger.error(f"Downloaded folder but could not find {filename}")
-            return None
+            # Generic lookup: look for the specified filename
+            downloaded_file = CHECKPOINTS_DIR / filename
+            if downloaded_file.exists():
+                shutil.copy(str(downloaded_file), str(filepath))
+                logger.info(f"Successfully downloaded {model_name} to {filepath}")
+                return filepath
+            else:
+                logger.error(f"Downloaded folder but could not find {filename}")
+                return None
         
     except ImportError:
         logger.error("gdown not installed; cannot download from Google Drive")
