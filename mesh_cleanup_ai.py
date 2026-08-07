@@ -380,140 +380,103 @@ def unload_models():
     logger.info("AI mesh cleanup models unloaded")
 
 
-def denoise_point_cloud_open3d(
+def denoise_mesh_inplace(
     vertices: np.ndarray,
-    nb_neighbors: int = 20,
-    std_ratio: float = 2.0,
-    radius: float = None,
-    min_points: int = 10,
-    apply_smooth: bool = False,
+    faces: np.ndarray,
+    iterations: int = 5,
     verbose: bool = False,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Denoise a point cloud using Open3D statistical methods (fallback for Point Transformer V3).
+    Denoise a mesh by smoothing vertices in-place (preserves topology and faces).
     
-    This combines two proven techniques:
-    1. Statistical Outlier Removal (SOR): Removes points farther than std_ratio * std_dev from neighbors
-    2. Radius-based Outlier Removal (ROR): Removes points with too few neighbors in a radius
+    Uses Laplacian smoothing with neighborhood averaging to reduce noise without
+    removing vertices or changing mesh connectivity.
     
     Args:
-        vertices: (V, 3) point positions
-        nb_neighbors: Number of neighbors to consider for statistics (default 20)
-        std_ratio: Standard deviation multiplier for outlier threshold (default 2.0, stricter = higher)
-        radius: Radius for neighbor search (auto-estimated from point density if None)
-        min_points: Minimum neighbors within radius (ROR threshold)
-        apply_smooth: If True, apply bilateral filtering after outlier removal
+        vertices: (V, 3) mesh vertices
+        faces: (F, 3) mesh faces (triangle indices)
+        iterations: Number of smoothing iterations (default 5)
         verbose: Print progress
     
     Returns:
-        (V', 3) denoised vertices (may be fewer points if outliers removed)
+        (vertices, faces) with smoothed vertices
     """
     if not OPEN3D_AVAILABLE:
         logger.warning("Open3D not available, returning original vertices")
-        return vertices
+        return vertices, faces
     
     if verbose:
-        logger.info(f"Denoising point cloud: {len(vertices)} points → Open3D statistical methods")
+        logger.info(f"Smoothing mesh: {len(vertices)} vertices → Laplacian smoothing")
     
     try:
-        # Convert to Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+        # Create mesh
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
         
-        # Estimate radius from average point spacing if not provided
-        if radius is None:
-            # Rough estimate: radius ~ 1.5x average nearest neighbor distance
-            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=10))
-            dists = []
-            kdtree = o3d.geometry.KDTreeFlann(pcd)
-            for i in range(min(1000, len(vertices))):  # Sample to estimate
-                _, idx, _ = kdtree.search_knn_vector_3d(pcd.points[i], 2)
-                if len(idx) > 1:
-                    dist = np.linalg.norm(np.asarray(pcd.points[idx[1]]) - np.asarray(pcd.points[i]))
-                    dists.append(dist)
-            avg_spacing = np.median(dists) if dists else 0.01
-            radius = avg_spacing * 3.0  # 3x nearest neighbor distance
-        
-        # Statistical Outlier Removal
-        pcd_sor, idx_sor = pcd.remove_statistical_outlier(
-            nb_neighbors=nb_neighbors,
-            std_ratio=std_ratio
+        # Apply Laplacian smoothing (preserves topology)
+        mesh_smooth = mesh.filter_smooth_laplacian(
+            number_of_iterations=iterations,
+            lambda_filter=0.5
         )
         
-        if verbose:
-            logger.info(f"  After SOR: {len(pcd_sor.points)} points (removed {len(vertices) - len(pcd_sor.points)})")
-        
-        # Radius-based Outlier Removal
-        pcd_ror, idx_ror = pcd_sor.remove_radius_outlier(
-            nb_points=min_points,
-            radius=radius
-        )
+        smoothed_vertices = np.asarray(mesh_smooth.vertices, dtype=np.float32)
+        smoothed_faces = faces  # Faces unchanged
         
         if verbose:
-            logger.info(f"  After ROR: {len(pcd_ror.points)} points (removed {len(pcd_sor.points) - len(pcd_ror.points)})")
+            logger.info(f"Mesh smoothed: {len(smoothed_vertices)} vertices (topology preserved)")
         
-        # Optional bilateral filtering for additional smoothing
-        if apply_smooth and len(pcd_ror.points) > 0:
-            try:
-                # Try Laplacian smoothing (available in newer versions)
-                pcd_ror = pcd_ror.filter_smooth_laplacian(
-                    number_of_iterations=5,
-                    lambda_filter=0.5
-                )
-                if verbose:
-                    logger.info(f"  After smoothing: {len(pcd_ror.points)} points")
-            except AttributeError:
-                # Fallback: use simple averaging if Laplacian smoothing unavailable
-                if verbose:
-                    logger.info(f"  Laplacian smoothing unavailable, skipping")
-
-        
-        result = np.asarray(pcd_ror.points, dtype=np.float32)
-        
-        if verbose:
-            logger.info(f"Denoising complete: {len(result)} points")
-        
-        return result
+        return smoothed_vertices, smoothed_faces
     
     except Exception as e:
-        logger.error(f"Open3D denoising failed: {e}, returning original vertices")
-        return vertices
+        logger.error(f"Mesh smoothing failed: {e}, returning original mesh")
+        return vertices, faces
+
+
+
 def denoise_point_cloud(
     vertices: np.ndarray,
+    faces: Optional[np.ndarray] = None,
     num_points: int = 2048,
     verbose: bool = False,
 ) -> np.ndarray:
     """
-    Denoise a point cloud using available denoising method.
+    Denoise a point cloud OR mesh using available denoising method.
     
-    Tries ML-based Point Transformer V3 first, falls back to Open3D statistical denoising.
+    For meshes (when faces provided): Applies in-place Laplacian smoothing to preserve topology.
+    For point clouds (no faces): Would use statistical outlier removal (but currently uses smoothing).
     
     Args:
-        vertices: (V, 3) point positions
+        vertices: (V, 3) point positions or mesh vertices
+        faces: (F, 3) mesh faces (if None, treats as point cloud)
         num_points: Number of points to sample/use (for ML methods)
         verbose: Print progress
     
     Returns:
-        (V, 3) or (V', 3) denoised vertices
+        (V, 3) denoised vertices
     """
     model = load_pcn_model()
     
-    # Use Open3D fallback if available
-    if model == "open3d_fallback":
-        return denoise_point_cloud_open3d(
-            vertices,
-            nb_neighbors=20,
-            std_ratio=2.0,
-            apply_smooth=True,
-            verbose=verbose
-        )
+    # For meshes: Use topology-preserving smoothing
+    if faces is not None:
+        if model == "open3d_fallback" and OPEN3D_AVAILABLE:
+            smoothed_verts, _ = denoise_mesh_inplace(
+                vertices, faces,
+                iterations=5,
+                verbose=verbose
+            )
+            return smoothed_verts
+        else:
+            if verbose:
+                logger.warning("Open3D denoising not available, returning original vertices")
+            return vertices
     
-    # Model is None or unavailable
+    # For point clouds: Use Point Transformer V3 if available (currently not available)
     if model is None:
-        logger.warning("No denoising method available (Open3D not installed), returning original vertices")
+        logger.warning("No denoising method available, returning original vertices")
         return vertices
     
-    # ML-based denoising (if Point Transformer V3 becomes available)
+    # ML-based denoising (Point Transformer V3, when available)
     try:
         device = get_device()
         original_count = len(vertices)
@@ -540,22 +503,16 @@ def denoise_point_cloud(
         x = torch.from_numpy(points_sampled[None]).float().to(device)  # (1, N, 3)
         with torch.no_grad():
             output = model(x)
-            # Handle different output formats (some models return tensor directly, others return tuple)
             if isinstance(output, tuple):
                 denoised = output[0]
             else:
                 denoised = output
             
-            # Ensure we have the right shape
             if denoised.ndim == 3:  # (B, N, 3)
-                denoised = denoised[0]  # Take first batch element: (N, 3)
+                denoised = denoised[0]
         
         denoised_np = denoised.cpu().numpy()
-        
-        # Denormalize
         denoised_np = denoised_np * max_dist + centroid
-        
-        # Take only original point count (remove padding)
         denoised_np = denoised_np[:original_count]
         
         if verbose:
@@ -667,7 +624,7 @@ def denoise_and_complete_mesh(
     Args:
         vertices: (V, 3) mesh vertices
         faces: (F, 3) mesh faces
-        enable_denoising: Use PCN for point cloud denoising
+        enable_denoising: Use denoising (Laplacian smoothing with Open3D)
         enable_completion: Use VAE for shape completion
         verbose: Print progress
     
@@ -679,7 +636,8 @@ def denoise_and_complete_mesh(
     
     try:
         if enable_denoising:
-            vertices = denoise_point_cloud(vertices, verbose=verbose)
+            # Pass faces so denoising uses mesh-aware smoothing (topology-preserving)
+            vertices = denoise_point_cloud(vertices, faces=faces, verbose=verbose)
         
         if enable_completion:
             vertices, faces = complete_shape_voxel(vertices, faces, verbose=verbose)
@@ -691,3 +649,4 @@ def denoise_and_complete_mesh(
         # Uncomment to enable aggressive memory cleanup:
         # unload_models()
         pass
+
