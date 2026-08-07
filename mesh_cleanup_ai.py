@@ -263,42 +263,17 @@ def load_pcn_model():
 
 
 def load_shape_vae_model():
-    """Load shape completion model (SnowflakeNet or fallback simple VAE)."""
+    """Load shape completion model (Fallback simple VAE for now; SnowflakeNet support pending)."""
     global _shape_vae_model
     if _shape_vae_model is not None:
         return _shape_vae_model
     
     device = get_device()
     
-    # Try SnowflakeNet (Snowflake Point Deconvolution) first
+    # For now, use simple voxel VAE fallback
+    # (SnowflakeNet checkpoint format requires custom architecture we don't have)
     try:
-        logger.info("Attempting to load SnowflakeNet for shape completion…")
-        config = WEIGHT_CONFIG["snowflakenet"]
-        
-        # Try to download/load SnowflakeNet weights from Google Drive
-        weight_path = _download_gdrive_weight(
-            "snowflakenet",
-            config["gdrive_folder_id"],
-            config["gdrive_model_file"]
-        )
-        
-        if weight_path and weight_path.exists():
-            try:
-                # Try to load as a pretrained model checkpoint
-                # SnowflakeNet expects a specific architecture, so this is best-effort
-                checkpoint = torch.load(weight_path, map_location=device)
-                logger.info(f"✓ SnowflakeNet weights loaded from {weight_path} (modern, MIT licensed)")
-                # Return checkpoint info for custom SnowflakeNet loading in inference
-                _shape_vae_model = checkpoint
-                return _shape_vae_model
-            except Exception as e:
-                logger.warning(f"Could not load SnowflakeNet checkpoint: {e}, using fallback VAE…")
-    except Exception as e:
-        logger.info(f"SnowflakeNet not available ({e}), falling back to simple model…")
-    
-    # Fallback: Simple voxel VAE with optional pretrained weights
-    try:
-        logger.info("Loading simple voxel VAE (fallback architecture)…")
+        logger.info("Loading simple voxel VAE for shape completion…")
         
         model = SimpleVoxelVAE(resolution=32, latent_dim=128)
         model = model.to(device)
@@ -315,14 +290,14 @@ def load_shape_vae_model():
                     model.load_state_dict(checkpoint["state_dict"])
                 else:
                     model.load_state_dict(checkpoint)
-                logger.info(f"Loaded fallback VAE weights from {weight_path}")
+                logger.info(f"Loaded Shape VAE weights from {weight_path}")
             except Exception as e:
-                logger.warning(f"Could not load fallback VAE weights, using random init: {e}")
+                logger.warning(f"Could not load Shape VAE weights, using random init: {e}")
         else:
-            logger.warning("Fallback VAE weights not available, using random initialization")
+            logger.warning("Shape VAE weights not available, using random initialization")
         
         _shape_vae_model = model
-        logger.info("✓ Simple voxel VAE ready (using random weights; consider upgrading to SnowflakeNet)")
+        logger.info("✓ Shape VAE ready for shape completion")
         
     except Exception as e:
         logger.error(f"Failed to load Shape VAE model: {e}")
@@ -427,6 +402,7 @@ def denoise_point_cloud(
     
     try:
         device = get_device()
+        original_count = len(vertices)
         
         # Normalize points to [-1, 1]
         centroid = vertices.mean(axis=0)
@@ -449,15 +425,24 @@ def denoise_point_cloud(
         # Inference
         x = torch.from_numpy(points_sampled[None]).float().to(device)  # (1, N, 3)
         with torch.no_grad():
-            denoised = model(x)[0]  # (1, N, 3) → (N, 3)
+            output = model(x)
+            # Handle different output formats (some models return tensor directly, others return tuple)
+            if isinstance(output, tuple):
+                denoised = output[0]
+            else:
+                denoised = output
+            
+            # Ensure we have the right shape
+            if denoised.ndim == 3:  # (B, N, 3)
+                denoised = denoised[0]  # Take first batch element: (N, 3)
         
-        denoised_np = denoised[0].cpu().numpy()
+        denoised_np = denoised.cpu().numpy()
         
         # Denormalize
         denoised_np = denoised_np * max_dist + centroid
         
-        # Take only non-padding points
-        denoised_np = denoised_np[:len(vertices)]
+        # Take only original point count (remove padding)
+        denoised_np = denoised_np[:original_count]
         
         if verbose:
             logger.info(f"Point cloud denoised: {len(vertices)} points")
@@ -503,35 +488,47 @@ def complete_shape_voxel(
         # Inference through VAE
         x = torch.from_numpy(voxel_grid[None, None]).to(device)  # (1, 1, R, R, R)
         with torch.no_grad():
-            recon, _, _ = model(x)
+            output = model(x)
+            if isinstance(output, tuple):
+                recon = output[0]  # (B, 1, R, R, R)
+            else:
+                recon = output
         
         recon_np = recon[0, 0].cpu().numpy()  # (R, R, R)
         
         # Threshold and convert back to mesh
         recon_np = (recon_np > 0.5).astype(np.uint8)
         
-        # Simple marching cubes
+        # Simple marching cubes to extract surface
         try:
             from skimage import measure
-            vertices_new = []
-            faces_new = []
             
-            # Threshold and extract surface
-            threshold = 0.5
+            # Extract isosurface using marching cubes
             verts, faces_mc, _, _ = measure.marching_cubes(
-                recon_np, level=threshold
+                recon_np, level=0.5
             )
             
-            # Normalize back to original scale
+            if len(verts) == 0:
+                logger.warning("Marching cubes produced empty mesh, returning original")
+                return vertices, faces
+            
+            # Normalize verts back to original coordinate frame
+            # Voxel coords [0, R] -> normalize to [-1, 1] -> scale to original bbox
             verts = verts / resolution * 2 - 1
-            bbox = vertices.max(axis=0) - vertices.min(axis=0)
+            
+            # Get original mesh bounds
             center = vertices.mean(axis=0)
-            verts = verts * (bbox / 2) + center
+            bbox = vertices.max(axis=0) - vertices.min(axis=0)
+            max_extent = np.max(bbox)
+            
+            # Scale verts to match original extent
+            verts = verts * (max_extent / 2) + center
             
             if verbose:
-                logger.info(f"Shape completed: {len(verts)} vertices, {len(faces_mc)} faces")
+                logger.info(f"Shape completed: {len(verts)} vertices, {len(faces_mc)} faces (from {len(vertices)} original)")
             
             return verts, faces_mc
+        
         except Exception as e:
             logger.warning(f"Marching cubes failed: {e}, returning original mesh")
             return vertices, faces
