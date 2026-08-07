@@ -53,6 +53,8 @@ CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 _pcn_model = None
 _shape_vae_model = None
 _device = None
+_pcn_load_attempted = False  # Track if we've already tried to load PCN
+_vae_load_attempted = False  # Track if we've already tried to load VAE
 
 
 def get_device():
@@ -201,77 +203,64 @@ class SimplePointDenoiser(torch.nn.Module):
 
 
 def load_pcn_model():
-    """Load point cloud denoising model (Point Transformer V3 or fallback simple model)."""
-    global _pcn_model
-    if _pcn_model is not None:
-        return _pcn_model
+    """Load point cloud denoising model.
     
-    device = get_device()
+    NOTE: Point cloud denoising is NOT functional in this build because:
+    - Point Transformer V3 from HuggingFace doesn't have a transformers-compatible config
+    - SimplePointDenoiser fallback has no trained weights available
     
-    # Try Point Transformer V3 from HuggingFace first
-    try:
-        logger.info("Attempting to load Point Transformer V3 for point cloud denoising…")
-        try:
-            from transformers import AutoModel
-            model_id = WEIGHT_CONFIG["point_transformer_v3"]["model"]
-            model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
-            model = model.to(device)
-            model.eval()
-            _pcn_model = model
-            logger.info("✓ Point Transformer V3 loaded successfully (modern, MIT licensed)")
-            return _pcn_model
-        except ImportError:
-            logger.info("transformers not installed, using fallback simple model…")
-    except Exception as e:
-        logger.info(f"Point Transformer V3 not available ({e}), falling back to simple model…")
+    Returns None to disable denoising gracefully.
+    """
+    global _pcn_model, _pcn_load_attempted
     
-    # Fallback: Simple point denoiser with optional pretrained weights
-    try:
-        logger.info("Loading simple point denoiser (fallback architecture)…")
-        
-        model = SimplePointDenoiser(num_points=2048)
-        model = model.to(device)
-        model.eval()
-        
-        # Try to load fallback weights if available
-        config = WEIGHT_CONFIG["simple_pcn_fallback"]
-        weight_path = _download_weight("pcn_fallback", config["url"])
-        
-        if weight_path and weight_path.exists():
-            try:
-                checkpoint = torch.load(weight_path, map_location=device)
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["state_dict"])
-                else:
-                    model.load_state_dict(checkpoint)
-                logger.info(f"Loaded fallback PCN weights from {weight_path}")
-            except Exception as e:
-                logger.warning(f"Could not load fallback PCN weights, using random init: {e}")
-        else:
-            logger.warning("Fallback PCN weights not available, using random initialization")
-        
-        _pcn_model = model
-        logger.info("✓ Simple point denoiser ready (using random weights; consider upgrading to Point Transformer V3)")
-        
-    except Exception as e:
-        logger.error(f"Failed to load PCN model: {e}")
-        _pcn_model = None
+    if _pcn_load_attempted:
+        return _pcn_model  # Return cached result (None)
     
-    return _pcn_model
+    _pcn_load_attempted = True
+    logger.warning("⚠ Point cloud denoising is disabled: no trained models available")
+    logger.warning("  - Point Transformer V3: Not compatible with transformers.AutoModel")
+    logger.warning("  - SimplePointDenoiser: No trained weights")
+    logger.warning("  To enable denoising, provide trained weights for PCN models")
+    
+    _pcn_model = None
+    return None
 
 
 
 
 def load_shape_vae_model():
-    """Load shape completion model (Fallback simple VAE for now; SnowflakeNet support pending)."""
-    global _shape_vae_model
-    if _shape_vae_model is not None:
-        return _shape_vae_model
+    """Load shape completion model.
     
+    Attempts to load SnowflakeNet (modern point cloud deconvolution with skip-transformer).
+    Falls back to SimpleVoxelVAE if SnowflakeNet unavailable.
+    """
+    global _shape_vae_model, _vae_load_attempted
+    
+    if _vae_load_attempted:
+        return _shape_vae_model  # Return cached result
+    
+    _vae_load_attempted = True
     device = get_device()
+    snowflakenet_path = CHECKPOINTS_DIR / "snowflakenet_model.pt"
     
-    # For now, use simple voxel VAE fallback
-    # (SnowflakeNet checkpoint format requires custom architecture we don't have)
+    # Try SnowflakeNet first if weights exist
+    if snowflakenet_path.exists():
+        try:
+            logger.info(f"Loading SnowflakeNet from {snowflakenet_path}…")
+            checkpoint = torch.load(snowflakenet_path, map_location=device)
+            
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
+                logger.info("✓ SnowflakeNet checkpoint loaded successfully")
+                logger.info("  SnowflakeNet: Point cloud deconvolution with skip-transformer (ICCV 2021, TPAMI 2023)")
+                _shape_vae_model = checkpoint
+                return _shape_vae_model
+        except Exception as e:
+            logger.warning(f"Could not load SnowflakeNet checkpoint: {e}")
+            logger.info("Falling back to SimpleVoxelVAE…")
+    else:
+        logger.info("SnowflakeNet checkpoint not found, using SimpleVoxelVAE fallback…")
+    
+    # Fallback to SimpleVoxelVAE
     try:
         logger.info("Loading simple voxel VAE for shape completion…")
         
@@ -285,11 +274,11 @@ def load_shape_vae_model():
         
         if weight_path and weight_path.exists():
             try:
-                checkpoint = torch.load(weight_path, map_location=device)
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["state_dict"])
+                ckpt = torch.load(weight_path, map_location=device)
+                if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                    model.load_state_dict(ckpt["state_dict"])
                 else:
-                    model.load_state_dict(checkpoint)
+                    model.load_state_dict(ckpt)
                 logger.info(f"Loaded Shape VAE weights from {weight_path}")
             except Exception as e:
                 logger.warning(f"Could not load Shape VAE weights, using random init: {e}")
@@ -297,7 +286,7 @@ def load_shape_vae_model():
             logger.warning("Shape VAE weights not available, using random initialization")
         
         _shape_vae_model = model
-        logger.info("✓ Shape VAE ready for shape completion")
+        logger.info("✓ Shape VAE ready for shape completion (random initialization)")
         
     except Exception as e:
         logger.error(f"Failed to load Shape VAE model: {e}")
