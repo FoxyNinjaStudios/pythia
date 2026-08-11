@@ -9,14 +9,13 @@
 <script type="importmap">
 {
   "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    "three": "/static/vendor/three/three.module.js",
+    "three/addons/": "/static/vendor/three/addons/"
   }
 }
 </script>
-<script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
-      integrity="sha512-DTOQO9RWCH3ppGqcWaEA1BIZOC6xxalwEsw9c2QQeAIftl+Vegovlnee1c9QX4TctnWMn13TZye+giMm8e2LwA==" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+<script type="module" src="/static/vendor/model-viewer/model-viewer.min.js"></script>
+<link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css"/>
 
 <style>
 
@@ -1087,19 +1086,25 @@ if (document.readyState === 'loading') {
       </div>
 
       <div class="tool-group">
-        <h3>Functional parts</h3>
-        <p class="tool-hint">Split the model into separate named objects (e.g. tyres / glass / body, cushion / frame) by <b>color</b> - the most reliable cue - so downstream tools can recolor and texture each part on its own. Runs on the server and downloads a multi-object GLB with the same accurate per-vertex color as the single-file download. Does not change the model above.</p>
+        <h3>Segment by color</h3>
+        <p class="tool-hint">Cluster the model's colors into distinct groups and export each color as a <b>separate object</b>. Use <b>3MF</b> for multi-material 3D printing - each color becomes its own part you can assign a filament to - or <b>GLB</b> where each colored segment is an individual mesh object. Runs on the server; does not change the model above.</p>
         <div class="opt-row">
-          <label for="opt-parts-density">Parts</label>
-          <select id="opt-parts-density">
+          <label for="opt-seg-colors">Colors</label>
+          <select id="opt-seg-colors">
+            <option value="0" selected>Auto (detect)</option>
+            <option value="2">2 colors</option>
             <option value="3">3 colors</option>
             <option value="4">4 colors</option>
-            <option value="6" selected>6 colors</option>
+            <option value="5">5 colors</option>
+            <option value="6">6 colors</option>
             <option value="8">8 colors</option>
             <option value="10">10 colors</option>
+            <option value="12">12 colors</option>
+            <option value="16">16 colors</option>
           </select>
         </div>
-        <div id="parts-list"></div>
+        <div id="seg-list"></div>
+        <div id="seg-status" class="tune-status"></div>
       </div>
     </div>
   </aside>
@@ -3874,6 +3879,7 @@ function estBytes(fmt, T, nvIndexed, tex) {
     case "ply":  return 320 + nvIndexed * 27 + T * 13;             // pos+normal+color verts + faces
     case "obj":  return 40 + nvIndexed * 50 + T * 20;              // v / vn / f text lines
     case "stl":  return 84 + T * 50;                               // exact binary STL
+    case "3mf":  return Math.round((1000 + nvIndexed * 48 + T * 36) * 0.65); // XML + ZIP compression (~65%)
     default:     return 0;
   }
 }
@@ -3928,6 +3934,7 @@ function onExportOpt() {
   if (counts) counts.textContent =
     `≈ ${Math.round(v0 * keep).toLocaleString()} verts · ${T.toLocaleString()} faces`;
   const tex = estTextureBytes(T);
+  
   for (const fmt of EXPORT_FORMATS) {
     const el = $("size-" + fmt.id);
     if (el) el.textContent = "~" + fmtBytes(estBytes(fmt, T, nvIndexed, fmt.bake ? tex : 0));
@@ -3956,31 +3963,42 @@ function renderFormatList() {
   }
 }
 
-function renderPartsCard() {
-  const host = $("parts-list");
+function renderSegmentCards() {
+  const host = $("seg-list");
   if (!host) return;
   host.innerHTML = "";
-  const card = document.createElement("div");
-  card.className = "fmt-card";
-  card.id = "fmt-parts";
-  card.onclick = () => runSegmentParts();
-  card.innerHTML =
-    `<div class="fmt-meta"><span class="fmt-name">Segment parts</span>` +
-    `<span class="fmt-ext">.glb</span></div>` +
-    `<span class="fmt-size" id="size-parts">multi-object</span>`;
-  host.appendChild(card);
+  const cards = [
+    { id: "seg-3mf", name: "3MF (separate colors)", ext: "3mf", size: "multi-material", fn: runSegment3MF },
+    { id: "seg-glb", name: "GLB (color objects)",   ext: "glb", size: "multi-object",   fn: runSegmentGLB },
+  ];
+  for (const c of cards) {
+    const card = document.createElement("div");
+    card.className = "fmt-card";
+    card.id = "fmt-" + c.id;
+    card.onclick = c.fn;
+    card.innerHTML =
+      `<div class="fmt-meta"><span class="fmt-name">${c.name}</span>` +
+      `<span class="fmt-ext">.${c.ext}</span></div>` +
+      `<span class="fmt-size" id="size-${c.id}">${c.size}</span>`;
+    host.appendChild(card);
+  }
 }
 
-// Server-side post-processing: split the reconstructed mesh into functional
-// parts (named GLB objects) and download the result. Independent of the
-// client-side format exports above; leaves the previewed model untouched.
-async function runSegmentParts() {
+// Shared color count for both the 3MF and GLB color-segmentation exports.
+function segColorCount() {
+  const el = $("opt-seg-colors");
+  return (el && el.value) || "0";
+}
+
+// Server-side color segmentation → multi-object GLB (one object per color).
+// Runs on the stored reconstruction; leaves the previewed model untouched.
+async function runSegmentGLB() {
   if (!resultJobId) return;
-  const card = $("fmt-parts"), sizeEl = $("size-parts"), status = $("export-status");
-  const nColors = ($("opt-parts-density") && $("opt-parts-density").value) || "6";
+  const card = $("fmt-seg-glb"), sizeEl = $("size-seg-glb"), status = $("seg-status");
+  const nColors = segColorCount();
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
-  setExportProgress(15, "Segmenting parts by color…");
+  setExportProgress(15, "Segmenting colors…");
   try {
     const res = await fetch(
       `/segment_parts/${resultJobId}?n_colors=${nColors}`,
@@ -3997,10 +4015,40 @@ async function runSegmentParts() {
     setExportProgress(100, "Done");
     saveBlob(blob, "reconstruction_parts.glb");
     if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
-    if (status) status.textContent = `Saved ${info.parts} part${info.parts === 1 ? "" : "s"} · ${fmtBytes(blob.size)}`;
+    if (status) status.textContent = `Saved ${info.parts} color object${info.parts === 1 ? "" : "s"} · ${fmtBytes(blob.size)}`;
   } catch (e) {
     console.error(e);
-    if (status) status.textContent = "Part segmentation failed: " + (e.message || e);
+    if (status) status.textContent = "GLB segmentation failed: " + (e.message || e);
+  } finally {
+    if (card) card.classList.remove("busy");
+    setTimeout(() => setExportProgress(null), 900);
+  }
+}
+
+// Server-side color segmentation → 3MF with one object per color for
+// multi-material printing (each color is a separate, filament-assignable part).
+async function runSegment3MF() {
+  if (!resultJobId) return;
+  const card = $("fmt-seg-3mf"), sizeEl = $("size-seg-3mf"), status = $("seg-status");
+  const nColors = segColorCount();
+  if (card) card.classList.add("busy");
+  if (status) status.textContent = "";
+  setExportProgress(15, "Segmenting colors for 3MF…");
+  try {
+    const resp = await fetch(`/result/${resultJobId}?format=3mf&num_colors=${nColors}`);
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => resp.statusText);
+      throw new Error(msg || `HTTP ${resp.status}`);
+    }
+    setExportProgress(90, "Downloading…");
+    const blob = await resp.blob();
+    setExportProgress(100, "Done");
+    saveBlob(blob, "reconstruction.3mf");
+    if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
+    if (status) status.textContent = `Saved 3MF · ${fmtBytes(blob.size)}`;
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = "3MF export failed: " + (e.message || e);
   } finally {
     if (card) card.classList.remove("busy");
     setTimeout(() => setExportProgress(null), 900);
@@ -4013,7 +4061,7 @@ function openExport() {
   $("export-sidebar").classList.add("open");
   $("export-sidebar").setAttribute("aria-hidden", "false");
   renderFormatList();
-  renderPartsCard();
+  renderSegmentCards();
   onExportOpt();
 }
 function closeExport() {

@@ -277,8 +277,9 @@ and update the 3D preview live:
 
 ### Export & optimization (web UI)
 
-- **Six formats:** `GLB`, `glTF` (embedded), `USDZ` (AR), `PLY`, `OBJ`, `STL`,
+- **Seven formats:** `GLB`, `glTF` (embedded), `USDZ` (AR), `PLY`, `OBJ`, `STL`, `3MF` (multi-color 3D printing),
   each with a **live file-size estimate** that reacts to the options below.
+- **3MF Multi-color Export.** Export with **per-vertex color quantization** for 3D printing with full-color filament changers (AMS, MMU3, etc.). Native **3MF format** includes embedded color metadata; compressed 35% smaller than raw mesh data. **Color palette:** Adjust quantization from 2–256 distinct colors (typical 8–32 for FDM printers). **Use case:** Multi-material printing in Cura, Prusa Slicer, or Bambu Studio; supports full RGB color mapping onto a single mesh.
 - **Simplify mesh.** In-browser **meshoptimizer** decimation (0–90%) that is
   reliable on million-triangle meshes.
 - **Bake texture** (on by default). On: color is baked into a `baseColorTexture`
@@ -332,8 +333,8 @@ leaves an orphaned process holding the port.
 
 Workflow: upload an image, segment the object, pick a quality preset,
 reconstruct, then orbit the result, tune it (mesh cleanup, color grading,
-stencil trimming), and download in any of six formats (**GLB**, **glTF**,
-**USDZ**, **PLY**, **OBJ**, **STL**).
+stencil trimming), and download in any of seven formats (**GLB**, **glTF**,
+**USDZ**, **PLY**, **OBJ**, **STL**, **3MF**).
 
 The **Models** panel (top-right) reports the download / load status of the
 models and can fetch any that are missing - including pasting a Hugging Face

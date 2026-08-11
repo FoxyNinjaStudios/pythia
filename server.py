@@ -1178,6 +1178,8 @@ async def depth(req: DepthRequest):
     return {"depth_b64": depth_b64}
 
 
+# ── Segmented GLB export (simple colored plane from mask) ──────────────────────
+
 # ── Reconstruct ────────────────────────────────────────────────────────────────
 
 @app.post("/reconstruct")
@@ -1414,7 +1416,7 @@ async def log_stream():
 # ── Result download ────────────────────────────────────────────────────────────
 
 @app.api_route("/result/{job_id}", methods=["GET", "HEAD"])
-async def get_result(job_id: str, format: str = "glb"):
+async def get_result(job_id: str, format: str = "glb", num_colors: int = 16):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
     job = jobs[job_id]
@@ -1422,7 +1424,49 @@ async def get_result(job_id: str, format: str = "glb"):
         raise HTTPException(202, "Not ready yet")
     if job.error:
         raise HTTPException(500, job.error)
+    
     fmt_raw = str(format).lower()
+    
+    # 3MF export: split the mesh into one object per colour for multi-material
+    # printing (each colour becomes a separate, filament-assignable part).
+    if fmt_raw == "3mf":
+        try:
+            from export_3mf import export_3mf_separated_by_color
+            import trimesh
+            
+            # Load the stored GLB mesh
+            glb_path = Path(job.result_path)
+            loaded = trimesh.load(str(glb_path), process=False)
+            
+            # Handle Scene vs Mesh: if it's a scene, extract and merge meshes
+            if isinstance(loaded, trimesh.Scene):
+                meshes = [g for g in loaded.geometry.values()]
+                if len(meshes) == 1:
+                    mesh = meshes[0]
+                else:
+                    mesh = trimesh.util.concatenate(meshes)
+            else:
+                mesh = loaded
+            
+            # Export as 3MF with one object per colour cluster.
+            # num_colors <= 0 means auto-detect the number of colours.
+            num_colors = 0 if int(num_colors) <= 0 else max(2, min(256, num_colors))
+            output_path = glb_path.with_suffix(".3mf")
+            
+            if export_3mf_separated_by_color(mesh, str(output_path), num_colors=num_colors, verbose=True):
+                raw = output_path.read_bytes()
+                return Response(
+                    content=raw,
+                    media_type="model/vnd.ms-package.3dmodel+xml",
+                    headers={"Content-Disposition": 'attachment; filename="reconstruction.3mf"'},
+                )
+            else:
+                raise HTTPException(500, "3MF export failed")
+        except Exception as exc:
+            logger.error(f"[JOB {job_id}] 3MF export failed: {exc}")
+            raise HTTPException(500, f"3MF export failed: {exc}")
+    
+    # Standard formats: PLY, GLB
     fmt = "ply" if fmt_raw == "ply" else "glb"
     path = Path(job.result_path).with_suffix(f".{fmt}")
     if not path.exists():
@@ -1481,7 +1525,7 @@ async def segment_parts(
             job.result_path,
             job.img_path,
             job.mask_path,
-            max(2, min(int(n_colors), 16)),
+            0 if int(n_colors) <= 0 else max(2, min(int(n_colors), 16)),
             bool(bake),
             max(256, min(int(texture_size), 4096)),
         )

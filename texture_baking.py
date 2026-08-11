@@ -984,6 +984,88 @@ def bake_mesh_texture(
     )
 
 
+def bake_vertex_color_texture(
+    trimesh_obj: trimesh.Trimesh,
+    texture_size: int = 1024,
+) -> trimesh.Trimesh:
+    """
+    Bake a UV texture atlas **purely from the mesh's own per-vertex colours**.
+
+    Unlike :func:`bake_mesh_texture`, no input photo is projected: the atlas is
+    filled by barycentric-interpolating the reconstructed mesh's ``COLOR_0``
+    per-vertex colours. Every texel — front, back, sides, underside — therefore
+    shows the generated-mesh colour and nothing from the source image.
+
+    Returns a ``trimesh.Trimesh`` with UVs and a matte PBR material whose
+    ``baseColorTexture`` is the baked atlas. Raises if the mesh has no per-vertex
+    colours (the caller should fall back to a solid material).
+    """
+    vertices = np.asarray(trimesh_obj.vertices, dtype=np.float32)
+    faces    = np.asarray(trimesh_obj.faces,    dtype=np.int32)
+
+    try:
+        vcol = np.asarray(trimesh_obj.visual.vertex_colors, dtype=np.float32)[:, :3]
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"mesh has no per-vertex colours to bake: {exc}")
+    if len(vcol) != len(vertices):
+        raise ValueError("per-vertex colour count does not match vertex count")
+
+    print(f"[TEXTURE] Vertex-colour atlas bake ({len(vertices)} verts, "
+          f"{len(faces)} faces, no image)...")
+
+    # UV-unwrap; expand vertices/colours along UV seams via the vertex mapping.
+    vmapping, faces_uv, uvs = xatlas.parametrize(vertices, faces)
+    vertices_uv = vertices[vmapping].astype(np.float32)
+    vertex_colors = vcol[vmapping].astype(np.float32)
+    faces_uv = faces_uv.astype(np.int64)
+    uvs = uvs.astype(np.float32)
+
+    # Rasterize the UV charts and fill each texel from the interpolated colours.
+    device = torch.device("cpu")
+    pix_to_face, bary_coords = _rasterize_uv_space(uvs, faces_uv, texture_size, device)
+    valid = pix_to_face >= 0
+
+    texture_np = np.full((texture_size, texture_size, 3), 128, dtype=np.float32)
+    if valid.any():
+        fids = pix_to_face[valid].numpy()
+        bary = bary_coords[valid].numpy()
+        face_vert_colors = vertex_colors[faces_uv[fids]]          # (N, 3, 3)
+        texel_colors = (bary[:, :, None] * face_vert_colors).sum(axis=1)
+        ys, xs = np.where(valid.numpy())
+        texture_np[ys, xs] = texel_colors
+    texture_np = np.clip(texture_np, 0, 255).astype(np.uint8)
+
+    # Pad UV-island borders then inpaint the remaining gutter (same as the image
+    # baker) so bilinear filtering does not bleed the grey background inward.
+    from scipy.ndimage import distance_transform_edt
+    valid_np = valid.numpy()
+    if valid_np.any() and (~valid_np).any():
+        dist, (iy, ix) = distance_transform_edt(
+            ~valid_np, return_distances=True, return_indices=True,
+        )
+        PAD_BAND = 6
+        grow = (~valid_np) & (dist <= PAD_BAND)
+        texture_np[grow] = texture_np[iy[grow], ix[grow]]
+        inpaint_mask = ((~valid_np) & (dist > PAD_BAND)).astype(np.uint8)
+    else:
+        inpaint_mask = (~valid_np).astype(np.uint8)
+    if inpaint_mask.any():
+        texture_np = cv2.inpaint(texture_np, inpaint_mask, 8, cv2.INPAINT_TELEA)
+
+    material = trimesh.visual.material.PBRMaterial(
+        roughnessFactor=1.0,
+        metallicFactor=0.0,
+        baseColorTexture=PILImage.fromarray(texture_np),
+        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+    )
+    return trimesh.Trimesh(
+        vertices=vertices_uv,
+        faces=faces_uv,
+        visual=trimesh.visual.TextureVisuals(uv=uvs, material=material),
+        process=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GLB export with metallicFactor patch
 # ---------------------------------------------------------------------------
