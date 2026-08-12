@@ -23,6 +23,7 @@ No CUDA, nvdiffrast, or Gaussian splatting required.
 from __future__ import annotations
 
 import json
+import math
 import struct
 import numpy as np
 import cv2
@@ -999,9 +1000,21 @@ def bake_vertex_color_texture(
     Returns a ``trimesh.Trimesh`` with UVs and a matte PBR material whose
     ``baseColorTexture`` is the baked atlas. Raises if the mesh has no per-vertex
     colours (the caller should fall back to a solid material).
+
+    **Grid-atlas bake (seam-free).** Instead of a real UV unwrap (xatlas), which
+    fragments the surface into hundreds of tiny charts that pack front/back faces
+    side by side and then bleed grey across the gutters under mipmap/bilinear
+    minification (the speckle), this lays out ONE flat square cell per triangle
+    in a regular grid. Each cell is filled with a single colour — the average of
+    its triangle's three vertex colours — and all three of the triangle's UVs
+    point at the cell CENTRE. Because every texel a triangle can sample is the
+    same colour, there are no seams, no gutters and nothing to bleed: the result
+    is exactly as clean as the in-viewer per-vertex colour, in every viewer
+    (including macOS Quick Look / USDZ). This mirrors the proven client-side
+    ``bakeVertexColorTexture`` grid bake.
     """
     vertices = np.asarray(trimesh_obj.vertices, dtype=np.float32)
-    faces    = np.asarray(trimesh_obj.faces,    dtype=np.int32)
+    faces    = np.asarray(trimesh_obj.faces,    dtype=np.int64)
 
     try:
         vcol = np.asarray(trimesh_obj.visual.vertex_colors, dtype=np.float32)[:, :3]
@@ -1010,47 +1023,51 @@ def bake_vertex_color_texture(
     if len(vcol) != len(vertices):
         raise ValueError("per-vertex colour count does not match vertex count")
 
-    print(f"[TEXTURE] Vertex-colour atlas bake ({len(vertices)} verts, "
-          f"{len(faces)} faces, no image)...")
+    n_tri = len(faces)
+    if n_tri == 0:
+        raise ValueError("mesh has no faces to bake")
 
-    # UV-unwrap; expand vertices/colours along UV seams via the vertex mapping.
-    vmapping, faces_uv, uvs = xatlas.parametrize(vertices, faces)
-    vertices_uv = vertices[vmapping].astype(np.float32)
-    vertex_colors = vcol[vmapping].astype(np.float32)
-    faces_uv = faces_uv.astype(np.int64)
-    uvs = uvs.astype(np.float32)
+    print(f"[TEXTURE] Vertex-colour grid-atlas bake ({len(vertices)} verts, "
+          f"{n_tri} faces, no image)...")
 
-    # Rasterize the UV charts and fill each texel from the interpolated colours.
-    device = torch.device("cpu")
-    pix_to_face, bary_coords = _rasterize_uv_space(uvs, faces_uv, texture_size, device)
-    valid = pix_to_face >= 0
+    # One flat square cell per triangle. The atlas edge tracks the requested
+    # texture size (minimum 2 px/cell so bilinear sampling at the cell centre
+    # never straddles a neighbouring cell).
+    cols = int(math.ceil(math.sqrt(n_tri)))
+    rows = int(math.ceil(n_tri / cols))
+    cell = max(2, texture_size // max(cols, rows))
+    tex_w, tex_h = cols * cell, rows * cell
 
-    texture_np = np.full((texture_size, texture_size, 3), 128, dtype=np.float32)
-    if valid.any():
-        fids = pix_to_face[valid].numpy()
-        bary = bary_coords[valid].numpy()
-        face_vert_colors = vertex_colors[faces_uv[fids]]          # (N, 3, 3)
-        texel_colors = (bary[:, :, None] * face_vert_colors).sum(axis=1)
-        ys, xs = np.where(valid.numpy())
-        texture_np[ys, xs] = texel_colors
-    texture_np = np.clip(texture_np, 0, 255).astype(np.uint8)
+    # Per-vertex COLOR_0 is stored linear (glTF spec); the baked baseColorTexture
+    # is sampled as sRGB. Encode linear→sRGB so the texture decodes back to the
+    # exact colour the per-vertex path renders in the viewer.
+    def _lin_to_srgb(c: np.ndarray) -> np.ndarray:
+        c = np.clip(c, 0.0, 1.0)
+        return np.where(c <= 0.0031308, c * 12.92,
+                        1.055 * np.power(c, 1.0 / 2.4) - 0.055)
 
-    # Pad UV-island borders then inpaint the remaining gutter (same as the image
-    # baker) so bilinear filtering does not bleed the grey background inward.
-    from scipy.ndimage import distance_transform_edt
-    valid_np = valid.numpy()
-    if valid_np.any() and (~valid_np).any():
-        dist, (iy, ix) = distance_transform_edt(
-            ~valid_np, return_distances=True, return_indices=True,
-        )
-        PAD_BAND = 6
-        grow = (~valid_np) & (dist <= PAD_BAND)
-        texture_np[grow] = texture_np[iy[grow], ix[grow]]
-        inpaint_mask = ((~valid_np) & (dist > PAD_BAND)).astype(np.uint8)
-    else:
-        inpaint_mask = (~valid_np).astype(np.uint8)
-    if inpaint_mask.any():
-        texture_np = cv2.inpaint(texture_np, inpaint_mask, 8, cv2.INPAINT_TELEA)
+    tri_lin = vcol[faces].mean(axis=1) / 255.0                 # (T, 3) 0-1 linear
+    flat = np.clip(_lin_to_srgb(tri_lin) * 255.0, 0, 255).astype(np.uint8)  # (T,3)
+
+    # Paint each triangle's cell. Row 0 is the TOP of the image.
+    texture_np = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
+    tri = np.arange(n_tri)
+    col_idx = tri % cols
+    row_idx = tri // cols
+    for t in range(n_tri):
+        y0 = row_idx[t] * cell
+        x0 = col_idx[t] * cell
+        texture_np[y0:y0 + cell, x0:x0 + cell] = flat[t]
+
+    # Non-indexed mesh: 3 unique verts per triangle, each carrying the same UV
+    # (its cell centre). trimesh flips V on GLB export (V-up → glTF V-down), so
+    # store v measured from the BOTTOM: 1 - (row+0.5)/rows.
+    vertices_uv = vertices[faces].reshape(-1, 3).astype(np.float32)
+    faces_uv = np.arange(n_tri * 3, dtype=np.int64).reshape(n_tri, 3)
+    u_c = (col_idx + 0.5) / cols
+    v_c = 1.0 - (row_idx + 0.5) / rows
+    uv_tri = np.stack([u_c, v_c], axis=1).astype(np.float32)   # (T, 2)
+    uvs = np.repeat(uv_tri, 3, axis=0)                         # (T*3, 2)
 
     material = trimesh.visual.material.PBRMaterial(
         roughnessFactor=1.0,

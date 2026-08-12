@@ -183,6 +183,9 @@ _default_stage2_mps = False
 _refine_text_mask_enabled = False
 # Disable client-side console logging
 _disable_client_logs = False
+# Enable AI part naming via the SmolVLM2 VLM (opt-in; off by default because the
+# small VLM's labels are unreliable and it adds a multi-GB download + load).
+_ai_part_names_enabled = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +209,9 @@ class JobState:
         # part segmentation) can be run on demand after reconstruction finishes.
         self.img_path: Optional[str] = None
         self.mask_path: Optional[str] = None
+        # Object concept (e.g. "chair") captured from the last part-segmentation
+        # request; drives the parts download filename and functional part names.
+        self.label: Optional[str] = None
         self._queues: List[asyncio.Queue] = []
         # Live memory tracking (for the RAM graph). mem_series is the full
         # history so a late subscriber can still redraw the whole curve.
@@ -374,6 +380,12 @@ def _shutdown_cleanup() -> None:
     except Exception:
         pass
     try:
+        # Drop the Moondream2 part-naming VLM if it is still resident.
+        import vlm_labeler
+        vlm_labeler.unload()
+    except Exception:
+        pass
+    try:
         # Clean up AI mesh cleanup models
         if ai_mesh_cleanup_manager:
             ai_mesh_cleanup_manager.cleanup_ai_on_shutdown()
@@ -435,10 +447,18 @@ async def root():
     # Also hide the console card if logs are disabled
     inject_script = f"""<script>
 window.DISABLE_CLIENT_LOGS = {str(_disable_client_logs).lower()};
+window.AI_PART_NAMES = {str(_ai_part_names_enabled).lower()};
 if (window.DISABLE_CLIENT_LOGS) {{
   document.addEventListener('DOMContentLoaded', function() {{
     const consoleCard = document.getElementById('console-card');
     if (consoleCard) consoleCard.style.display = 'none';
+  }});
+}}
+if (!window.AI_PART_NAMES) {{
+  document.addEventListener('DOMContentLoaded', function() {{
+    // Hide the "AI part names" checkbox row when the VLM feature is off.
+    const cb = document.getElementById('opt-seg-ai-names');
+    if (cb) {{ const row = cb.closest('.opt-row'); if (row) row.style.display = 'none'; }}
   }});
 }}
 </script>"""
@@ -474,19 +494,28 @@ _hf_token = None         # HF token kept in memory only, never written to disk
 
 # Per-model download source. ``gated`` marks repos that need Meta approval.
 # ``dl_bytes`` is the approximate total transfer size, shown in the progress label.
+# ``required`` marks the models the core photo→3-D pipeline cannot run without
+# (segmentation, reconstruction, depth, features); everything else is an optional
+# enhancement (AI part naming, AI mesh cleanup) the pipeline runs fine without.
 _MODEL_META = {
-    "sam2":  {"repo": None,                      "gated": False, "dl_bytes": 898_000_000},
-    "sam3":  {"repo": "facebook/sam3",           "gated": True,  "dl_bytes": 3_400_000_000},
-    "sam3d": {"repo": "facebook/sam-3d-objects", "gated": True,  "dl_bytes": 13_106_000_000},
-    "moge":  {"repo": "Ruicheng/moge-vitl",      "gated": False, "dl_bytes": 1_340_000_000},
+    "sam2":  {"repo": None,                      "gated": False, "dl_bytes": 898_000_000,     "required": True},
+    "sam3":  {"repo": "facebook/sam3",           "gated": True,  "dl_bytes": 3_400_000_000,   "required": True},
+    "sam3d": {"repo": "facebook/sam-3d-objects", "gated": True,  "dl_bytes": 13_106_000_000,  "required": True},
+    "moge":  {"repo": "Ruicheng/moge-vitl",      "gated": False, "dl_bytes": 1_340_000_000,   "required": True},
     # DINOv2 ViT-L/14 (with registers) – image feature backbone used inside the
     # reconstruction generators. Not an HF repo: it is fetched from torch.hub
     # (facebookresearch/dinov2 code + the reg4 pretrained weights).
-    "dino":  {"repo": None,                      "gated": False, "dl_bytes": 1_217_607_321},
+    "dino":  {"repo": None,                      "gated": False, "dl_bytes": 1_217_607_321,   "required": True},
+    # Moondream2 – small open (Apache-2.0) vision-language model used to name
+    # segmented parts from a render (see vlm_labeler.py). Public repo, no token.
+    # Native transformers model (no remote code); ~4.5 GB of safetensors.
+    # (Replaces Moondream2, whose pinned build is broken on current PyTorch.)
+    "moondream": {"repo": "HuggingFaceTB/SmolVLM2-2.2B-Instruct", "gated": False,
+                  "dl_bytes": 4_500_000_000, "required": False},
     # AI mesh cleanup models
-    "pcn":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
-    "snowflakenet": {"repo": None, "gated": False, "dl_bytes": 367_300_000, "ai_model": True},
-    "vae":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True},
+    "pcn":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True, "required": False},
+    "snowflakenet": {"repo": None, "gated": False, "dl_bytes": 367_300_000, "ai_model": True, "required": False},
+    "vae":   {"repo": None, "gated": False, "dl_bytes": 0, "builtin": True, "required": False},
 }
 
 
@@ -672,6 +701,16 @@ def _download_worker(model_id: str) -> None:
                     shutil.rmtree(nested, ignore_errors=True)
             finally:
                 stop.set()
+        elif model_id == "moondream":
+            from huggingface_hub import snapshot_download
+            repo_dir = paths.HF_HUB_DIR / ("models--" + meta["repo"].replace("/", "--"))
+            stop = _start_progress_sampler(
+                "moondream", repo_dir, meta.get("dl_bytes", 0), "Downloading SmolVLM2")
+            try:
+                with paths.hf_online():
+                    snapshot_download(repo_id=meta["repo"])
+            finally:
+                stop.set()
         elif model_id == "snowflakenet":
             # AI mesh completion model from Google Drive
             import mesh_cleanup_ai
@@ -777,6 +816,16 @@ def _purge_model(model_id: str) -> int:
                 shutil.rmtree(repo, ignore_errors=True)
         except Exception as exc:
             logger.warning("DINOv2 purge failed: %s", exc)
+    elif model_id == "moondream":
+        meta = _MODEL_META.get(model_id, {})
+        if meta.get("repo"):
+            freed += _purge_hf_repo(meta["repo"])
+        try:
+            import vlm_labeler
+            vlm_labeler._model = None               # drop the in-memory VLM
+            vlm_labeler._processor = None
+        except Exception as exc:
+            logger.warning("SmolVLM2 unload failed: %s", exc)
     elif model_id == "snowflakenet":
         # Delete SnowflakeNet weights from ai_cleanup cache
         try:
@@ -828,6 +877,18 @@ def _sam3_cache() -> tuple[bool, int]:
         from huggingface_hub import scan_cache_dir
         for repo in scan_cache_dir().repos:
             if repo.repo_id == "facebook/sam3" and repo.size_on_disk > 0:
+                return True, int(repo.size_on_disk)
+    except Exception:
+        pass
+    return False, 0
+
+
+def _moondream_cache() -> tuple[bool, int]:
+    """Detect whether the part-naming VLM (SmolVLM2-2.2B) weights are cached."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        for repo in scan_cache_dir().repos:
+            if repo.repo_id == "HuggingFaceTB/SmolVLM2-2.2B-Instruct" and repo.size_on_disk > 0:
                 return True, int(repo.size_on_disk)
     except Exception:
         pass
@@ -913,6 +974,15 @@ def _models_status() -> list:
     dino_down, dino_size = _dino_cache()
     dino_loaded = sam3d_running
 
+    # 4b) Moondream2 (open VLM) used to name segmented parts from a render. Its
+    # weights live in the HF cache; loaded lazily by vlm_labeler on first use.
+    moondream_down, moondream_size = _moondream_cache()
+    try:
+        import vlm_labeler
+        moondream_loaded = getattr(vlm_labeler, "_model", None) is not None
+    except Exception:
+        moondream_loaded = False
+
     # 5) AI mesh cleanup models (Point Completion Network, SnowflakeNet, Shape VAE)
     pcn_loaded = False
     snowflakenet_loaded = False
@@ -940,6 +1010,7 @@ def _models_status() -> list:
             "status": status,
             "size": _human_size(size),
             "gated": bool(meta.get("gated")),
+            "required": bool(meta.get("required")),
             "repo": meta.get("repo"),
             "download": _get_dl(mid),
         }
@@ -955,6 +1026,8 @@ def _models_status() -> list:
               moge_down, moge_loaded, moge_size),
         entry("dino", "DINOv2 ViT-L/14", "Image feature backbone",
               dino_down, dino_loaded, dino_size),
+        entry("moondream", "SmolVLM2-2.2B", "AI part naming (VLM)",
+              moondream_down, moondream_loaded, moondream_size),
         entry("pcn", "Point Completion Network", "AI mesh denoising",
               True, pcn_loaded, 50_000_000),
         entry("snowflakenet", "SnowflakeNet (SPD)", "AI mesh completion",
@@ -962,6 +1035,20 @@ def _models_status() -> list:
         entry("vae", "3D Shape VAE", "AI mesh completion (fallback)",
               True, vae_loaded, 80_000_000),
     ]
+    # The part-naming VLM is opt-in (--ai-part-names); hidden from the panel otherwise.
+    if _ai_part_names_enabled:
+        models.append(
+            entry("moondream", "SmolVLM2-2.2B", "AI part naming (VLM)",
+                  moondream_down, moondream_loaded, moondream_size))
+    models += [
+        entry("pcn", "Point Completion Network", "AI mesh denoising",
+              True, pcn_loaded, 50_000_000),
+        entry("snowflakenet", "SnowflakeNet (SPD)", "AI mesh completion",
+              snowflakenet_down, snowflakenet_loaded, 350_000_000),
+        entry("vae", "3D Shape VAE", "AI mesh completion (fallback)",
+              True, vae_loaded, 80_000_000),
+    ]
+    return models
 
 
 @app.get("/models")
@@ -1506,7 +1593,9 @@ async def segment_parts(
     job_id: str,
     n_colors: int = 6,
     bake: bool = False,
-    texture_size: int = 2048,
+    texture_size: int = 512,
+    label: Optional[str] = None,
+    semantic: bool = False,
 ):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
@@ -1515,6 +1604,12 @@ async def segment_parts(
         raise HTTPException(202, "Reconstruction not finished")
     if not job.result_path or not Path(job.result_path).exists():
         raise HTTPException(404, "Reconstructed mesh not available")
+
+    job.label = (label or "").strip() or None
+
+    # AI part naming (VLM) is opt-in via --ai-part-names; ignore the client's
+    # semantic=true unless the server enabled it.
+    semantic = bool(semantic) and _ai_part_names_enabled
 
     loop = asyncio.get_event_loop()
     try:
@@ -1528,6 +1623,8 @@ async def segment_parts(
             0 if int(n_colors) <= 0 else max(2, min(int(n_colors), 16)),
             bool(bake),
             max(256, min(int(texture_size), 4096)),
+            job.label,
+            bool(semantic),
         )
     except Exception as exc:
         logger.exception(f"[JOB {job_id}] part segmentation failed")
@@ -1541,10 +1638,15 @@ async def get_result_parts(job_id: str):
     path = RESULT_DIR / f"{job_id}_parts.glb"
     if not path.exists():
         raise HTTPException(404, "Segmented parts not available")
+    from part_segmentation import slugify_label
+
+    job = jobs.get(job_id)
+    slug = slugify_label(job.label if job else None)
+    filename = f"{slug}.glb" if slug else "reconstruction_parts.glb"
     return FileResponse(
         str(path),
         media_type="model/gltf-binary",
-        filename="reconstruction_parts.glb",
+        filename=filename,
     )
 
 
@@ -1580,6 +1682,8 @@ def _run_part_segmentation_sync(
     n_colors: int,
     bake: bool = False,
     texture_size: int = 2048,
+    label: Optional[str] = None,
+    semantic: bool = False,
 ):
     """Post-processing: split the reconstructed mesh into functional parts.
 
@@ -1604,6 +1708,8 @@ def _run_part_segmentation_sync(
         n_colors=n_colors,
         bake=bake,
         texture_size=texture_size,
+        label=label,
+        use_sam3=semantic,
     )
     out_path = str(RESULT_DIR / f"{job_id}_parts.glb")
     raw = scene.export(file_type="glb")
@@ -2223,15 +2329,18 @@ if __name__ == "__main__":
                         help="Enable text mask refinement for SAM 3 segmentation (disabled by default)")
     parser.add_argument("--no-client-logs", action="store_true",
                         help="Disable client-side console logging in the web UI")
+    parser.add_argument("--ai-part-names", action="store_true",
+                        help="Enable AI part naming of segmented meshes via the SmolVLM2 VLM (off by default; downloads a multi-GB model)")
     parser.add_argument("--silent", action="store_true",
                         help="Do not open the client in a browser after startup")
     args = parser.parse_args()
     port = args.port
     
-    # Set global defaults from CLI arguments
+    # Set global defaults from CLI arguments (module-level, no `global` needed)
     _default_stage2_mps = not args.no_stage2_mps
     _refine_text_mask_enabled = args.refine_text_mask
     _disable_client_logs = args.no_client_logs
+    _ai_part_names_enabled = args.ai_part_names
     if _default_stage2_mps:
         logger.info("[SERVER] Stage 2 MPS acceleration enabled")
     else:

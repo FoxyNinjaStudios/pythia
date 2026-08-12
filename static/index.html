@@ -485,6 +485,13 @@ model-viewer {
 .model-card .model-name { font-size: .86rem; font-weight: 600; }
 .model-card .model-role { color: var(--muted); font-size: .72rem; margin-top: 2px; }
 .model-card .model-sub  { color: var(--muted); font-size: .7rem; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.model-tier {
+  display: inline-block; margin-left: 6px; vertical-align: middle;
+  font-size: .6rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 999px; white-space: nowrap;
+}
+.model-tier.required { color: #fbbf24; background: rgba(251,191,36,.14); }
+.model-tier.optional { color: var(--muted); background: rgba(148,163,184,.12); }
 .model-badge {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: .68rem; font-weight: 600; padding: 3px 9px; border-radius: 999px;
@@ -859,7 +866,7 @@ if (document.readyState === 'loading') {
     </div>
   </div>
 
-  <!-- ─── Step 3 : Progress ───────────────────────────────────────────── -->
+  <!-- ─── Step 3 : Progress ─────────────────────────────────────────────── -->
   <div class="card" id="progress-card">
     <div class="card-title">Step 3 - Reconstructing…</div>
     <div class="progress-track">
@@ -1103,6 +1110,15 @@ if (document.readyState === 'loading') {
             <option value="16">16 colors</option>
           </select>
         </div>
+        <div class="opt-row">
+          <label for="opt-seg-ai-names" title="Ask the SmolVLM2 vision model to name each part from a render (legs, seat, cushion…). Requires the SmolVLM2 model to be downloaded; falls back to geometric names otherwise. Slower.">AI part names</label>
+          <input id="opt-seg-ai-names" type="checkbox" />
+        </div>
+        <div class="opt-row">
+          <label for="opt-seg-bake" title="Off (default): each part keeps its own per-vertex color, exactly like the in-app preview and the unsegmented GLB - clean, smooth color in three.js / model-viewer / Blender. On: bake a UV texture atlas per part so color also shows in macOS Quick Look / Preview / USDZ (which ignore per-vertex color). Slower; GLB only.">Bake texture (Quick Look)</label>
+          <input id="opt-seg-bake" type="checkbox" />
+        </div>
+        <p class="tool-hint">Off (default): parts keep per-vertex color - identical to the preview / unsegmented model. On: bakes a texture atlas per part so color shows in macOS Quick Look / Preview / USDZ too (slower, larger file).</p>
         <div id="seg-list"></div>
         <div id="seg-status" class="tune-status"></div>
       </div>
@@ -1118,7 +1134,7 @@ if (document.readyState === 'loading') {
 
     <div class="tools-body">
       <div class="tool-group">
-        <p class="tool-hint">Status of the three models this app uses. <span style="color:#34d399">Loaded</span> = in memory, <span style="color:#60a5fa">Downloaded</span> = on disk, <span style="color:#f87171">Missing</span> = not downloaded yet.</p>
+        <p class="tool-hint">Status of the models this app uses. <span style="color:#fbbf24">Required</span> models power the core photo→3D pipeline; <span style="color:var(--muted)">Optional</span> ones add extras (AI part naming, mesh cleanup). <span style="color:#34d399">Loaded</span> = in memory, <span style="color:#60a5fa">Downloaded</span> = on disk, <span style="color:#f87171">Missing</span> = not downloaded yet.</p>
 
         <div id="models-status" class="loading">Loading…</div>
         <div class="tool-btn-row">
@@ -1356,7 +1372,6 @@ function addMultiViewImage(imageId, maskB64) {
   const thumb = document.createElement("div");
   thumb.style.cssText = "width:60px;height:60px;border-radius:6px;background:var(--border);position:relative;cursor:pointer;";
   thumb.title = `View ${g_multiViewImages.length}`;
-  thumb.onclick = () => removeMultiViewImage(g_multiViewImages.length - 1);
   grid.appendChild(thumb);
   
   // Show thumbnail
@@ -1375,7 +1390,6 @@ function removeMultiViewImage(index) {
     const thumb = document.createElement("div");
     thumb.style.cssText = "width:60px;height:60px;border-radius:6px;background:var(--border);";
     thumb.title = `View ${i + 1}`;
-    thumb.onclick = () => removeMultiViewImage(i);
     grid.appendChild(thumb);
   });
 }
@@ -3663,8 +3677,8 @@ window.HoleTune = {
     curSat = 1; curContrast = 1; curBright = 1;
     killed = new Set();
     const hv = $("holefill-val"); if (hv) hv.textContent = "all holes";
-    const ev = $("edgetrim-val"); if (ev) ev.textContent = "off";
-    const sv = $("smooth-val");   if (sv) sv.textContent = "off";
+    const ev = $("edgetrim-val");   if (ev) ev.textContent = "off";
+    const sv = $("smooth-val");     if (sv) sv.textContent = "off";
     const cfv = $("cutfillet-val"); if (cfv) cfv.textContent = "flat";
     const satv = $("saturation-val"); if (satv) satv.textContent = "off";
     const conv = $("contrast-val");   if (conv) conv.textContent = "off";
@@ -3730,7 +3744,7 @@ window.HoleTune = {
 
   // Bake the current tuned vertex colors into a texture, then download the GLB.
   // Baking is the default step before download: it produces a baseColorTexture
-  // (with normals) so macOS Preview / Quick Look render it in full color.
+  // (with normals) so those viewers render it in full color.
   async downloadTuned() {
     if (!welded) return;
     const status = $("holefill-status");
@@ -4000,8 +4014,22 @@ async function runSegmentGLB() {
   if (status) status.textContent = "";
   setExportProgress(15, "Segmenting colors…");
   try {
+    // Pass the object concept (SAM 3 text prompt) so the server can name the
+    // parts functionally (legs/seat/pillow) and the download after it, e.g.
+    // "chair.glb" instead of the generic "reconstruction_parts.glb".
+    const labelRaw = (document.getElementById("segtext-input")?.value || "").trim();
+    const labelQ = labelRaw ? `&label=${encodeURIComponent(labelRaw)}` : "";
+    const aiNames = !!document.getElementById("opt-seg-ai-names")?.checked;
+    const semQ = aiNames ? "&semantic=true" : "";
+    // Bake per-part textures from the part's own vertex colors (opt-in). Default
+    // (off) keeps clean per-vertex color; baking is only for Quick Look / USDZ.
+    const segBake = !!document.getElementById("opt-seg-bake")?.checked;
+    // A 1024 px atlas per part gives each UV chart enough texels that the viewer's
+    // mip/bilinear filtering doesn't bleed neighbouring charts together (512 px
+    // packed the hundreds of charts too tightly and looked speckled).
+    const bakeQ = segBake ? `&bake=true&texture_size=1024` : "";
     const res = await fetch(
-      `/segment_parts/${resultJobId}?n_colors=${nColors}`,
+      `/segment_parts/${resultJobId}?n_colors=${nColors}${labelQ}${semQ}${bakeQ}`,
       { method: "POST" });
     if (!res.ok) {
       const msg = await res.text().catch(() => res.statusText);
@@ -4013,7 +4041,8 @@ async function runSegmentGLB() {
     if (!glb.ok) throw new Error(`HTTP ${glb.status}`);
     const blob = await glb.blob();
     setExportProgress(100, "Done");
-    saveBlob(blob, "reconstruction_parts.glb");
+    const slug = labelRaw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
+    saveBlob(blob, slug ? `${slug}.glb` : "reconstruction_parts.glb");
     if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
     if (status) status.textContent = `Saved ${info.parts} color object${info.parts === 1 ? "" : "s"} · ${fmtBytes(blob.size)}`;
   } catch (e) {
@@ -4073,7 +4102,7 @@ function closeExport() {
 
 // ── Models status sidebar ──────────────────────────────────────────────────
 let _modelsPollTimer = null;
-const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3: "fa-comment-dots", sam3d: "fa-cube", moge: "fa-layer-group", dino: "fa-diagram-project", pcn: "fa-droplet", vae: "fa-sparkles" };
+const MODEL_ICONS = { sam2: "fa-wand-magic-sparkles", sam3: "fa-comment-dots", sam3d: "fa-cube", moge: "fa-layer-group", dino: "fa-diagram-project", moondream: "fa-eye", pcn: "fa-droplet", vae: "fa-sparkles" };
 const MODEL_LABEL = { loaded: "Loaded", downloaded: "Downloaded", not_downloaded: "Missing" };
 const _modelNames = {};
 const _modelGated = {};
@@ -4149,6 +4178,9 @@ async function loadModelsStatus(silent) {
       const dl = m.download || {};
       const running = dl.state === "running";
       if (running) anyRunning = true;
+      const tier = m.required
+        ? ` <span class="model-tier required" title="Core pipeline — required to generate a 3D model">Required</span>`
+        : ` <span class="model-tier optional" title="Optional enhancement — the pipeline runs without it">Optional</span>`;
       const sub = m.status === "not_downloaded"
         ? "Not downloaded"
         : `On disk · ${_esc(m.size || "-")}`;
@@ -4170,8 +4202,7 @@ async function loadModelsStatus(silent) {
       let action = "";
       if (running) {
         const hasPct = typeof dl.progress === "number" && isFinite(dl.progress);
-        const pct = hasPct ? Math.max(0, Math.min(100, Math.round(dl.progress * 100))) : null;
-        const fill = hasPct
+        const pct = hasPct
           ? `<div class="model-dl-fill" style="width:${pct}%"></div>`
           : `<div class="model-dl-fill indeterminate"></div>`;
         const pctLabel = hasPct ? `<span class="model-dl-pct">${pct}%</span>` : "";
@@ -4210,7 +4241,7 @@ async function loadModelsStatus(silent) {
           <div class="model-top">
             <div class="model-ic"><i class="fa-solid ${icon}"></i></div>
             <div class="model-meta">
-              <div class="model-name">${_esc(m.name)}</div>
+              <div class="model-name">${_esc(m.name)}${tier}</div>
               <div class="model-role">${_esc(m.role)}</div>
               <div class="model-sub">${sub}</div>
             </div>
