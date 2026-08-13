@@ -1503,7 +1503,7 @@ async def log_stream():
 # ── Result download ────────────────────────────────────────────────────────────
 
 @app.api_route("/result/{job_id}", methods=["GET", "HEAD"])
-async def get_result(job_id: str, format: str = "glb", num_colors: int = 16):
+async def get_result(job_id: str, format: str = "glb", num_colors: int = 16, separate: bool = True):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
     job = jobs[job_id]
@@ -1535,12 +1535,22 @@ async def get_result(job_id: str, format: str = "glb", num_colors: int = 16):
             else:
                 mesh = loaded
             
-            # Export as 3MF with one object per colour cluster.
-            # num_colors <= 0 means auto-detect the number of colours.
+            # Export as 3MF. num_colors <= 0 means auto-detect the number of
+            # colours. When `separate` is true (default) each colour cluster
+            # becomes its own filament-assignable object; when false the whole
+            # model is written as a single full-colour object (no segmentation).
             num_colors = 0 if int(num_colors) <= 0 else max(2, min(256, num_colors))
             output_path = glb_path.with_suffix(".3mf")
-            
-            if export_3mf_separated_by_color(mesh, str(output_path), num_colors=num_colors, verbose=True):
+
+            if separate:
+                ok = export_3mf_separated_by_color(
+                    mesh, str(output_path), num_colors=num_colors, verbose=True)
+            else:
+                from export_3mf import export_3mf_with_colors
+                ok = export_3mf_with_colors(
+                    mesh, str(output_path), num_colors=(num_colors or 16), verbose=True)
+
+            if ok:
                 raw = output_path.read_bytes()
                 return Response(
                     content=raw,

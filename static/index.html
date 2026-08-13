@@ -1115,11 +1115,15 @@ if (document.readyState === 'loading') {
           <input id="opt-seg-ai-names" type="checkbox" />
         </div>
         <div class="opt-row">
-          <label for="opt-seg-bake" title="Off (default): each part keeps its own per-vertex color, exactly like the in-app preview and the unsegmented GLB - clean, smooth color in three.js / model-viewer / Blender. On: bake a UV texture atlas per part so color also shows in macOS Quick Look / Preview / USDZ (which ignore per-vertex color). Slower; GLB only.">Bake texture (Quick Look)</label>
-          <input id="opt-seg-bake" type="checkbox" />
+          <label for="opt-seg-bake" title="On (default): bake a UV texture atlas per part so color shows in macOS Quick Look / Preview / USDZ (which ignore per-vertex color). Off: each part keeps its own per-vertex color, exactly like the in-app preview and the unsegmented GLB - clean, smooth color in three.js / model-viewer / Blender (smaller file). GLB only.">Bake texture (Quick Look)</label>
+          <input id="opt-seg-bake" type="checkbox" checked />
         </div>
-        <p class="tool-hint">Off (default): parts keep per-vertex color - identical to the preview / unsegmented model. On: bakes a texture atlas per part so color shows in macOS Quick Look / Preview / USDZ too (slower, larger file).</p>
+        <p class="tool-hint">On (default): bakes a texture atlas per part so color shows in macOS Quick Look / Preview / USDZ too. Off: parts keep per-vertex color - identical to the preview / unsegmented model (smaller file).</p>
         <div id="seg-list"></div>
+        <div id="seg-progress" class="export-progress" hidden>
+          <div class="export-progress-bar"><div class="export-progress-fill" id="seg-progress-fill"></div></div>
+          <div class="export-progress-label" id="seg-progress-label">Preparing…</div>
+        </div>
         <div id="seg-status" class="tune-status"></div>
       </div>
     </div>
@@ -3823,6 +3827,7 @@ const EXPORT_FORMATS = [
   { id: "ply",  name: "Stanford PLY",     ext: "ply",  bake: false },
   { id: "obj",  name: "Wavefront OBJ",    ext: "obj",  bake: false },
   { id: "stl",  name: "STL",              ext: "stl",  bake: false },
+  { id: "3mf",  name: "3MF (full color)", ext: "3mf",  bake: false },
 ];
 
 function fmtBytes(n) {
@@ -4012,7 +4017,7 @@ async function runSegmentGLB() {
   const nColors = segColorCount();
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
-  setExportProgress(15, "Segmenting colors…");
+  setSegProgress(15, "Segmenting colors…");
   try {
     // Pass the object concept (SAM 3 text prompt) so the server can name the
     // parts functionally (legs/seat/pillow) and the download after it, e.g.
@@ -4036,11 +4041,11 @@ async function runSegmentGLB() {
       throw new Error(msg || `HTTP ${res.status}`);
     }
     const info = await res.json();
-    setExportProgress(80, "Downloading…");
+    setSegProgress(80, "Downloading…");
     const glb = await fetch(`/result_parts/${resultJobId}`);
     if (!glb.ok) throw new Error(`HTTP ${glb.status}`);
     const blob = await glb.blob();
-    setExportProgress(100, "Done");
+    setSegProgress(100, "Done");
     const slug = labelRaw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48);
     saveBlob(blob, slug ? `${slug}.glb` : "reconstruction_parts.glb");
     if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
@@ -4050,7 +4055,7 @@ async function runSegmentGLB() {
     if (status) status.textContent = "GLB segmentation failed: " + (e.message || e);
   } finally {
     if (card) card.classList.remove("busy");
-    setTimeout(() => setExportProgress(null), 900);
+    setTimeout(() => setSegProgress(null), 900);
   }
 }
 
@@ -4062,16 +4067,16 @@ async function runSegment3MF() {
   const nColors = segColorCount();
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
-  setExportProgress(15, "Segmenting colors for 3MF…");
+  setSegProgress(15, "Segmenting colors for 3MF…");
   try {
     const resp = await fetch(`/result/${resultJobId}?format=3mf&num_colors=${nColors}`);
     if (!resp.ok) {
       const msg = await resp.text().catch(() => resp.statusText);
       throw new Error(msg || `HTTP ${resp.status}`);
     }
-    setExportProgress(90, "Downloading…");
+    setSegProgress(90, "Downloading…");
     const blob = await resp.blob();
-    setExportProgress(100, "Done");
+    setSegProgress(100, "Done");
     saveBlob(blob, "reconstruction.3mf");
     if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
     if (status) status.textContent = `Saved 3MF · ${fmtBytes(blob.size)}`;
@@ -4080,7 +4085,7 @@ async function runSegment3MF() {
     if (status) status.textContent = "3MF export failed: " + (e.message || e);
   } finally {
     if (card) card.classList.remove("busy");
-    setTimeout(() => setExportProgress(null), 900);
+    setTimeout(() => setSegProgress(null), 900);
   }
 }
 
@@ -4403,8 +4408,54 @@ function setExportProgress(pct, label) {
   if (lab && label) lab.textContent = label;
 }
 
+// Progress bar for the color-segmentation exports, shown directly below the
+// segment format buttons (separate from the main export progress bar).
+function setSegProgress(pct, label) {
+  const wrap = $("seg-progress"), fill = $("seg-progress-fill"), lab = $("seg-progress-label");
+  if (!wrap) return;
+  if (pct == null) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  if (fill) fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (lab && label) lab.textContent = label;
+}
+
+// Server-side full-color 3MF of the WHOLE model (no color segmentation): one
+// object with quantized per-vertex color for multi-material printing. Uses the
+// stored reconstruction on the server, like the color-segmentation exports.
+async function runPlain3MF() {
+  if (!resultJobId) {
+    const status = $("export-status");
+    if (status) status.textContent = "3MF needs the server reconstruction; not available.";
+    return;
+  }
+  const card = $("fmt-3mf"), sizeEl = $("size-3mf"), status = $("export-status");
+  if (card) card.classList.add("busy");
+  if (status) status.textContent = "";
+  setExportProgress(15, "Building 3MF…");
+  try {
+    const resp = await fetch(`/result/${resultJobId}?format=3mf&separate=false`);
+    if (!resp.ok) {
+      const msg = await resp.text().catch(() => resp.statusText);
+      throw new Error(msg || `HTTP ${resp.status}`);
+    }
+    setExportProgress(90, "Downloading…");
+    const blob = await resp.blob();
+    setExportProgress(100, "Done");
+    saveBlob(blob, "reconstruction.3mf");
+    if (sizeEl) sizeEl.textContent = fmtBytes(blob.size);
+    if (status) status.textContent = `Saved 3MF · ${fmtBytes(blob.size)}`;
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = "3MF export failed: " + (e.message || e);
+  } finally {
+    if (card) card.classList.remove("busy");
+    setTimeout(() => setExportProgress(null), 900);
+  }
+}
+
 async function runExport(id) {
   if (!welded) return;
+  if (id === "3mf") return runPlain3MF();
   const fmt = EXPORT_FORMATS.find((f) => f.id === id);
   if (!fmt) return;
   const card = $("fmt-" + id), sizeEl = $("size-" + id), status = $("export-status");
