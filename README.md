@@ -380,15 +380,30 @@ python main.py \
 ## Geometry cleanup
 
 After the mesh is decoded, a post-processing pass runs **by default** to
-suppress reconstruction artifacts and keep the output watertight:
+suppress reconstruction artifacts, clean up the silhouette, and keep the output
+watertight:
 
+- **Adaptive decimation.** The mesh is decoded via FlexiCubes on a 64³
+  sparse-voxel grid, which leaves a ~1-voxel "staircase" on thin features (chair
+  legs, table edges). A quadric edge-collapse pass decimates the mesh toward a
+  fixed **triangle budget** (~60k) rather than a fixed fraction, so the amount of
+  cleanup scales with the raw mesh density. Edge-collapse regularises the voxel
+  staircase into clean edges that follow the true surface. Meshes already at or
+  below the budget are left untouched, and an explicit `--simplify` /
+  `simplify_ratio` still overrides the automatic budget.
+- **Taubin smoothing.** A light, volume-preserving **Taubin** pass (5 iterations
+  by default) polishes the decimated surface without shrinking thin parts. Kept
+  deliberately light because decimation already regularises the silhouette; too
+  many passes reintroduce a low-frequency "wave" on straight edges. Raise it via
+  the web UI "Sand / smooth" control, `--smooth-iterations` (CLI), or
+  `smooth_iterations` (API).
 - **Hole filling.** Small gaps left by decoding or simplification are closed so
   the surface is manifold and closed.
 - **Floater removal.** Disconnected islands are dropped, keeping the largest
   connected component (the object) and discarding stray voxel debris.
 
-Both passes are guarded: if a step cannot run on a given mesh it is skipped, and
-neither can fail the reconstruction job. The result is the watertight GLB used
+All passes are guarded: if a step cannot run on a given mesh it is skipped, and
+none can fail the reconstruction job. The result is the watertight GLB used
 by the viewer and every export path.
 
 ## Geometry resolution

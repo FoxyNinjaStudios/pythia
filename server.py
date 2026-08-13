@@ -2052,19 +2052,40 @@ def _run_reconstruction_sync(
         result_mesh = output["glb"]
 
         # Post-process: Decimation (mesh simplification)
+        # Adaptive: decimate toward a fixed triangle budget rather than a fixed
+        # fraction, so the amount of cleanup scales with the raw mesh density.
+        # Quadric edge-collapse regularises the 64³ FlexiCubes voxel staircase
+        # into clean edges (the SAM3 demo lands ~15k tris); the Taubin pass below
+        # then polishes it. A client-supplied simplify_ratio still overrides this.
+        TARGET_FACES = 60000  # lower = cleaner/straighter lines, higher = more detail
+        try:
+            n_faces = len(result_mesh.faces)
+        except Exception:
+            n_faces = 0
+
         if simplify_ratio and simplify_ratio > 0.0:
+            decimate_ratio = max(0.0, min(simplify_ratio, 0.99))
+        elif n_faces > TARGET_FACES:
+            decimate_ratio = max(0.0, min(1.0 - (TARGET_FACES / n_faces), 0.95))
+        else:
+            decimate_ratio = 0.0
+
+        if decimate_ratio > 0.0:
             try:
-                simplify_ratio = max(0.0, min(simplify_ratio, 0.99))
-                target_reduction = 100 * simplify_ratio
-                logger.info(f"[JOB {job_id}] Simplifying mesh to {100*(1-simplify_ratio):.1f}% vertices…")
-                result_mesh = result_mesh.simplify(simplify_ratio)
+                logger.info(
+                    f"[JOB {job_id}] Simplifying mesh ({n_faces} faces → "
+                    f"~{int(n_faces * (1 - decimate_ratio))}, ratio {decimate_ratio:.2f})…"
+                )
+                result_mesh = result_mesh.simplify(decimate_ratio)
                 logger.info(f"[JOB {job_id}] Mesh simplified to {len(result_mesh.vertices)} vertices")
             except Exception as exc:
                 logger.warning(f"[JOB {job_id}] mesh simplification skipped: {exc}")
 
         # Post-process: Smoothing (Taubin smoothing to de-staircase the 64³ voxel grid)
-        # Default to 10 iterations if not specified; allow up to 500
-        smooth_iters = smooth_iterations if smooth_iterations > 0 else 10
+        # Decimation above already regularises the silhouette, so a lighter
+        # Taubin pass is enough here; too many passes reintroduces low-frequency
+        # "wave" on straight edges. Default to 5 iterations; allow up to 500.
+        smooth_iters = smooth_iterations if smooth_iterations > 0 else 5
         try:
             from mesh_utils import taubin_smooth
             logger.info(f"[JOB {job_id}] Taubin-smoothing mesh ({smooth_iters} iterations)…")
