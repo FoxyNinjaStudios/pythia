@@ -749,8 +749,15 @@ if (document.readyState === 'loading') {
   <!-- ─── Step 1 : Upload ─────────────────────────────────────────────── -->
   <div class="card" id="step-upload">
     <div class="card-title">Step 1 - upload image</div>
-    
-    
+
+    <div class="quality-row" style="margin-bottom:12px;">
+      <span class="label">Input</span>
+      <div class="seg" id="mode-seg">
+        <button type="button" id="mode-single" class="active" onclick="setMode('single')" title="Reconstruct from a single image">Single image</button>
+        <button type="button" id="mode-multi" onclick="setMode('multi')" title="Fuse 2+ images for better geometry and texture (experimental)">Multi-view</button>
+      </div>
+    </div>
+
     <div id="drop-zone" onclick="document.getElementById('file-input').click()"
          ondragover="onDragOver(event)" ondragleave="onDragLeave(event)"
          ondrop="onDrop(event)">
@@ -836,8 +843,8 @@ if (document.readyState === 'loading') {
           </div>
         </div>
         
-        <!-- Multi-view fusion options (hidden - multi-view optimization pending) -->
-        <div id="mv-controls" style="display:none !important;">
+        <!-- Multi-view fusion options (shown only in multi-view mode via setMode) -->
+        <div id="mv-controls" style="display:none;">
           <div class="quality-row">
             <span class="label">Fusion mode</span>
             <select id="fusion-mode" style="flex:1;">

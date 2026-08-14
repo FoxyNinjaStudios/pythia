@@ -157,6 +157,61 @@ def _compute_image_entropy(image) -> float:
     return float(entropy / np.log(256))
 
 
+def _fuse_coords_by_voting(coords_list, min_votes: int, device: torch.device):
+    """Fuse per-view sparse voxel coordinates by occupancy voting.
+
+    Each view votes at most once per voxel; a voxel is kept when it is present
+    in at least ``min_votes`` views. ``min_votes=1`` is a union (max
+    completeness); a higher value acts as majority voting (rejects per-view
+    floaters). This is geometrically well-defined across views in the shared
+    canonical 64^3 grid, unlike averaging integer voxel indices (which is also
+    undefined when views produce different voxel counts).
+
+    Returns an ``[M, 4]`` int64 tensor ``[batch, x, y, z]`` (batch = 0), or
+    ``None`` if there is nothing to fuse.
+    """
+    per_view_unique = []
+    for c in coords_list:
+        c = torch.as_tensor(c, device=device)
+        if c.numel() == 0:
+            continue
+        xyz = c[:, 1:4].round().to(torch.int64)
+        per_view_unique.append(torch.unique(xyz, dim=0))  # one vote per view
+    if not per_view_unique:
+        return None
+    stacked = torch.cat(per_view_unique, dim=0)
+    uniq, counts = torch.unique(stacked, dim=0, return_counts=True)
+    mask = counts >= min_votes
+    if not bool(mask.any()):
+        mask = counts >= 1  # never return empty geometry
+    xyz = uniq[mask]
+    batch = torch.zeros((xyz.shape[0], 1), dtype=xyz.dtype, device=device)
+    return torch.cat([batch, xyz], dim=1)
+
+
+def _coords_agreement_weights(coords_list, consensus_coords, device: torch.device) -> torch.Tensor:
+    """Per-view confidence = fraction of a view's voxels that fall in the
+    consensus geometry. Views that agree with the majority score higher; noisy
+    or outlier views score lower. Grounded in the reconstructed geometry rather
+    than the image-entropy proxy. Returns normalised weights summing to 1.
+    """
+    cons = set(
+        map(tuple, consensus_coords[:, 1:4].round().to(torch.int64).tolist())
+    ) if consensus_coords is not None else set()
+    ws = []
+    for c in coords_list:
+        c = torch.as_tensor(c)
+        if c.numel() == 0:
+            ws.append(0.0)
+            continue
+        uniq = set(map(tuple, torch.unique(c[:, 1:4].round().to(torch.int64), dim=0).tolist()))
+        ws.append((len(uniq & cons) / len(uniq)) if uniq else 0.0)
+    w = torch.tensor(ws, device=device, dtype=torch.float32)
+    if float(w.sum()) <= 0:
+        w = torch.ones(len(coords_list), device=device)
+    return w / w.sum()
+
+
 class InferencePipeline:
     def __init__(
         self,
@@ -730,34 +785,49 @@ class InferencePipeline:
                 ss_input_dicts.append(self.preprocess_image(merged_img, self.ss_preprocessor))
                 slat_input_dicts.append(self.preprocess_image(merged_img, self.slat_preprocessor))
             
-            # Stage 1
-            if fusion_config.stage1_fusion:
-                logger.info("Fusing views for Stage 1...")
-                fused_ss = fuse_multi_view_representations(ss_input_dicts, fusion_config, self.device)
-                ss_dicts_to_sample = [fused_ss]
-            else:
-                ss_dicts_to_sample = ss_input_dicts
-            
-            logger.info("Sampling sparse structure...")
+            # Stage 1 - sample the sparse structure per view, then fuse the
+            # voxel coordinates by occupancy voting in the shared 64^3 grid.
+            logger.info("Sampling sparse structure (per view)...")
             ss_returns = []
-            for ss_dict in ss_dicts_to_sample:
+            for ss_dict in ss_input_dicts:
                 ret = self.sample_sparse_structure(
                     ss_dict,
                     inference_steps=stage1_inference_steps,
                     use_distillation=use_stage1_distillation,
                 )
                 ss_returns.append(ret)
-            
-            if len(ss_returns) > 1:
-                logger.info("Averaging Stage 1 outputs across views...")
-                coords_list = [r["coords"] for r in ss_returns if "coords" in r]
-                if coords_list:
-                    coords = torch.stack([torch.as_tensor(c) for c in coords_list]).mean(dim=0)
-                else:
-                    coords = ss_returns[0]["coords"]
-                ss_return = ss_returns[0].copy()
+
+            coords_list = [r["coords"] for r in ss_returns if "coords" in r]
+
+            if len(coords_list) > 1:
+                # Provisional union to establish a consensus, then score each
+                # view by how well its geometry agrees with that consensus.
+                provisional = _fuse_coords_by_voting(coords_list, min_votes=1, device=self.device)
+                view_weights = _coords_agreement_weights(coords_list, provisional, self.device)
+
+                sel = list(range(len(coords_list)))
+                k = fusion_config.weighting.num_views_to_select
+                if k:
+                    k = min(int(k), len(coords_list))
+                    sel = torch.topk(view_weights, k).indices.tolist()
+                selected_coords = [coords_list[i] for i in sel]
+
+                # Union for 2 views (completeness); majority for >=3 (reject floaters).
+                min_votes = 2 if len(selected_coords) >= 3 else 1
+                coords = _fuse_coords_by_voting(selected_coords, min_votes=min_votes, device=self.device)
+                if coords is None or coords.shape[0] == 0:
+                    coords = _fuse_coords_by_voting(selected_coords, min_votes=1, device=self.device)
+
+                best_view = int(torch.argmax(view_weights).item())
+                logger.info(
+                    f"Fused geometry by voting: {int(coords.shape[0])} voxels from "
+                    f"{len(selected_coords)} view(s), min_votes={min_votes}; best view={best_view}"
+                )
+                ss_return = ss_returns[best_view].copy()
                 ss_return["coords"] = coords
             else:
+                view_weights = torch.ones(1, device=self.device)
+                best_view = 0
                 ss_return = ss_returns[0]
             
             ss_return.update(self.pose_decoder(ss_return))
@@ -771,30 +841,16 @@ class InferencePipeline:
             
             coords = ss_return["coords"]
             
-            # Stage 2
-            if fusion_config.stage2_fusion:
-                logger.info("Fusing views for Stage 2...")
-                fused_slat = fuse_multi_view_representations(slat_input_dicts, fusion_config, self.device)
-                slat_dicts_to_sample = [fused_slat]
-            else:
-                slat_dicts_to_sample = slat_input_dicts
-            
-            logger.info("Sampling SLAT...")
-            slat_list = []
-            for slat_dict in slat_dicts_to_sample:
-                slat = self.sample_slat(
-                    slat_dict,
-                    coords,
-                    inference_steps=stage2_inference_steps,
-                    use_distillation=use_stage2_distillation,
-                )
-                slat_list.append(slat)
-            
-            if len(slat_list) > 1:
-                logger.info("Merging SLAT latents across views...")
-                slat = torch.stack(slat_list).mean(dim=0)
-            else:
-                slat = slat_list[0]
+            # Stage 2 - sample the structured latent once on the fused
+            # (consensus) geometry, conditioned on the highest-confidence view.
+            # Avoids the broken SparseTensor averaging and is occlusion-aware.
+            logger.info(f"Sampling SLAT on fused geometry (conditioning view={best_view})...")
+            slat = self.sample_slat(
+                slat_input_dicts[best_view],
+                coords,
+                inference_steps=stage2_inference_steps,
+                use_distillation=use_stage2_distillation,
+            )
             
             logger.info("Decoding SLAT...")
             decode_formats_to_use = decode_formats if decode_formats else self.decode_formats

@@ -186,6 +186,9 @@ _disable_client_logs = False
 # Enable AI part naming via the SmolVLM2 VLM (opt-in; off by default because the
 # small VLM's labels are unreliable and it adds a multi-GB download + load).
 _ai_part_names_enabled = False
+# Multi-view reconstruction (on by default). When disabled the web-UI mode
+# toggle is hidden and the /reconstruct_multi_view endpoint is rejected.
+_multi_view_enabled = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,6 +451,7 @@ async def root():
     inject_script = f"""<script>
 window.DISABLE_CLIENT_LOGS = {str(_disable_client_logs).lower()};
 window.AI_PART_NAMES = {str(_ai_part_names_enabled).lower()};
+window.MULTI_VIEW_ENABLED = {str(_multi_view_enabled).lower()};
 if (window.DISABLE_CLIENT_LOGS) {{
   document.addEventListener('DOMContentLoaded', function() {{
     const consoleCard = document.getElementById('console-card');
@@ -459,6 +463,14 @@ if (!window.AI_PART_NAMES) {{
     // Hide the "AI part names" checkbox row when the VLM feature is off.
     const cb = document.getElementById('opt-seg-ai-names');
     if (cb) {{ const row = cb.closest('.opt-row'); if (row) row.style.display = 'none'; }}
+  }});
+}}
+if (!window.MULTI_VIEW_ENABLED) {{
+  document.addEventListener('DOMContentLoaded', function() {{
+    // Hide the Single/Multi-view mode toggle and force single-view.
+    const seg = document.getElementById('mode-seg');
+    if (seg) {{ const row = seg.closest('.quality-row'); if (row) row.style.display = 'none'; }}
+    if (typeof setMode === 'function') {{ try {{ setMode('single'); }} catch (e) {{}} }}
   }});
 }}
 </script>"""
@@ -1334,6 +1346,8 @@ async def reconstruct(req: ReconstructRequest):
 @app.post("/reconstruct_multi_view")
 async def reconstruct_multi_view(req: ReconstructMultiViewRequest):
     """Multi-view 3D reconstruction from multiple uploaded images."""
+    if not _multi_view_enabled:
+        raise HTTPException(403, "Multi-view reconstruction is disabled (server started with --no-multi-view)")
     if len(req.images) < 2:
         raise HTTPException(400, "Multi-view reconstruction requires at least 2 images")
     
@@ -2362,6 +2376,8 @@ if __name__ == "__main__":
                         help="Disable client-side console logging in the web UI")
     parser.add_argument("--ai-part-names", action="store_true",
                         help="Enable AI part naming of segmented meshes via the SmolVLM2 VLM (off by default; downloads a multi-GB model)")
+    parser.add_argument("--no-multi-view", action="store_true",
+                        help="Suppress multi-view reconstruction: hides the Single/Multi-view toggle in the web UI and rejects the /reconstruct_multi_view endpoint (multi-view is enabled by default)")
     parser.add_argument("--silent", action="store_true",
                         help="Do not open the client in a browser after startup")
     args = parser.parse_args()
@@ -2372,6 +2388,9 @@ if __name__ == "__main__":
     _refine_text_mask_enabled = args.refine_text_mask
     _disable_client_logs = args.no_client_logs
     _ai_part_names_enabled = args.ai_part_names
+    _multi_view_enabled = not args.no_multi_view
+    if not _multi_view_enabled:
+        logger.info("[SERVER] Multi-view reconstruction disabled (--no-multi-view)")
     if _default_stage2_mps:
         logger.info("[SERVER] Stage 2 MPS acceleration enabled")
     else:

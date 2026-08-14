@@ -297,8 +297,13 @@ def load_shape_vae_model():
         else:
             logger.warning("Shape VAE weights not available, using random initialization")
         
+        model._pythia_trained = False  # random-init / untrained fallback
         _shape_vae_model = model
-        logger.info("✓ Shape VAE ready for shape completion (random initialization)")
+        logger.warning(
+            "Shape completion model is UNTRAINED (SnowflakeNet weights not found). "
+            "Shape completion will be skipped rather than run random weights that "
+            f"would degrade the mesh; place trained SnowflakeNet weights in {CHECKPOINTS_DIR}/ to enable it."
+        )
         
     except Exception as e:
         logger.error(f"Failed to load Shape VAE model: {e}")
@@ -561,7 +566,18 @@ def complete_shape_voxel(
     if model is None:
         logger.warning("Shape VAE model unavailable, skipping completion")
         return vertices, faces
-    
+
+    # An untrained (random-init) network does not "complete" a shape: it maps the
+    # mesh through random weights, i.e. produces noise. Refuse to run it and return
+    # the mesh unchanged so the UI never silently degrades output while claiming to
+    # clean it. Only run when a genuine, runnable trained model is loaded.
+    if not isinstance(model, torch.nn.Module) or not getattr(model, "_pythia_trained", False):
+        logger.warning(
+            "Shape completion unavailable (no trained weights): returning mesh unchanged. "
+            f"Place trained SnowflakeNet weights in {CHECKPOINTS_DIR}/ to enable it."
+        )
+        return vertices, faces
+
     try:
         device = get_device()
         

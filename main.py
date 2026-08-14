@@ -352,17 +352,26 @@ def main():
         help="Index of mask in mask-dir (default: 0)"
     )
     
-    # Multi-view arguments (NEW)
+    # Multi-view arguments
     parser.add_argument(
         "--multi-view",
         action="store_true",
-        help="Enable multi-view mode for improved geometry and pose stability"
+        help="Force multi-view mode. Multi-view is enabled automatically whenever "
+             "--image-dir is given, so this flag is only needed for clarity; use "
+             "--single-view to suppress the automatic behaviour."
+    )
+    parser.add_argument(
+        "--single-view",
+        action="store_true",
+        help="Suppress the automatic multi-view mode and force single-view "
+             "reconstruction even when --image-dir is provided."
     )
     parser.add_argument(
         "--image-dir",
         type=str,
         default=None,
-        help="Directory with multiple views (required with --multi-view)"
+        help="Directory with multiple views. Providing this enables multi-view mode "
+             "by default (override with --single-view)."
     )
     parser.add_argument(
         "--masks-dir",
@@ -534,10 +543,14 @@ def main():
 
     args = parser.parse_args()
     
+    # Multi-view is enabled by default whenever multiple inputs (--image-dir) are
+    # provided; --single-view suppresses it and forces the single-view path.
+    use_multi_view = (args.multi_view or bool(args.image_dir)) and not args.single_view
+
     # Multi-view mode
-    if args.multi_view:
+    if use_multi_view:
         if not args.image_dir:
-            parser.error("Multi-view mode (--multi-view) requires --image-dir")
+            parser.error("Multi-view mode requires --image-dir (or pass --single-view)")
         
         print("=" * 70)
         print("SAM-3D MPS Pipeline (Multi-View Mode)")
@@ -668,7 +681,7 @@ def main():
     
     # Single-view mode (existing logic)
     if not args.image and not args.mask_dir:
-        parser.error("Must provide either --image (single-view) or --multi-view --image-dir")
+        parser.error("Must provide either --image (single-view) or --image-dir (multi-view)")
     
     if not args.image:
         parser.error("Single-view mode requires --image")

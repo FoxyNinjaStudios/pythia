@@ -93,52 +93,79 @@ one pool, so a 24 GB Mac holds both comfortably without a separate VRAM ceiling.
 
 ### ⚠️ Multi-view reconstruction (experimental)
 
-Multi-view 3D reconstruction fuses geometry and appearance from 2+ images for improved shape completeness and texture quality. It is **fully implemented**, **re-enabled for testing** in the web UI, CLI, and API, and now includes **improved texture mapping and occlusion handling**.
+Multi-view 3D reconstruction fuses geometry from 2+ images of the same object
+for improved shape completeness. It is **implemented and enabled by default** in
+the web UI, CLI, and API. Disable it server-side with `--no-multi-view`.
 
-**Web UI:** Toggle "Multi-View" mode in Step 1, upload 2+ images, segment each, then reconstruct.
+**How fusion works (occupancy voting).** Each view is run independently through
+Stage 1 (sparse-structure / geometry). The per-view voxel grids are then fused
+in the shared canonical 64³ frame by **occupancy voting**: every view votes at
+most once per voxel, and a voxel is kept when enough views agree.
 
-**CLI usage:**
+- **2 views:** union (maximum completeness — one view fills what the other
+  occludes).
+- **3+ views:** majority vote (a voxel must appear in ≥2 views), which rejects
+  per-view floaters and reconstruction noise.
+
+Each view is then scored by **geometry agreement** — the fraction of its voxels
+that land in the fused consensus. Views that agree with the majority score
+higher; outlier or noisy views score lower. These confidence scores drive:
+
+- **View selection** (`--num-views-select N` / `num_views_to_select`): keep only
+  the N highest-agreement views before the final vote.
+- **Best-view conditioning:** Stage 2 (SLAT texture & appearance) is sampled
+  **once** on the fused consensus geometry, conditioned on the single
+  highest-agreement view. This is occlusion-aware (the clearest view drives
+  appearance) and avoids the cost of running Stage 2 per view.
+
+This replaces the earlier naïve approach (averaging integer voxel indices and
+averaging Stage-2 latents), which was geometrically ill-defined and crashed when
+views produced different voxel counts.
+
+> **Assumptions & limits.** Voting assumes all views land in the same canonical
+> frame (SAM 3D canonicalises per object) and use the same downsample factor.
+> True cross-view **pose alignment** (e.g. DUSt3R/MASt3R/VGGT) and
+> **MultiDiffusion appearance blending** across views remain future work — the
+> current path blends geometry but conditions appearance on the best single
+> view. The `--fusion-mode` selector is retained for API compatibility but no
+> longer changes the geometry path.
+
+**Web UI:** Toggle "Multi-View" mode in Step 1, upload 2+ images, segment each,
+then reconstruct.
+
+**CLI usage:** Multi-view is enabled **by default** whenever you pass
+`--image-dir` (multiple inputs); the explicit `--multi-view` flag is optional.
+Use `--single-view` to suppress it and force single-view reconstruction.
 ```bash
-python main.py --multi-view --image-dir <images_directory> --masks-dir <masks_directory> --output output.glb
+# Multi-view is auto-enabled by --image-dir
+python main.py --image-dir <images_directory> --masks-dir <masks_directory> --output output.glb
+
+# Select the 3 best-agreement views and disable MPS
+python main.py --image-dir <images_directory> --num-views-select 3 --no-stage2-mps --output output.glb
+
+# Suppress multi-view even with --image-dir
+python main.py --image-dir <images_directory> --single-view --output output.glb
 ```
+
+**Multi-view CLI flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--image-dir` | Directory of input views. Providing it **auto-enables** multi-view. |
+| `--masks-dir` | Directory of per-view masks (optional). |
+| `--multi-view` | Force multi-view mode (redundant when `--image-dir` is given). |
+| `--single-view` | Suppress auto multi-view; force the single-view path. |
+| `--view-indices` | Comma-separated indices to select specific views (e.g. `0,1,2`). |
+| `--num-views-select` | Keep only the N highest-agreement views (default: all). |
+| `--fusion-mode` | `stochastic` or `multidiffusion` (retained for API compatibility; no longer changes the geometry path). |
+| `--view-weighting` | `uniform` or `entropy` (view-weighting strategy hint). |
 
 **API usage:**
 ```bash
 POST /reconstruct_multi_view
 ```
-with multiple images in the request body.
-
-**Multi-view features:**
-- Processes each view independently (full pipeline per view)
-- **Fuses sparse geometry** via coordinate averaging across all views
-- **Fuses appearance (gaussians)** with confidence-weighted blending
-- **Occlusion-aware weighting**: Views with clearer/more consistent reconstructions contribute more
-- Stage 2 MPS acceleration applies to **each view** separately
-- Supports fusion modes: `stochastic` (random view per step) or `multidiffusion` (all views per step)
-- Supports view weighting: `uniform` (equal) or `entropy` (prioritize consistent views)
-
-**Multi-view with MPS control and fusion config:**
-```bash
-# MPS enabled (default), uniform view weighting
-python main.py --multi-view --image-dir ... --output output.glb
-
-# MPS disabled
-python main.py --multi-view --image-dir ... --no-stage2-mps --output output.glb
-```
-
-**Texture mapping improvements:**
-- ✅ Gaussian appearance fusion: Colors and covariances from all views are blended with confidence weights
-- ✅ Per-view confidence weights: Views with clearer geometry contribute more to final appearance
-- ✅ Occlusion-aware blending: Prioritizes well-reconstructed views, reduces artifacts from ambiguous regions
-- ✅ Reduced seams and ghosting: Confident views dominate; uncertain views contribute less
-
-**Performance notes:**
-- Peak memory ~1.5× single-view due to per-view Stage 2 on MPS
-- Each view's Stage 2 runs independently on MPS when enabled
-- Geometry fusion happens on CPU (no device conflicts)
-- Appearance fusion adds ~50-100ms per view
-
-**Advanced usage (Web API with custom fusion config):**
+with 2+ images in the request body (rejected with HTTP 403 if the server was
+started with `--no-multi-view`). Custom fusion config example:
 ```bash
 curl -X POST http://localhost:8005/reconstruct_multi_view \
   -H "Content-Type: application/json" \
@@ -146,14 +173,18 @@ curl -X POST http://localhost:8005/reconstruct_multi_view \
     "images": [...],
     "stage2_mps": true,
     "fusion_config": {
-      "view_weighting": "entropy"
+      "view_weighting": "entropy",
+      "num_views_to_select": 3
     }
   }'
 ```
 
-**View weighting modes:**
-- `uniform`: All views contribute equally (default, fast)
-- `entropy`: Views with lower reconstruction uncertainty contribute more (better quality, slightly slower)
+**Performance notes:**
+- Stage 1 runs per view (cheap — 2 shortcut-distilled steps each).
+- Stage 2 runs **once** on the fused geometry, so total cost is close to a
+  single-view Stage 2 plus N× lightweight Stage 1 — faster than the old
+  per-view Stage 2 path.
+- Geometry voting runs on CPU (no device conflicts); Stage 2 uses MPS by default.
 
 ### Stage 2 MPS Acceleration (Default)
 
@@ -293,7 +324,7 @@ and update the 3D preview live:
   (pencil), **Low-Poly**, **Watercolor**, **Retro** (8-bit), **Oil Painting**,
   **Comic**, **Pixelated**, **Posterized**, **Grayscale**, **Sepia**, **High Contrast**,
   **Neon**. Live preview in viewport; applies on download when baking is enabled.
-- **AI Mesh Cleanup** (functional, visible smoothing). The export panel includes checkboxes for **point cloud denoising** and **shape completion**. **Point Cloud Denoising** now uses **Open3D's Laplacian smoothing** for topology-preserving mesh refinement—smooths vertices in-place using neighborhood averaging, removing high-frequency noise while preserving mesh connectivity and structure. **Result:** Visible mesh surface smoothing applied to all vertices while maintaining the original face topology (no vertex removal, no mesh corruption). **Shape Completion** uses a random-weight 3D VAE (minimal effect until trained weights available). **How it works:** Enable "AI Denoise" checkbox in export panel → surface vertices are iteratively smoothed via Laplacian filtering → mesh edges soften, noise reduces, surface becomes smoother. **Modern architecture support:** When Point Transformer V3 trained weights become available, the system will auto-upgrade to ML-based denoising; SnowflakeNet point cloud completion framework is ready for trained weights. Both models run on Metal (MPS) on Apple Silicon.
+- **AI Mesh Cleanup.** The export panel has checkboxes for **point cloud denoising** and **shape completion**. **Denoising is real and deterministic:** it uses **Open3D's Laplacian / statistical smoothing** to refine vertices in-place (neighborhood averaging), removing high-frequency noise while preserving the face topology (no vertex removal, no ML weights required). **Shape completion requires trained SnowflakeNet weights.** If those weights are not present in `checkpoints/ai_cleanup/`, shape completion is **skipped (no-op) and the mesh is returned unchanged** — the app **never** runs an untrained (random-weight) network on your mesh, because doing so would degrade it rather than clean it. When trained SnowflakeNet weights are installed, completion runs on Metal (MPS) on Apple Silicon.
 
 - **Meshopt compress** (opt-in). `EXT_meshopt_compression` +
   `KHR_mesh_quantization` via **glTF-Transform** for dramatically smaller GLBs
@@ -326,6 +357,11 @@ python server.py --silent        # do not auto-open a browser
 |------|-------------|
 | `--port` | TCP port to listen on (default: `8005`). |
 | `--silent` | Do not open the client in a browser after startup. |
+| `--no-stage2-mps` | Disable MPS acceleration for Stage 2 (SLAT); run CPU-only. Enabled by default on Apple Silicon. |
+| `--no-multi-view` | Suppress multi-view: hides the Single/Multi-view toggle in the web UI and rejects `/reconstruct_multi_view` (HTTP 403). Multi-view is enabled by default. |
+| `--refine-text-mask` | Enable text-mask refinement for SAM 3 segmentation (off by default). |
+| `--ai-part-names` | Enable AI part-naming of segmented meshes via the SmolVLM2 VLM (off by default; downloads a multi-GB model). |
+| `--no-client-logs` | Disable client-side console logging in the web UI. |
 
 The server opens the client once the port is actually accepting connections, and
 shuts down cleanly on `Ctrl-C` / `SIGTERM` (with a watchdog fallback) so it never
@@ -349,33 +385,55 @@ Optional Gaussian-splat export is on by default; disable it with
 ```bash
 conda activate sam-3d
 python main.py \
-    --image images/shutterstock_stylish_kidsroom_1640806567/image.png \
-    --mask-dir images/shutterstock_stylish_kidsroom_1640806567 \
+    --image <image/path> \
+    --mask-dir <mask-path> \
     --mask-index 0 \
     --mesh \
     --output outputs/reconstruction.glb
 ```
 
 #### Key Arguments
+
+**Input / output**
 | Argument | Description |
 |----------|-------------|
-| `--image` | Input image path |
-| `--mask` / `--mask-dir` + `--mask-index` | Object mask (single file or SAM-style directory) |
-| `--mesh` | Output a smooth GLB mesh (otherwise voxel STL) |
-| `--voxels-only` | Only run stage 1 and export raw voxels (STL); skip mesh decoding |
-| `--steps` | Stage-2 (SLAT texture & refinement) flow-matching steps (default: 12). Stage 2 is genuine flow matching and is not distilled. |
-| `--ss-steps` | Stage-1 (sparse-structure / geometry) steps (default: 2). This stage is **shortcut-distilled** in the shipped weights, so 2 steps is the intended default; values above 4 rarely help. |
-| `--ss-distill` / `--no-ss-distill` | Use shortcut-distilled sampling for stage 1 (step-size conditioning, CFG-free, about 1 eval per step). On by default and required for the low `--ss-steps` to be valid; pass `--no-ss-distill` to fall back to CFG flow matching (then use about 12 steps). |
-| `--distill` | Also distill **stage 2** (SLAT). The released SLAT weights are not shortcut-distilled, so this is experimental and usually degrades texture; leave it off. |
-| `--simplify` | Mesh decimation ratio (`0.0` = none to `0.95` = heavy) |
-| `--full-res-geometry` | Keep large objects at native 64 cubed instead of letting the sparse structure be factor-2 downsampled. **On by default**; disable with `SAM3D_FULL_RES_GEOMETRY=0`. Very large objects still fall back to the halved path (see [Geometry resolution](#geometry-resolution)). |
-| `--vertex-color-source` | `gaussian` (saturated, recommended) or `mesh` |
-| `--bake` | Bake a UV texture atlas instead of per-vertex color |
-| `--bake-source` | `gaussian` (higher fidelity) or `vertex` |
-| `--texture-size` | Baked atlas edge length in px (default: 2048) |
-| `--cache-dir` / `--load-slat` | Cache / reuse intermediate SLAT to skip stages 0 to 2 |
-| `--seed` | Random seed for reproducibility (default: 42) |
-| `--output` `-o` | Output file (`.glb`, `.stl`) |
+| `--image` / `-i` | Input image path (single-view mode). |
+| `--mask` / `-m` | Mask file (PNG/JPG). |
+| `--mask-dir` + `--mask-index` | Object mask from a SAM-style directory (index default: `0`). |
+| `--image-dir` | Directory of views — **auto-enables multi-view** (see [Multi-view](#-multi-view-reconstruction-experimental)). |
+| `--masks-dir` / `--view-indices` / `--num-views-select` / `--fusion-mode` / `--view-weighting` | Multi-view inputs and fusion controls (see [Multi-view](#-multi-view-reconstruction-experimental)). |
+| `--multi-view` / `--single-view` | Force / suppress multi-view mode. |
+| `--output` / `-o` | Output file (default: `outputs/voxels.stl`; use `.glb` with `--mesh`). |
+
+**Geometry & stages**
+| Argument | Description |
+|----------|-------------|
+| `--mesh` | Output a smooth GLB mesh (otherwise voxel STL). |
+| `--voxels-only` | Only run Stage 1 and export raw voxels (STL); skip mesh decoding. |
+| `--steps` | Stage-2 (SLAT texture & refinement) flow-matching steps (default: `12`). Not distilled. |
+| `--ss-steps` | Stage-1 (sparse-structure / geometry) steps (default: `2`). Shortcut-distilled; >4 rarely helps. |
+| `--ss-distill` / `--no-ss-distill` | Shortcut-distilled Stage-1 sampling (CFG-free, ~1 eval/step). On by default; `--no-ss-distill` falls back to CFG flow matching (then use ~12 steps). |
+| `--distill` | Also distill **Stage 2** (SLAT). Experimental; usually degrades texture — leave off. |
+| `--full-res-geometry` | Keep large objects at native 64³ (interior-voxel pruning) instead of factor-2 downsampling. **On by default**; disable with `SAM3D_FULL_RES_GEOMETRY=0` (see [Geometry resolution](#geometry-resolution)). |
+| `--no-stage2-mps` | Disable MPS for Stage 2; force CPU-only (MPS is default). |
+| `--seed` | Random seed (default: `42`). |
+
+**Mesh cleanup & appearance**
+| Argument | Description |
+|----------|-------------|
+| `--simplify` | Mesh decimation ratio (`0.0` = none … `0.95` = heavy). Default `0.0`, or `0.9` with `--bake`. |
+| `--smooth ITERS` | Taubin-smooth the output mesh by `ITERS` iterations to sand off the 64³ voxel staircase (default: `0` = off; ~10 removes stepping). |
+| `--refine-mask` | Clean and anti-alias the mask before reconstruction (fill pinholes, drop speckles, feather the boundary). Off by default. |
+| `--vertex-color-source` | `gaussian` (saturated, recommended) or `mesh`. |
+| `--bake` | Bake a UV texture atlas instead of per-vertex color. |
+| `--bake-source` | `gaussian` (higher fidelity) or `vertex`. |
+| `--texture-size` | Baked atlas edge length in px (default: `2048`). |
+
+**Caching**
+| Argument | Description |
+|----------|-------------|
+| `--cache-dir` | Directory for intermediate outputs (default: `.cache`). |
+| `--load-slat` | Load a cached SLAT `.pt` (skips stages 0–2; only runs mesh decoding). |
 
 ## Geometry cleanup
 
@@ -395,7 +453,7 @@ watertight:
   by default) polishes the decimated surface without shrinking thin parts. Kept
   deliberately light because decimation already regularises the silhouette; too
   many passes reintroduce a low-frequency "wave" on straight edges. Raise it via
-  the web UI "Sand / smooth" control, `--smooth-iterations` (CLI), or
+  the web UI "Sand / smooth" control, `--smooth ITERS` (CLI), or
   `smooth_iterations` (API).
 - **Hole filling.** Small gaps left by decoding or simplification are closed so
   the surface is manifold and closed.
@@ -552,6 +610,19 @@ options.
    export SAM3D_FULL_RES_MAX_COORDS=30000  # surface-voxel budget before falling back to the halved path
    ```
 
+   Full reference of the environment variables the app honours:
+
+   | Variable | Default | Effect |
+   |----------|---------|--------|
+   | `PYTORCH_MPS_HIGH_WATERMARK_RATIO` | `0.0` | PyTorch MPS memory watermark (set automatically). |
+   | `SAM3D_SAM_DEVICE` | `mps` | Device for SAM segmentation (set automatically to `mps`). |
+   | `SAM3D_MOGE_DEVICE` | `mps` | Device for MoGe depth (set automatically to `mps`). |
+   | `SAM3D_SPLAT` | `1` | Gaussian-splat `.ply` export; set `0` to disable. |
+   | `SAM3D_FULL_RES_GEOMETRY` | `1` | Keep large objects at native 64³; set `0` to always halve. |
+   | `SAM3D_FULL_RES_MAX_COORDS` | `30000` | Surface-voxel budget before falling back to the halved path. |
+   | `SAM3D_CHECKPOINTS_DIR` | `checkpoints/ai_cleanup` | Directory for AI mesh-cleanup weights. |
+   | `SAM3D_PROFILE` | unset | Set `1` to print mesh-decoder profiling. |
+
 ## Structure
 ```
 main.py             # CLI entry point
@@ -641,7 +712,17 @@ following were built here:
     download / load status and downloads missing weights from Hugging Face,
     including token entry and gated-repo handling for SAM 3D Objects (see
     [Model management](#model-management-web-ui)).
-9. **AI mesh cleanup (functional, modern models).** UI controls for point cloud denoising and 3D shape completion are fully integrated into the export pipeline with Metal (MPS) acceleration on Apple Silicon. The system uses modern transformer-based architectures where available: **Point Transformer V3** (Pointcept, MIT license) for point cloud understanding and denoising, and **SnowflakeNet** (snowflake point deconvolution with skip-transformer, MIT license, ICCV 2021/TPAMI 2023) for point cloud completion. If the `transformers` library is installed, Point Transformer V3 is automatically fetched from Hugging Face; SnowflakeNet weights are downloaded from Google Drive. Otherwise, the system falls back to simpler random-initialized architectures. Both paths support lazy loading and MPS acceleration. See [AI Mesh Cleanup](#ai-mesh-cleanup) for upgrade instructions.
+9. **AI mesh cleanup (denoising real; completion gated on weights).** UI controls
+    for point cloud denoising and shape completion, integrated into the export
+    pipeline with Metal (MPS) acceleration. **Denoising** uses Open3D statistical /
+    Laplacian smoothing (deterministic, no weights required). **Shape completion**
+    uses **SnowflakeNet** (skip-transformer point deconvolution; MIT; ICCV 2021 /
+    TPAMI 2023) and runs **only** when trained weights are present in
+    `checkpoints/ai_cleanup/`; otherwise it is **skipped (no-op)** rather than
+    running an untrained network that would degrade the mesh. The
+    `mesh_cleanup_ai.py` wrappers provide lazy loading and MPS acceleration;
+    trained weights are downloaded from their upstream sources, not redistributed
+    here.
 
 ## Troubleshooting
 
@@ -698,7 +779,7 @@ need a Meta-approved Hugging Face account and an access token.
 The default mesh uses per-vertex color (`COLOR_0`), which **Preview and Quick
 Look ignore**, so the model shows up grey. Export a baked texture instead: use
 `--bake` on the CLI, or download from the web UI (baking runs client-side). See
-[Texture baking](#texture-baking).
+[Texture baking](#texture-baking--glb-optimization).
 
 ### Confusing checkpoint load failure (zero-byte weight)
 An interrupted or truncated download can leave a **zero-byte**
@@ -767,7 +848,7 @@ IP available under a separate commercial license.
   token are required (this is Meta's requirement; see
   [Troubleshooting](#model-download--hugging-face-authentication)).
 
-- **SnowflakeNet (MIT).** The point cloud completion model (SnowflakeNet, "Snowflake Point Deconvolution with Skip-Transformer") is available under MIT license from [`AllenXiangX/SnowflakeNet`](https://github.com/AllenXiangX/SnowflakeNet). This is published in ICCV 2021 (oral presentation) and extended in TPAMI 2023. The pretrained weights are **not** included in this repository and must be downloaded manually from [Google Drive](https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR) (or [Baidu backup](https://pan.baidu.com/s/10tkqJfMdWO9GkzXSBSNlIw), password: oy5c) and placed in `checkpoints/ai_cleanup/`.
+- **SnowflakeNet (MIT).** The point cloud completion model (SnowflakeNet, "Snowflake Point Deconvolution with Skip-Transformer") comes from [`AllenXiangX/SnowflakeNet`](https://github.com/AllenXiangX/SnowflakeNet) (ICCV 2021 oral; extended in TPAMI 2023). The repository is **MIT-licensed in its entirety** (a single `LICENSE` file; its README states "This project is open sourced under MIT license"), and it distributes its **pretrained models within that same project under that MIT license** — there is no separate or more-restrictive weights license stated. The pretrained weights are **not** included or redistributed in this repository and must be downloaded manually from [Google Drive](https://drive.google.com/drive/folders/1mdA-6ZwzXAbaWJ6fmfL9-gl3aGTGTWyR) (or [Baidu backup](https://pan.baidu.com/s/10tkqJfMdWO9GkzXSBSNlIw), password: oy5c) and placed in `checkpoints/ai_cleanup/`. Note that these weights were **trained on third-party datasets** (e.g. ShapeNet / PCN), whose own dataset terms may apply to specific downstream uses.
 
 - **Upstream port.** The custom Metal reconstruction kernels that originated in
   [`ZimengXiong/Sam3D-Objects-MLX`](https://github.com/ZimengXiong/Sam3D-Objects-MLX)
