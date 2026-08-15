@@ -251,12 +251,18 @@ def _write_multi_object_3mf(submeshes, colors, filepath: str) -> None:
     """
     CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
     MATL = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+    PROD = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+
+    import uuid as _uuid
+
+    def _uid():
+        return _uuid.uuid4().hex
 
     out = []
     out.append('<?xml version="1.0" encoding="UTF-8"?>')
     out.append(
         f'<model unit="millimeter" xml:lang="en-US" '
-        f'xmlns="{CORE}" xmlns:m="{MATL}">'
+        f'xmlns="{CORE}" xmlns:m="{MATL}" xmlns:p="{PROD}">'
     )
     out.append(" <resources>")
 
@@ -279,7 +285,10 @@ def _write_multi_object_3mf(submeshes, colors, filepath: str) -> None:
         verts = np.asarray(sub.vertices, dtype=np.float64)
         faces = np.asarray(sub.faces, dtype=np.int64)
 
-        out.append(f'  <object id="{oid}" type="model" pid="1" pindex="{i}">')
+        out.append(
+            f'  <object id="{oid}" p:UUID="{_uid()}" '
+            f'type="model" pid="1" pindex="{i}">'
+        )
         out.append("   <mesh>")
         out.append("    <vertices>")
         out.extend(
@@ -296,9 +305,28 @@ def _write_multi_object_3mf(submeshes, colors, filepath: str) -> None:
         out.append("   </mesh>")
         out.append("  </object>")
 
+    # Wrap every colour part as a component of ONE assembly object. The parts
+    # already share the model's absolute coordinates, so each component uses the
+    # identity transform and the pieces reassemble exactly. Building this single
+    # object (instead of one build item per colour) stops slicers such as Bambu
+    # Studio from auto-arranging the colours as separate objects across the
+    # plate — they stay locked in their true relative positions as printable
+    # sub-parts of the one model.
+    assembly_id = len(submeshes) + 2
+    out.append(f'  <object id="{assembly_id}" p:UUID="{_uid()}" type="model">')
+    out.append("   <components>")
+    out.extend(
+        f'    <component objectid="{oid}" p:UUID="{_uid()}" '
+        f'transform="1 0 0 0 1 0 0 0 1 0 0 0"/>'
+        for oid in obj_ids
+    )
+    out.append("   </components>")
+    out.append("  </object>")
+
     out.append(" </resources>")
     out.append(" <build>")
-    out.extend(f'  <item objectid="{oid}"/>' for oid in obj_ids)
+    out.append(f'  <item objectid="{assembly_id}" p:UUID="{_uid()}" '
+               f'transform="1 0 0 0 1 0 0 0 1 0 0 0" printable="1"/>')
     out.append(" </build>")
     out.append("</model>")
     model_xml = "\n".join(out).encode("utf-8")
@@ -322,10 +350,34 @@ def _write_multi_object_3mf(submeshes, colors, filepath: str) -> None:
         "</Relationships>"
     ).encode("utf-8")
 
+    # Bambu Studio / OrcaSlicer read per-part filament (extruder) assignments
+    # from Metadata/model_settings.config, NOT from the 3MF base materials.
+    # Without it every part defaults to filament 1 even though each part is a
+    # distinct object. Map colour i → filament/extruder i+1 (the user re-maps
+    # these to physical AMS slots in the slicer). The <part id> matches the
+    # component objectid in 3dmodel.model.
+    cfg = ['<?xml version="1.0" encoding="UTF-8"?>', "<config>"]
+    cfg.append(f'  <object id="{assembly_id}">')
+    cfg.append('    <metadata key="name" value="segmented"/>')
+    cfg.append('    <metadata key="extruder" value="1"/>')
+    for i, oid in enumerate(obj_ids):
+        cfg.append(f'    <part id="{oid}" subtype="normal_part">')
+        cfg.append(f'      <metadata key="name" value="Color {i + 1}"/>')
+        cfg.append(
+            '      <metadata key="matrix" '
+            'value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>'
+        )
+        cfg.append(f'      <metadata key="extruder" value="{i + 1}"/>')
+        cfg.append("    </part>")
+    cfg.append("  </object>")
+    cfg.append("</config>")
+    model_settings = "\n".join(cfg).encode("utf-8")
+
     with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", content_types)
         z.writestr("_rels/.rels", rels)
         z.writestr("3D/3dmodel.model", model_xml)
+        z.writestr("Metadata/model_settings.config", model_settings)
 
 
 def _export_3mf_with_vertex_colors(
