@@ -1101,7 +1101,7 @@ if (document.readyState === 'loading') {
 
       <div class="tool-group">
         <h3>Segment by color</h3>
-        <p class="tool-hint">Cluster the model's colors into distinct groups and export each color as a <b>separate object</b>. Use <b>3MF</b> for multi-material 3D printing - each color becomes its own part you can assign a filament to - or <b>GLB</b> where each colored segment is an individual mesh object. Runs on the server; does not change the model above.</p>
+        <p class="tool-hint">Cluster the model's colors into distinct groups and export each color as a <b>separate object</b>. Use <b>3MF</b> for multi-material 3D printing - each color becomes its own part you can assign a filament to - or <b>GLB</b> where each colored segment is an individual mesh object. Runs on the server using your current edits (hole fill, trim, smooth, cuts, color grading).</p>
         <div class="opt-row">
           <label for="opt-seg-colors">Colors</label>
           <select id="opt-seg-colors">
@@ -4024,6 +4024,8 @@ async function runSegmentGLB() {
   const nColors = segColorCount();
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
+  setSegProgress(8, "Uploading edits…");
+  await uploadEditedMesh();
   setSegProgress(15, "Segmenting colors…");
   try {
     // Pass the object concept (SAM 3 text prompt) so the server can name the
@@ -4074,6 +4076,8 @@ async function runSegment3MF() {
   const nColors = segColorCount();
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
+  setSegProgress(8, "Uploading edits…");
+  await uploadEditedMesh();
   setSegProgress(15, "Segmenting colors for 3MF…");
   try {
     const resp = await fetch(`/result/${resultJobId}?format=3mf&num_colors=${nColors}`);
@@ -4404,6 +4408,47 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
+// The Tools-tab edits (hole fill, trim, smooth, stencil cuts, colour grading)
+// are applied entirely in the browser. Server-side exports (colour
+// segmentation, 3MF) re-load the reconstruction on the server, so they'd miss
+// those edits. Before any server-side export we upload the current tuned,
+// per-vertex-colour mesh so the server operates on exactly what's shown in the
+// viewer. No baking / decimation here: segmentation clusters raw COLOR_0, and
+// grading is already applied by buildTunedGeometry.
+async function uploadEditedMesh() {
+  if (!welded || !resultJobId) return false;
+  let { geometry } = buildTunedGeometry(curThreshold, curTrim);
+  // Store COLOR_0 as normalized uint8 (like the SAM server GLB) so the upload is
+  // ~⅓ the size of float32 with no visible difference. The server strips the
+  // material on load so trimesh reads these as per-vertex colours.
+  const c = geometry.getAttribute("color");
+  if (c && c.array instanceof Float32Array) {
+    const n = c.count, u = new Uint8Array(n * 3);
+    for (let i = 0; i < n * 3; i++) u[i] = Math.max(0, Math.min(255, Math.round(c.array[i] * 255)));
+    geometry.setAttribute("color", new THREE.BufferAttribute(u, 3, true));
+  }
+  const mat = new THREE.MeshStandardMaterial({
+    vertexColors: !!geometry.getAttribute("color"),
+    metalness: 0, roughness: 0.85, side: THREE.DoubleSide,
+  });
+  if (!geometry.getAttribute("color")) mat.color.set(0xffffff);
+  if (geometry.getAttribute("uv")) geometry.deleteAttribute("uv");
+  const mesh = new THREE.Mesh(geometry, mat);
+  try {
+    const blob = await meshToGLB(mesh);
+    const fd = new FormData();
+    fd.append("file", blob, "edited.glb");
+    const resp = await fetch(`/edited_mesh/${resultJobId}`, { method: "POST", body: fd });
+    return resp.ok;
+  } catch (e) {
+    console.error("Edited-mesh upload failed:", e);
+    return false;
+  } finally {
+    mat.dispose();
+    geometry.dispose();
+  }
+}
+
 // Determinate progress bar shown while a download is being prepared.
 const tick = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 function setExportProgress(pct, label) {
@@ -4438,6 +4483,8 @@ async function runPlain3MF() {
   const card = $("fmt-3mf"), sizeEl = $("size-3mf"), status = $("export-status");
   if (card) card.classList.add("busy");
   if (status) status.textContent = "";
+  setExportProgress(8, "Uploading edits…");
+  await uploadEditedMesh();
   setExportProgress(15, "Building 3MF…");
   try {
     const resp = await fetch(`/result/${resultJobId}?format=3mf&separate=false`);

@@ -208,6 +208,11 @@ class JobState:
         self.cancelled   = False
         self.error: Optional[str] = None
         self.result_path: Optional[str] = None
+        # Client-uploaded, Tools-tab-edited mesh (hole fill, trim, smooth,
+        # stencil cuts, colour grading). When present, server-side exports
+        # (colour segmentation, 3MF) operate on this instead of result_path so
+        # they match the edited model shown in the viewer.
+        self.edited_path: Optional[str] = None
         # Source image / mask paths, so post-processing steps (e.g. functional
         # part segmentation) can be run on demand after reconstruction finishes.
         self.img_path: Optional[str] = None
@@ -1535,9 +1540,12 @@ async def get_result(job_id: str, format: str = "glb", num_colors: int = 16, sep
             from export_3mf import export_3mf_separated_by_color
             import trimesh
             
-            # Load the stored GLB mesh
-            glb_path = Path(job.result_path)
-            loaded = trimesh.load(str(glb_path), process=False)
+            # Load the stored GLB mesh (prefer the edited mesh so 3MF reflects
+            # the Tools-tab edits shown in the viewer). Strip materials so
+            # trimesh keeps per-vertex COLOR_0 (browser exports include a
+            # material, which otherwise hides the colours).
+            glb_path = Path(_job_mesh_source(job))
+            loaded = _load_mesh_colored(str(glb_path))
             
             # Handle Scene vs Mesh: if it's a scene, extract and merge meshes
             if isinstance(loaded, trimesh.Scene):
@@ -1612,6 +1620,105 @@ async def get_result(job_id: str, format: str = "glb", num_colors: int = 16, sep
 # in-browser editing tools keep working. Each part is a named GLB object that
 # downstream tools can recolour / texture independently.
 
+def _job_mesh_source(job: "JobState") -> Optional[str]:
+    """Path to the mesh server-side exports should operate on.
+
+    Prefer the client-uploaded, Tools-tab-edited mesh when present so colour
+    segmentation and 3MF exports reflect the edits shown in the viewer; fall
+    back to the pristine reconstruction otherwise.
+    """
+    if job.edited_path and Path(job.edited_path).exists():
+        return job.edited_path
+    return job.result_path
+
+
+def _strip_glb_materials(data: bytes) -> bytes:
+    """Remove all material references from a binary GLB.
+
+    trimesh classifies a primitive that references a material as a
+    ``TextureVisuals`` and DROPS its per-vertex ``COLOR_0`` — even when the
+    material has no texture. The browser's glTF exporter always writes a
+    material, so meshes uploaded from the editor would lose their colours on
+    load and colour segmentation / 3MF export would fail. Stripping the material
+    makes trimesh read ``COLOR_0`` as ``ColorVisuals``. The pristine on-disk
+    reconstruction has no material (it's injected only at serve time), so this
+    is a no-op there.
+    """
+    import struct as _struct
+
+    if len(data) < 20 or data[:4] != b"glTF":
+        return data
+    try:
+        json_len = _struct.unpack("<I", data[12:16])[0]
+        json_start = 20  # 12-byte header + 8-byte chunk header
+        gltf = json.loads(data[json_start:json_start + json_len])
+        changed = False
+        for mesh in gltf.get("meshes", []):
+            for prim in mesh.get("primitives", []):
+                if "material" in prim:
+                    del prim["material"]
+                    changed = True
+        if "materials" in gltf:
+            del gltf["materials"]
+            changed = True
+        if not changed:
+            return data
+        new_json = json.dumps(gltf).encode("utf-8")
+        new_json += b" " * ((4 - len(new_json) % 4) % 4)  # pad to 4 bytes
+        bin_all = data[json_start + json_len:]  # 8-byte BIN chunk header + payload
+        out = b"glTF" + _struct.pack("<II", 2, 12 + 8 + len(new_json) + len(bin_all))
+        out += _struct.pack("<I", len(new_json)) + b"JSON" + new_json + bin_all
+        return out
+    except Exception as exc:
+        logger.warning("GLB material strip failed (%s); loading as-is", exc)
+        return data
+
+
+def _load_mesh_colored(path: str):
+    """Load a mesh for server-side export, preserving per-vertex COLOR_0.
+
+    Strips materials from GLB inputs first so trimesh exposes vertex colours
+    (see :func:`_strip_glb_materials`).
+    """
+    import io as _io
+    import trimesh
+
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] == b"glTF":
+        return trimesh.load(
+            _io.BytesIO(_strip_glb_materials(data)),
+            file_type="glb",
+            force="mesh",
+        )
+    return trimesh.load(path, force="mesh")
+
+
+@app.post("/edited_mesh/{job_id}")
+async def upload_edited_mesh(job_id: str, file: UploadFile = File(...)):
+    """Store the client's Tools-tab-edited GLB for a job.
+
+    The web UI applies mesh edits (hole fill, trim, smooth, stencil cuts, colour
+    grading) entirely in the browser. Server-side exports (colour segmentation,
+    3MF) otherwise re-load the pristine reconstruction and miss those edits, so
+    the client POSTs the edited mesh here first and the exports operate on it.
+    """
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    job = jobs[job_id]
+    if not job.done or job.error:
+        raise HTTPException(202, "Reconstruction not finished")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty edited-mesh upload")
+    out_path = RESULT_DIR / f"{job_id}_edited.glb"
+    with open(out_path, "wb") as f:
+        f.write(data)
+    job.edited_path = str(out_path)
+    return {"job_id": job_id, "bytes": len(data)}
+
+
 @app.post("/segment_parts/{job_id}")
 async def segment_parts(
     job_id: str,
@@ -1626,7 +1733,8 @@ async def segment_parts(
     job = jobs[job_id]
     if not job.done or job.error:
         raise HTTPException(202, "Reconstruction not finished")
-    if not job.result_path or not Path(job.result_path).exists():
+    mesh_source = _job_mesh_source(job)
+    if not mesh_source or not Path(mesh_source).exists():
         raise HTTPException(404, "Reconstructed mesh not available")
 
     job.label = (label or "").strip() or None
@@ -1641,7 +1749,7 @@ async def segment_parts(
             None,
             _run_part_segmentation_sync,
             job_id,
-            job.result_path,
+            mesh_source,
             job.img_path,
             job.mask_path,
             0 if int(n_colors) <= 0 else max(2, min(int(n_colors), 16)),
@@ -1725,7 +1833,7 @@ def _run_part_segmentation_sync(
 
     image = np.array(PILImage.open(img_path).convert("RGB")) if img_path else None
     mask  = np.array(PILImage.open(mask_path).convert("L")) if mask_path else None
-    mesh  = trimesh.load(result_path, force="mesh")
+    mesh  = _load_mesh_colored(result_path)
 
     scene = segment_mesh_parts(
         mesh, image, mask,
